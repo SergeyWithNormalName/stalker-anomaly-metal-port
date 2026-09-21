@@ -1,0 +1,13 @@
+// Exact R4 `shadow_direct_base_aref.ps` alpha admission, with the same
+// R32Float color-depth representation required by Direct Metal.  The native
+// R4 shader only needs the alpha-tested base texture in this pass; preserving
+// `def_aref` prevents foliage, grates, and other cutouts from becoming solid
+// local-light shadow casters.
+#include "common.h"
+
+float main(p_shadow_direct_aref input, float4 position : SV_Position) : SV_Target
+{
+    const float4 color = s_base.Sample(smp_linear, input.tc0);
+    clip(color.w - def_aref);
+    return position.z;
+}

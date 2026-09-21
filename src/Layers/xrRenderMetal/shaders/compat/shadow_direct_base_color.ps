@@ -1,0 +1,7 @@
+// Metal cannot bind a Depth32Float attachment to the Texture2D<float> SRV
+// expected by converted R4 lighting. The shadow pass therefore writes the
+// post-raster depth into a matching R32Float color attachment in the same draw.
+float main(float4 position : SV_Position) : SV_Target
+{
+    return position.z;
+}

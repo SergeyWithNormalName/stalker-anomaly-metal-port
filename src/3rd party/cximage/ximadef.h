@@ -1,0 +1,261 @@
+#if !defined(__ximadefs_h)
+#define __ximadefs_h
+
+#include "ximacfg.h"
+
+#if defined(_AFXDLL)||defined(_USRDLL)
+ #define DLL_EXP
+//__declspec(dllexport)
+#elif defined(_MSC_VER)&&(_MSC_VER<1200)
+ #define DLL_EXP
+//__declspec(dllimport)
+#else
+ #define DLL_EXP
+#endif
+
+
+#if CXIMAGE_SUPPORT_EXCEPTION_HANDLING
+  #define cx_try try
+  #define cx_throw(message) throw(message)
+  #define cx_catch catch (const char *message)
+#else
+  #define cx_try bool cx_error=false;
+  #define cx_throw(message) {cx_error=true; if(strcmp(message,"")) strncpy(info.szLastError,message,255); goto cx_error_catch;}
+  #define cx_catch cx_error_catch: char message[]=""; if(cx_error)
+#endif
+
+
+#if CXIMAGE_SUPPORT_JP2 || CXIMAGE_SUPPORT_JPC || CXIMAGE_SUPPORT_PGX || CXIMAGE_SUPPORT_PNM || CXIMAGE_SUPPORT_RAS
+ #define CXIMAGE_SUPPORT_JASPER 1
+#else
+ #define CXIMAGE_SUPPORT_JASPER 0
+#endif
+
+#if CXIMAGE_SUPPORT_DSP
+#undef CXIMAGE_SUPPORT_TRANSFORMATION
+ #define CXIMAGE_SUPPORT_TRANSFORMATION 1
+#endif
+
+#if CXIMAGE_SUPPORT_TRANSFORMATION || CXIMAGE_SUPPORT_TIF || CXIMAGE_SUPPORT_TGA || CXIMAGE_SUPPORT_BMP || CXIMAGE_SUPPORT_WINDOWS
+ #define CXIMAGE_SUPPORT_BASICTRANSFORMATIONS 1
+#endif
+
+#if CXIMAGE_SUPPORT_DSP || CXIMAGE_SUPPORT_TRANSFORMATION
+#undef CXIMAGE_SUPPORT_INTERPOLATION
+ #define CXIMAGE_SUPPORT_INTERPOLATION 1
+#endif
+
+#if defined (_WIN32_WCE)
+ #undef CXIMAGE_SUPPORT_WMF
+ #define CXIMAGE_SUPPORT_WMF 0
+#endif
+
+#if !defined(WIN32) && !defined(_WIN32_WCE)
+ #undef CXIMAGE_SUPPORT_WINDOWS
+ #define CXIMAGE_SUPPORT_WINDOWS 0
+#endif
+
+#ifndef min
+#define min(a,b) (((a)<(b))?(a):(b))
+#endif
+#ifndef max
+#define max(a,b) (((a)>(b))?(a):(b))
+#endif
+
+#ifndef PI
+ #define PI 3.141592653589793f
+#endif
+
+
+#if defined(WIN32) || defined(_WIN32_WCE)
+#include <windows.h>
+#include <tchar.h>
+#endif
+
+#include <stdio.h>
+#include <math.h>
+
+#ifdef __BORLANDC__
+
+#ifndef _COMPLEX_DEFINED
+
+typedef struct tagcomplex {
+	double x,y;
+} _complex;
+
+#endif
+
+#define _cabs(c) sqrt(c.x*c.x+c.y*c.y)
+
+#endif
+
+
+#if !defined(WIN32) && !defined(_WIN32_WCE)
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h>
+
+#ifndef _BYTE_DEFINED
+typedef unsigned char  BYTE;
+#define _BYTE_DEFINED
+#endif
+
+#ifndef _WORD_DEFINED
+typedef unsigned short WORD;
+#define _WORD_DEFINED
+#endif
+
+#ifndef _DWORD_DEFINED
+// Windows DWORD is always 32-bit.  `unsigned long` is 64-bit on LP64
+// platforms, which changes CxImage's public C++ ABI and makes callers built
+// against xrCore's u32-based DWORD unable to link to this archive.
+typedef uint32_t       DWORD;
+#define _DWORD_DEFINED
+#endif
+
+#ifndef _UINT_DEFINED
+typedef unsigned int   UINT;
+#define _UINT_DEFINED
+#endif
+
+#ifndef COLORREF
+typedef DWORD          COLORREF;
+#endif
+
+#ifndef _HANDLE_DEFINED
+typedef unsigned int   HANDLE;
+#define _HANDLE_DEFINED
+#endif
+
+typedef void*          HRGN;
+typedef void*          HDC;
+
+#ifndef BOOL
+#define	BOOL bool
+#endif
+
+#ifndef TRUE
+#define	TRUE true
+#endif
+
+#ifndef FALSE
+#define	FALSE false
+#endif
+
+#ifndef TCHAR
+#define TCHAR char
+#define _T
+#endif
+
+typedef const TCHAR* LPCTSTR;
+typedef TCHAR* LPTSTR;
+
+#ifndef _tcsnicmp
+#define _tcsnicmp strncasecmp
+#endif
+#ifndef _tcsicmp
+#define _tcsicmp strcasecmp
+#endif
+#ifndef _tfopen
+#define _tfopen fopen
+#endif
+
+#if !defined(_RECT_DEFINED) && !defined(RECT_DEFINED)
+#define _RECT_DEFINED
+#define RECT_DEFINED
+typedef struct tagRECT
+{
+	long    left;
+	long    top;
+	long    right;
+	long    bottom;
+} RECT;
+#endif
+
+#if !defined(_POINT_DEFINED) && !defined(POINT_DEFINED)
+#define _POINT_DEFINED
+#define POINT_DEFINED
+typedef struct tagPOINT
+{
+	long  x;
+	long  y;
+} POINT;
+#endif
+
+typedef struct tagRGBQUAD {
+	BYTE    rgbBlue;
+	BYTE    rgbGreen;
+	BYTE    rgbRed;
+	BYTE    rgbReserved;
+} RGBQUAD;
+
+#pragma pack(1)
+
+#ifndef BITMAPINFOHEADER_DEFINED
+#define BITMAPINFOHEADER_DEFINED
+typedef struct tagBITMAPINFOHEADER{
+	DWORD      biSize;
+	long       biWidth;
+	long       biHeight;
+	WORD       biPlanes;
+	WORD       biBitCount;
+	DWORD      biCompression;
+	DWORD      biSizeImage;
+	long       biXPelsPerMeter;
+	long       biYPelsPerMeter;
+	DWORD      biClrUsed;
+	DWORD      biClrImportant;
+} BITMAPINFOHEADER;
+#endif
+
+typedef struct tagBITMAPFILEHEADER {
+	WORD    bfType;
+	DWORD   bfSize;
+	WORD    bfReserved1;
+	WORD    bfReserved2;
+	DWORD   bfOffBits;
+} BITMAPFILEHEADER;
+
+typedef struct tagBITMAPCOREHEADER {
+	DWORD   bcSize;
+	WORD    bcWidth;
+	WORD    bcHeight;
+	WORD    bcPlanes;
+	WORD    bcBitCount;
+} BITMAPCOREHEADER;
+
+typedef struct tagRGBTRIPLE {
+	BYTE    rgbtBlue;
+	BYTE    rgbtGreen;
+	BYTE    rgbtRed;
+} RGBTRIPLE;
+
+#pragma pack()
+
+#define BI_RGB        0L
+#define BI_RLE8       1L
+#define BI_RLE4       2L
+#define BI_BITFIELDS  3L
+
+#define GetRValue(rgb)      ((BYTE)(rgb))
+#define GetGValue(rgb)      ((BYTE)(((WORD)(rgb)) >> 8))
+#define GetBValue(rgb)      ((BYTE)((rgb)>>16))
+#ifndef RGB
+#define RGB(r,g,b)          ((COLORREF)(((BYTE)(r)|((WORD)((BYTE)(g))<<8))|(((DWORD)(BYTE)(b))<<16)))
+#endif
+
+#ifndef _COMPLEX_DEFINED
+
+typedef struct tagcomplex {
+	double x,y;
+} _complex;
+
+#endif
+
+#define _cabs(c) sqrt(c.x*c.x+c.y*c.y)
+
+#endif
+
+#endif //__ximadefs

@@ -1,0 +1,86 @@
+////////////////////////////////////////////////////////////////////////////
+//	Module 		: vertex_manager_fixed.h
+//	Created 	: 21.03.2002
+//  Modified 	: 01.03.2004
+//	Author		: Dmitriy Iassenev
+//	Description : Fixed vertex manager
+////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+template <
+	typename PathIdType,
+	typename IndexType,
+	u8 mask
+>
+struct CVertexManagerFixed
+{
+	template <template <typename _T> class T1>
+	struct VertexManager
+	{
+		template <typename T2>
+		struct _vertex : public T1<T2>
+		{
+			typedef IndexType _index_type;
+			_index_type _index : 8 * sizeof(_index_type) - mask;
+			_index_type _opened : mask;
+
+			IC _index_type index() const
+			{
+				return (_index);
+			}
+
+			IC _index_type opened() const
+			{
+				return (_opened);
+			}
+		};
+	};
+
+	template <
+		template <typename _T> class _vertex,
+		template <typename _T1, typename _T2> class _index_vertex,
+		typename _data_storage
+	>
+	class CDataStorage : public _data_storage::template CDataStorage<VertexManager<_vertex>::template _vertex>
+	{
+	public:
+		typedef typename _data_storage::template CDataStorage<
+			VertexManager<_vertex>::template _vertex
+		> inherited;
+		typedef typename inherited::CGraphVertex CGraphVertex;
+		typedef typename CGraphVertex::_index_type _index_type;
+
+#pragma pack(push,1)
+		template <typename TPathId>
+		struct SGraphIndexVertex : public _index_vertex<CGraphVertex, SGraphIndexVertex<TPathId>>
+		{
+			TPathId m_path_id;
+			CGraphVertex* m_vertex;
+		};
+#pragma pack(pop)
+
+		typedef PathIdType _path_id_type;
+		typedef SGraphIndexVertex<_path_id_type> CGraphIndexVertex;
+
+	protected:
+		_path_id_type m_current_path_id;
+		u32 m_max_node_count;
+		CGraphIndexVertex* m_indexes;
+
+	public:
+		IC CDataStorage(const u32 vertex_count);
+		virtual ~CDataStorage();
+		IC void init();
+		IC bool is_opened(const CGraphVertex& vertex) const;
+		IC bool is_visited(const _index_type& vertex_id) const;
+		IC bool is_closed(const CGraphVertex& vertex) const;
+		IC CGraphVertex& get_node(const _index_type& vertex_id) const;
+		IC CGraphVertex& create_vertex(CGraphVertex& vertex, const _index_type& vertex_id);
+		IC void add_opened(CGraphVertex& vertex);
+		IC void add_closed(CGraphVertex& vertex);
+		IC _path_id_type current_path_id() const;
+	};
+};
+
+#include "vertex_manager_fixed_inline.h"

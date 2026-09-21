@@ -1,0 +1,7 @@
+product=Metal Shader Converter 4.0 beta 2
+payload_version=4.0.1
+source_url=https://download.developer.apple.com/Developer_Tools/Metal_Shader_Converter_3.1_beta_1/Metal_Shader_Converter_4.0_beta_2.pkg
+package_sha256=0e7b6c83617a0b67905614579e82031d177ed49cfaacccb0aaef6ddadf19107c
+package_signature_status=invalid_or_untrusted_on_2026-09-09
+cli_sha256=b80d3f61df0dc974ab96d176cd6a8903b226bec46d9adac2d08f69e50b4319ff
+library_sha256=1af7a62b73330e56e7e47ad7cf3582b3b79b5cdee1c8fef9ab1387fb15b71d2e

@@ -1,0 +1,142 @@
+include_guard(GLOBAL)
+
+get_filename_component(_XRAY_METAL_TOOLCHAIN_REPOSITORY_ROOT
+  "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+
+set(XRAY_DXC_EXECUTABLE "" CACHE FILEPATH
+  "Path to the DirectX Shader Compiler executable")
+set(XRAY_METAL_SHADER_CONVERTER_EXECUTABLE "" CACHE FILEPATH
+  "Path to Apple's metal-shaderconverter executable")
+set(XRAY_METAL_IRCONVERTER_INCLUDE_DIR "" CACHE PATH
+  "Directory containing metal_irconverter/metal_irconverter.h")
+set(XRAY_METAL_IRCONVERTER_LIBRARY "" CACHE FILEPATH
+  "Path to Apple's libmetalirconverter dynamic library")
+
+set(_XRAY_DXC_HINTS
+  "$ENV{DXC_ROOT}"
+  "$ENV{DXC_ROOT}/bin"
+  "${_XRAY_METAL_TOOLCHAIN_REPOSITORY_ROOT}/build/direct-metal-toolchain/dxc-v1.9.2607/bin")
+
+set(_XRAY_MSC_HINTS
+  "$ENV{METAL_SHADER_CONVERTER_ROOT}"
+  "$ENV{METAL_SHADER_CONVERTER_ROOT}/bin"
+  "${_XRAY_METAL_TOOLCHAIN_REPOSITORY_ROOT}/build/direct-metal-toolchain/metal-shaderconverter-4.0.1/bin"
+  "/usr/local/bin"
+  "/opt/homebrew/bin")
+
+if(NOT XRAY_DXC_EXECUTABLE)
+  find_program(_XRAY_DXC_DISCOVERED
+    NAMES dxc
+    HINTS ${_XRAY_DXC_HINTS})
+  if(_XRAY_DXC_DISCOVERED)
+    set(XRAY_DXC_EXECUTABLE "${_XRAY_DXC_DISCOVERED}" CACHE FILEPATH
+      "Path to the DirectX Shader Compiler executable" FORCE)
+  endif()
+endif()
+
+if(NOT XRAY_METAL_SHADER_CONVERTER_EXECUTABLE)
+  find_program(_XRAY_MSC_DISCOVERED
+    NAMES metal-shaderconverter
+    HINTS ${_XRAY_MSC_HINTS})
+  if(_XRAY_MSC_DISCOVERED)
+    set(XRAY_METAL_SHADER_CONVERTER_EXECUTABLE "${_XRAY_MSC_DISCOVERED}"
+      CACHE FILEPATH "Path to Apple's metal-shaderconverter executable" FORCE)
+  endif()
+endif()
+
+if(NOT XRAY_METAL_IRCONVERTER_INCLUDE_DIR)
+  find_path(_XRAY_METAL_IRCONVERTER_INCLUDE_DISCOVERED
+    NAMES metal_irconverter/metal_irconverter.h
+    HINTS
+      "$ENV{METAL_SHADER_CONVERTER_ROOT}"
+      "${_XRAY_METAL_TOOLCHAIN_REPOSITORY_ROOT}/build/direct-metal-toolchain/metal-shaderconverter-4.0.1"
+      /usr/local
+      /opt/homebrew
+    PATH_SUFFIXES include)
+  if(_XRAY_METAL_IRCONVERTER_INCLUDE_DISCOVERED)
+    set(XRAY_METAL_IRCONVERTER_INCLUDE_DIR
+      "${_XRAY_METAL_IRCONVERTER_INCLUDE_DISCOVERED}" CACHE PATH
+      "Directory containing metal_irconverter/metal_irconverter.h" FORCE)
+  endif()
+endif()
+
+if(NOT XRAY_METAL_IRCONVERTER_LIBRARY)
+  find_library(_XRAY_METAL_IRCONVERTER_LIBRARY_DISCOVERED
+    NAMES metalirconverter
+    HINTS
+      "$ENV{METAL_SHADER_CONVERTER_ROOT}"
+      "${_XRAY_METAL_TOOLCHAIN_REPOSITORY_ROOT}/build/direct-metal-toolchain/metal-shaderconverter-4.0.1"
+      /usr/local
+      /opt/homebrew
+    PATH_SUFFIXES lib)
+  if(_XRAY_METAL_IRCONVERTER_LIBRARY_DISCOVERED)
+    set(XRAY_METAL_IRCONVERTER_LIBRARY
+      "${_XRAY_METAL_IRCONVERTER_LIBRARY_DISCOVERED}" CACHE FILEPATH
+      "Path to Apple's libmetalirconverter dynamic library" FORCE)
+  endif()
+endif()
+
+set(XRAY_DXC_VERSION "")
+if(XRAY_DXC_EXECUTABLE AND EXISTS "${XRAY_DXC_EXECUTABLE}")
+  execute_process(
+    COMMAND "${XRAY_DXC_EXECUTABLE}" --version
+    RESULT_VARIABLE _XRAY_DXC_VERSION_RESULT
+    OUTPUT_VARIABLE _XRAY_DXC_VERSION_STDOUT
+    ERROR_VARIABLE _XRAY_DXC_VERSION_STDERR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+  if(_XRAY_DXC_VERSION_RESULT EQUAL 0)
+    set(XRAY_DXC_VERSION
+      "${_XRAY_DXC_VERSION_STDOUT}${_XRAY_DXC_VERSION_STDERR}")
+  endif()
+endif()
+
+set(XRAY_METAL_SHADER_CONVERTER_VERSION "")
+if(XRAY_METAL_SHADER_CONVERTER_EXECUTABLE AND
+   EXISTS "${XRAY_METAL_SHADER_CONVERTER_EXECUTABLE}")
+  execute_process(
+    COMMAND "${XRAY_METAL_SHADER_CONVERTER_EXECUTABLE}" --version
+    RESULT_VARIABLE _XRAY_MSC_VERSION_RESULT
+    OUTPUT_VARIABLE _XRAY_MSC_VERSION_STDOUT
+    ERROR_VARIABLE _XRAY_MSC_VERSION_STDERR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+  if(_XRAY_MSC_VERSION_RESULT EQUAL 0)
+    set(XRAY_METAL_SHADER_CONVERTER_VERSION
+      "${_XRAY_MSC_VERSION_STDOUT}${_XRAY_MSC_VERSION_STDERR}")
+  endif()
+endif()
+
+if(XRAY_DXC_EXECUTABLE AND EXISTS "${XRAY_DXC_EXECUTABLE}" AND
+   XRAY_METAL_SHADER_CONVERTER_EXECUTABLE AND
+   EXISTS "${XRAY_METAL_SHADER_CONVERTER_EXECUTABLE}")
+  set(XRAY_METAL_SHADER_TOOLCHAIN_FOUND TRUE)
+else()
+  set(XRAY_METAL_SHADER_TOOLCHAIN_FOUND FALSE)
+endif()
+
+function(xray_require_metal_shader_toolchain)
+  if(NOT APPLE)
+    message(FATAL_ERROR "The Direct Metal shader toolchain is supported only on Apple hosts")
+  endif()
+
+  if(NOT XRAY_DXC_EXECUTABLE OR NOT EXISTS "${XRAY_DXC_EXECUTABLE}")
+    message(FATAL_ERROR
+      "DXC was not found. Set XRAY_DXC_EXECUTABLE or DXC_ROOT; "
+      "see DIRECT_METAL_SHADER_TOOLCHAIN.md")
+  endif()
+
+  if(NOT XRAY_METAL_SHADER_CONVERTER_EXECUTABLE OR
+     NOT EXISTS "${XRAY_METAL_SHADER_CONVERTER_EXECUTABLE}")
+    message(FATAL_ERROR
+      "metal-shaderconverter was not found. Set "
+      "XRAY_METAL_SHADER_CONVERTER_EXECUTABLE or "
+      "METAL_SHADER_CONVERTER_ROOT; see DIRECT_METAL_SHADER_TOOLCHAIN.md")
+  endif()
+endfunction()
+
+mark_as_advanced(
+  XRAY_DXC_EXECUTABLE
+  XRAY_METAL_SHADER_CONVERTER_EXECUTABLE
+  XRAY_METAL_IRCONVERTER_INCLUDE_DIR
+  XRAY_METAL_IRCONVERTER_LIBRARY)

@@ -1,0 +1,9 @@
+--- r3/screenspace_water.h
++++ r3/screenspace_water.h
+@@ -50,1 +50,5 @@
+-	[unroll (q_steps[SSFX_WATER_QUALITY].x)]
++#ifdef __hlsl_dx_compiler
++	[unroll]
++#else
++	[unroll (q_steps[SSFX_WATER_QUALITY].x)]
++#endif
