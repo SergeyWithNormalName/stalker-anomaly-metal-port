@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -21,9 +22,31 @@ namespace
 constexpr std::size_t kVertexGlobalsSize = 7648u;
 constexpr std::size_t kTransformsSize = 256u;
 constexpr std::size_t kFragmentGlobalsSize = 208u;
+constexpr std::size_t kEmissiveFragmentGlobalsSize = 192u;
+constexpr std::size_t kEmissivePdaParamsOffset = 176u;
 constexpr std::size_t kSkin4CurrentPaletteOffset = 160u;
 constexpr std::size_t kSkin4PreviousPaletteOffset = 3904u;
 constexpr std::size_t kSkin4PaletteBoneCapacity = 78u;
+static_assert(kEmissivePdaParamsOffset + sizeof(float) * 4u == kEmissiveFragmentGlobalsSize,
+    "accum_emissivel pda_params must fit the reflected 192-byte $Globals b0 ABI");
+
+bool isModelsSelflightL(const std::string& shaderName)
+{
+    std::string normalized;
+    normalized.reserve(shaderName.size());
+    for (const unsigned char character : shaderName)
+        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
+    return normalized == "models/selflightl";
+}
+
+bool isModelsSelflightFamily(const std::string& shaderName)
+{
+    std::string normalized;
+    normalized.reserve(shaderName.size());
+    for (const unsigned char character : shaderName)
+        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
+    return normalized == "models/selflight" || normalized == "models/selflightl";
+}
 
 bool experimentalHardwareSkin4Enabled()
 {
@@ -346,18 +369,6 @@ bool uploadDds(IR4Resources& resources, const xray::metal::R4DdsTexture& dds,
     return true;
 }
 
-bool updateUniform(IR4Resources& resources, std::shared_ptr<IR4Buffer>& buffer,
-    std::size_t size, const void* data, const char* label, std::string& error)
-{
-    if (!buffer)
-    {
-        R4BufferDesc descriptor{size, R4ResourceStorage::Shared, R4BufferUsage::Uniform, label};
-        buffer = resources.CreateBuffer(descriptor, data, size, error);
-        return bool(buffer);
-    }
-    return resources.UpdateBuffer(buffer, 0u, data, size, error);
-}
-
 std::string keyFor(const R4EngineWorldAsset& asset, std::size_t geometry)
 {
     return std::to_string(asset.contentHash) + ":" + std::to_string(geometry);
@@ -370,6 +381,21 @@ bool isSelectedHudGeometry(const R4EngineHudRenderable& renderable, std::size_t 
         std::count(selected.begin(), selected.end(), static_cast<std::uint32_t>(geometryIndex)) == 1;
 }
 
+bool isSelectedHudEmissiveGeometry(const R4EngineHudRenderable& renderable, std::size_t geometryIndex)
+{
+    const auto& selected = renderable.emissiveGeometryIndices;
+    return geometryIndex < renderable.asset->geometry.size() &&
+        geometryIndex < renderable.geometryShaderFlags.size() &&
+        renderable.geometryShaderFlags[geometryIndex].emissive &&
+        std::count(selected.begin(), selected.end(), static_cast<std::uint32_t>(geometryIndex)) == 1;
+}
+
+bool isSelectedHudPrewarmGeometry(const R4EngineHudRenderable& renderable, std::size_t geometryIndex)
+{
+    return isSelectedHudGeometry(renderable, geometryIndex) ||
+        isSelectedHudEmissiveGeometry(renderable, geometryIndex);
+}
+
 bool hasInvalidHudGeometrySelection(const R4EngineHudRenderable& renderable)
 {
     const auto& selected = renderable.eligibleGeometryIndices;
@@ -379,6 +405,21 @@ bool hasInvalidHudGeometrySelection(const R4EngineHudRenderable& renderable)
         if (geometryIndex >= renderable.asset->geometry.size() ||
             std::find(selected.begin(), selected.begin() + selectionIndex, geometryIndex) !=
                 selected.begin() + selectionIndex)
+            return true;
+    }
+    if (!renderable.emissiveGeometryIndices.empty() &&
+        renderable.geometryShaderFlags.size() != renderable.asset->geometry.size())
+        return true;
+    for (std::size_t selectionIndex = 0;
+        selectionIndex < renderable.emissiveGeometryIndices.size(); ++selectionIndex)
+    {
+        const std::uint32_t geometryIndex = renderable.emissiveGeometryIndices[selectionIndex];
+        if (geometryIndex >= renderable.asset->geometry.size() ||
+            geometryIndex >= renderable.geometryShaderFlags.size() ||
+            !renderable.geometryShaderFlags[geometryIndex].emissive ||
+            std::find(renderable.emissiveGeometryIndices.begin(),
+                renderable.emissiveGeometryIndices.begin() + selectionIndex, geometryIndex) !=
+                renderable.emissiveGeometryIndices.begin() + selectionIndex)
             return true;
     }
     return false;
@@ -413,10 +454,10 @@ struct MetalR4HudAdapter::Impl
     };
     struct FrameSlot
     {
-        std::shared_ptr<IR4Buffer> vertices;
-        std::shared_ptr<IR4Buffer> vertexGlobals;
-        std::shared_ptr<IR4Buffer> transforms;
-        std::shared_ptr<IR4Buffer> fragmentGlobals;
+        R4FrameBufferSlice vertices;
+        R4FrameBufferSlice vertexGlobals;
+        R4FrameBufferSlice transforms;
+        R4FrameBufferSlice fragmentGlobals;
     };
 
     Options options;
@@ -424,6 +465,10 @@ struct MetalR4HudAdapter::Impl
     std::shared_ptr<IR4GraphicsPipeline> flatPipeline;
     std::shared_ptr<IR4GraphicsPipeline> bumpSkin4Pipeline;
     std::shared_ptr<IR4GraphicsPipeline> flatSkin4Pipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveCpuSkin0Pipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveCpuSkin0AccumulatorPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveHardwareSkin4Pipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveHardwareSkin4AccumulatorPipeline;
     std::shared_ptr<IR4Sampler> sampler;
     std::shared_ptr<IR4Texture> hudRain;
     std::unordered_map<std::string, Geometry> geometry;
@@ -431,6 +476,7 @@ struct MetalR4HudAdapter::Impl
     std::unordered_map<std::string, PermanentReject> rejected;
     std::unordered_set<std::string> reportedRejects;
     std::unordered_set<std::string> admittedThisFrame;
+    bool legacySelflightMismatchLogged = false;
 };
 
 MetalR4HudAdapter::MetalR4HudAdapter() = default;
@@ -492,6 +538,118 @@ bool MetalR4HudAdapter::Configure(IR4Backend& backend, const Options& options, s
     m_impl->flatPipeline = makePipeline(true, xray::metal::R4HudSkinRoute::CpuSkin0);
     m_impl->bumpSkin4Pipeline = makePipeline(false, xray::metal::R4HudSkinRoute::HardwareSkin4);
     m_impl->flatSkin4Pipeline = makePipeline(true, xray::metal::R4HudSkinRoute::HardwareSkin4);
+    if (!options.emissiveShaderDirectory.empty())
+    {
+        std::string emissiveError;
+        if (ValidateR4SelflightLMSCBundle(options.emissiveShaderDirectory, emissiveError))
+        {
+            const std::filesystem::path vertexPath =
+                options.emissiveShaderDirectory / "deffer_model_flat.vs.metallib";
+            const std::filesystem::path fragmentPath =
+                options.emissiveShaderDirectory / "accum_emissivel.ps.metallib";
+            const std::string vertexMetallib = vertexPath.string();
+            const std::string fragmentMetallib = fragmentPath.string();
+            R4GraphicsPipelineDesc emissive;
+            emissive.label = "R4 HUD models_selflightl accum_emissivel SKIN_0";
+            emissive.shaderKey = "r4-hud-selflightl-accum-emissivel-skin0-v1";
+            emissive.vertexMetallibPath = vertexMetallib.c_str();
+            emissive.fragmentMetallibPath = fragmentMetallib.c_str();
+            emissive.vertexAttributes = {
+                {11, 6, offsetof(R4DynamicWorldSkinnedVertex, position), R4VertexFormat::Float4},
+                {12, 6, offsetof(R4DynamicWorldSkinnedVertex, normal), R4VertexFormat::UChar4Normalized},
+                {13, 6, offsetof(R4DynamicWorldSkinnedVertex, tangent), R4VertexFormat::UChar4Normalized},
+                {14, 6, offsetof(R4DynamicWorldSkinnedVertex, binormal), R4VertexFormat::UChar4Normalized},
+                {15, 6, offsetof(R4DynamicWorldSkinnedVertex, texcoord), R4VertexFormat::Float2},
+            };
+            emissive.vertexLayouts = {{6, sizeof(R4DynamicWorldSkinnedVertex)}};
+            emissive.colorFormats = {R4PixelFormat::BGRA8Unorm};
+            emissive.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+            emissive.depthCompare = R4CompareFunction::LessEqual;
+            emissive.depthWrite = false;
+            emissive.cullMode = R4CullMode::Back;
+            emissive.frontFace = R4Winding::Clockwise;
+            emissive.stencil.enabled = true;
+            emissive.stencil.frontFace.compare = R4CompareFunction::Always;
+            emissive.stencil.frontFace.readMask = 0xffu;
+            emissive.stencil.frontFace.writeMask = 0xffu;
+            emissive.stencil.frontFace.depthStencilPass = R4StencilOperation::Replace;
+            emissive.stencil.backFace = emissive.stencil.frontFace;
+            m_impl->emissiveCpuSkin0Pipeline = backend.CreateGraphicsPipeline(emissive, emissiveError);
+            if (m_impl->emissiveCpuSkin0Pipeline)
+            {
+                std::fprintf(stderr,
+                    "METAL_HUD_EMISSIVE_PREPARED enabled=true bundle=\"%s\" VS=deffer_model_flat.vs PS=accum_emissivel.ps\n",
+                    options.emissiveShaderDirectory.generic_string().c_str());
+                R4GraphicsPipelineDesc accumulator = emissive;
+                accumulator.label = "R4 HUD selflightl first accumulator SKIN_0";
+                accumulator.shaderKey = "r4-hud-selflightl-accum-emissivel-skin0-rgba16f-v1";
+                accumulator.colorFormats = {R4PixelFormat::RGBA16Float};
+                m_impl->emissiveCpuSkin0AccumulatorPipeline = backend.CreateGraphicsPipeline(
+                    accumulator, emissiveError);
+            }
+        }
+        if (!m_impl->emissiveCpuSkin0Pipeline)
+            std::fprintf(stderr, "METAL_HUD_EMISSIVE_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.empty() ? "selflightl MSC bundle unavailable" : emissiveError.c_str());
+        else if (!m_impl->emissiveCpuSkin0AccumulatorPipeline)
+            std::fprintf(stderr, "METAL_HUD_EMISSIVE_ACCUMULATOR_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.empty() ? "SKIN_0 accumulator PSO unavailable" : emissiveError.c_str());
+    }
+    if (!options.emissiveSkin4ShaderDirectory.empty())
+    {
+        std::string emissiveError;
+        if (ValidateR4SelflightLSkin4MSCBundle(options.emissiveSkin4ShaderDirectory, emissiveError))
+        {
+            const std::filesystem::path vertexPath =
+                options.emissiveSkin4ShaderDirectory / "deffer_model_flat.vs.metallib";
+            const std::filesystem::path fragmentPath =
+                options.emissiveSkin4ShaderDirectory / "accum_emissivel.ps.metallib";
+            const std::string vertexMetallib = vertexPath.string();
+            const std::string fragmentMetallib = fragmentPath.string();
+            R4GraphicsPipelineDesc emissive;
+            emissive.label = "R4 HUD models_selflightl accum_emissivel SKIN_4 bloom";
+            emissive.shaderKey = "r4-hud-selflightl-accum-emissivel-skin4-bgra8-v1";
+            emissive.vertexMetallibPath = vertexMetallib.c_str();
+            emissive.fragmentMetallibPath = fragmentMetallib.c_str();
+            emissive.vertexAttributes = {
+                {11, 6, offsetof(xray::metal::R4HudHardware4Vertex, position), R4VertexFormat::Float4},
+                {12, 6, offsetof(xray::metal::R4HudHardware4Vertex, normalWeight), R4VertexFormat::UChar4Normalized},
+                {13, 6, offsetof(xray::metal::R4HudHardware4Vertex, tangentWeight), R4VertexFormat::UChar4Normalized},
+                {14, 6, offsetof(xray::metal::R4HudHardware4Vertex, binormalWeight), R4VertexFormat::UChar4Normalized},
+                {15, 6, offsetof(xray::metal::R4HudHardware4Vertex, texcoord), R4VertexFormat::Float2},
+                {16, 6, offsetof(xray::metal::R4HudHardware4Vertex, boneIndices), R4VertexFormat::UChar4Normalized},
+            };
+            emissive.vertexLayouts = {{6, sizeof(xray::metal::R4HudHardware4Vertex)}};
+            emissive.colorFormats = {R4PixelFormat::BGRA8Unorm};
+            emissive.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+            emissive.depthCompare = R4CompareFunction::LessEqual;
+            emissive.depthWrite = false;
+            emissive.cullMode = R4CullMode::Back;
+            emissive.frontFace = R4Winding::Clockwise;
+            emissive.stencil.enabled = true;
+            emissive.stencil.frontFace.compare = R4CompareFunction::Always;
+            emissive.stencil.frontFace.readMask = 0xffu;
+            emissive.stencil.frontFace.writeMask = 0xffu;
+            emissive.stencil.frontFace.depthStencilPass = R4StencilOperation::Replace;
+            emissive.stencil.backFace = emissive.stencil.frontFace;
+            m_impl->emissiveHardwareSkin4Pipeline = backend.CreateGraphicsPipeline(emissive, emissiveError);
+            if (m_impl->emissiveHardwareSkin4Pipeline)
+            {
+                R4GraphicsPipelineDesc accumulator = emissive;
+                accumulator.label = "R4 HUD selflightl first accumulator SKIN_4";
+                accumulator.shaderKey = "r4-hud-selflightl-accum-emissivel-skin4-rgba16f-v1";
+                accumulator.colorFormats = {R4PixelFormat::RGBA16Float};
+                m_impl->emissiveHardwareSkin4AccumulatorPipeline = backend.CreateGraphicsPipeline(
+                    accumulator, emissiveError);
+            }
+        }
+        if (!m_impl->emissiveHardwareSkin4Pipeline)
+            std::fprintf(stderr, "METAL_HUD_EMISSIVE_SKIN4_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.empty() ? "selflightl SKIN_4 MSC bundle unavailable" : emissiveError.c_str());
+        else if (!m_impl->emissiveHardwareSkin4AccumulatorPipeline)
+            std::fprintf(stderr, "METAL_HUD_EMISSIVE_SKIN4_ACCUMULATOR_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.empty() ? "SKIN_4 accumulator PSO unavailable" : emissiveError.c_str());
+    }
     R4SamplerDesc samplerDesc;
     samplerDesc.label = "R4 HUD MSC base sampler";
     samplerDesc.maxAnisotropy = 8u;
@@ -569,7 +727,7 @@ bool MetalR4HudAdapter::Prewarm(IR4Backend& backend,
 		}
         for (std::size_t geometryIndex = 0; geometryIndex < renderable.asset->geometry.size(); ++geometryIndex)
         {
-			if (!isSelectedHudGeometry(renderable, geometryIndex))
+			if (!isSelectedHudPrewarmGeometry(renderable, geometryIndex))
 				continue;
             ++m_telemetry.requested;
             const R4EngineWorldGeometry& source = renderable.asset->geometry[geometryIndex];
@@ -705,14 +863,8 @@ bool MetalR4HudAdapter::Prewarm(IR4Backend& backend,
                     continue;
                 }
                 const std::size_t vertexBytes = vertices.size() * sizeof(vertices.front());
-                if (!buffers.vertices)
-                {
-                    R4BufferDesc vertexDesc{vertexBytes, R4ResourceStorage::Private,
-                        R4BufferUsage::Vertex, "R4 HUD CPU-skinned SKIN_0"};
-                    buffers.vertices = resources.CreateBuffer(vertexDesc, nullptr, 0u, localError);
-                }
-                if (!buffers.vertices || !resources.UpdateBuffer(
-                        buffers.vertices, 0u, vertices.data(), vertexBytes, localError))
+                if (!backend.UploadFrameData(vertices.data(), vertexBytes, 16u,
+                        buffers.vertices, localError))
                 {
                     ++m_telemetry.rejectUpload;
                     ++m_telemetry.rejected;
@@ -779,9 +931,12 @@ bool MetalR4HudAdapter::Prewarm(IR4Backend& backend,
             std::memcpy(fragmentGlobals.data() + 160u, snapshot->ssfxPom.data(), sizeof(snapshot->ssfxPom));
             std::memcpy(fragmentGlobals.data() + 176u, snapshot->ssfxHudDrops1.data(), sizeof(snapshot->ssfxHudDrops1));
             std::memcpy(fragmentGlobals.data() + 192u, snapshot->ssfxHudDrops2.data(), sizeof(snapshot->ssfxHudDrops2));
-            if (!updateUniform(resources, buffers.vertexGlobals, vertexGlobals.size(), vertexGlobals.data(), "R4 HUD vertex globals", localError) ||
-                !updateUniform(resources, buffers.transforms, transforms.size(), transforms.data(), "R4 HUD transforms", localError) ||
-                !updateUniform(resources, buffers.fragmentGlobals, fragmentGlobals.size(), fragmentGlobals.data(), "R4 HUD fragment globals", localError))
+            if (!backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u,
+                    buffers.vertexGlobals, localError) ||
+                !backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                    buffers.transforms, localError) ||
+                !backend.UploadFrameData(fragmentGlobals.data(), fragmentGlobals.size(), 256u,
+                    buffers.fragmentGlobals, localError))
             {
                 ++m_telemetry.rejectUpload;
                 ++m_telemetry.rejected;
@@ -819,19 +974,19 @@ bool MetalR4HudAdapter::Draw(IR4Backend& backend,
             const Impl::Geometry& cached = geometry->second;
             const Impl::FrameSlot& buffers = instance->second;
             R4MscStageBindings vertex{R4ShaderStage::Vertex, 48u, {
-                {R4MscResourceType::ConstantBuffer, 0u, buffers.vertexGlobals, 0u, kVertexGlobalsSize},
-                {R4MscResourceType::ConstantBuffer, 24u, buffers.transforms, 0u, kTransformsSize}}};
+                {R4MscResourceType::ConstantBuffer, 0u, buffers.vertexGlobals.buffer, buffers.vertexGlobals.offset, kVertexGlobalsSize},
+                {R4MscResourceType::ConstantBuffer, 24u, buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize}}};
             R4MscStageBindings fragment;
             fragment.stage = R4ShaderStage::Fragment;
             if (cached.flat)
             {
                 fragment.tlabSize = 120u;
-                fragment.resources = {{R4MscResourceType::Texture, 0u, {}, 0u, 0u, cached.base}, {R4MscResourceType::Texture, 24u, {}, 0u, 0u, m_impl->hudRain}, {R4MscResourceType::ConstantBuffer, 48u, buffers.fragmentGlobals, 0u, kFragmentGlobalsSize}, {R4MscResourceType::ConstantBuffer, 72u, buffers.transforms, 0u, kTransformsSize}, {R4MscResourceType::Sampler, 96u, {}, 0u, 0u, {}, m_impl->sampler}};
+                fragment.resources = {{R4MscResourceType::Texture, 0u, {}, 0u, 0u, cached.base}, {R4MscResourceType::Texture, 24u, {}, 0u, 0u, m_impl->hudRain}, {R4MscResourceType::ConstantBuffer, 48u, buffers.fragmentGlobals.buffer, buffers.fragmentGlobals.offset, kFragmentGlobalsSize}, {R4MscResourceType::ConstantBuffer, 72u, buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize}, {R4MscResourceType::Sampler, 96u, {}, 0u, 0u, {}, m_impl->sampler}};
             }
             else
             {
                 fragment.tlabSize = 144u;
-                fragment.resources = {{R4MscResourceType::Texture, 0u, {}, 0u, 0u, cached.base}, {R4MscResourceType::Texture, 24u, {}, 0u, 0u, cached.bump}, {R4MscResourceType::Texture, 48u, {}, 0u, 0u, m_impl->hudRain}, {R4MscResourceType::ConstantBuffer, 72u, buffers.fragmentGlobals, 0u, kFragmentGlobalsSize}, {R4MscResourceType::ConstantBuffer, 96u, buffers.transforms, 0u, kTransformsSize}, {R4MscResourceType::Sampler, 120u, {}, 0u, 0u, {}, m_impl->sampler}};
+                fragment.resources = {{R4MscResourceType::Texture, 0u, {}, 0u, 0u, cached.base}, {R4MscResourceType::Texture, 24u, {}, 0u, 0u, cached.bump}, {R4MscResourceType::Texture, 48u, {}, 0u, 0u, m_impl->hudRain}, {R4MscResourceType::ConstantBuffer, 72u, buffers.fragmentGlobals.buffer, buffers.fragmentGlobals.offset, kFragmentGlobalsSize}, {R4MscResourceType::ConstantBuffer, 96u, buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize}, {R4MscResourceType::Sampler, 120u, {}, 0u, 0u, {}, m_impl->sampler}};
             }
             R4IndexedDrawDesc draw;
             draw.indexBuffer = cached.indices;
@@ -840,14 +995,136 @@ bool MetalR4HudAdapter::Draw(IR4Backend& backend,
                 (cached.flat ? m_impl->flatSkin4Pipeline : m_impl->bumpSkin4Pipeline) :
                 (cached.flat ? m_impl->flatPipeline : m_impl->bumpPipeline);
             const std::shared_ptr<IR4Buffer>& vertexBuffer =
-                cached.hardware4 ? cached.hardwareVertices : buffers.vertices;
+                cached.hardware4 ? cached.hardwareVertices : buffers.vertices.buffer;
+            const std::size_t vertexOffset = cached.hardware4 ? 0u : buffers.vertices.offset;
             if (!backend.BindGraphicsPipeline(pipeline, error) ||
                 !backend.BindMscResources(vertex, error) || !backend.BindMscResources(fragment, error) ||
-                !backend.BindVertexBuffer(6u, vertexBuffer, 0u, error) || !backend.SetStencilReference(1u, error) ||
+                !backend.BindVertexBuffer(6u, vertexBuffer, vertexOffset, error) || !backend.SetStencilReference(1u, error) ||
                 !backend.DrawIndexed(draw, error)) return false;
             ++m_telemetry.submitted;
             if (cached.hardware4) ++m_telemetry.skin4Submitted;
             if (cached.flat) ++m_telemetry.flatDraws; else ++m_telemetry.bumpDraws;
+        }
+    }
+    return true;
+}
+
+bool MetalR4HudAdapter::DrawEmissive(IR4Backend& backend,
+    const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+    const float pdaDisplayFactor, std::string& error)
+{
+    return DrawEmissiveTarget(backend, snapshot, pdaDisplayFactor, false, error);
+}
+
+bool MetalR4HudAdapter::DrawEmissiveAccumulator(IR4Backend& backend,
+    const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+    const float pdaDisplayFactor, std::string& error)
+{
+    return DrawEmissiveTarget(backend, snapshot, pdaDisplayFactor, true, error);
+}
+
+bool MetalR4HudAdapter::DrawEmissiveTarget(IR4Backend& backend,
+    const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+    const float pdaDisplayFactor, const bool accumulator, std::string& error)
+{
+    if (!m_ready || !m_impl || !snapshot || !snapshot->valid)
+        return true;
+    const std::size_t frameSlot = backend.ActiveFrameContextIndex();
+    std::array<std::uint8_t, kEmissiveFragmentGlobalsSize> fragmentGlobals{};
+    std::memcpy(fragmentGlobals.data() + kEmissivePdaParamsOffset,
+        &pdaDisplayFactor, sizeof(pdaDisplayFactor));
+    R4FrameBufferSlice pdaParameters;
+    bool uploadedParameters = false;
+    for (std::size_t renderableIndex = 0; renderableIndex < snapshot->renderables.size(); ++renderableIndex)
+    {
+        const R4EngineHudRenderable& renderable = snapshot->renderables[renderableIndex];
+        if (!renderable.asset || hasInvalidHudGeometrySelection(renderable))
+            continue;
+        for (std::size_t geometryIndex = 0; geometryIndex < renderable.asset->geometry.size(); ++geometryIndex)
+        {
+            if (!isSelectedHudEmissiveGeometry(renderable, geometryIndex))
+                continue;
+            const R4EngineWorldGeometry& source = renderable.asset->geometry[geometryIndex];
+            if (!isModelsSelflightFamily(source.shaderName))
+                continue;
+            if (accumulator) ++m_telemetry.emissiveAccumulatorCandidates;
+            else ++m_telemetry.emissiveCandidates;
+            if (!isModelsSelflightL(source.shaderName))
+            {
+                if (!m_impl->legacySelflightMismatchLogged)
+                {
+                    std::fprintf(stderr,
+                        "METAL_HUD_EMISSIVE_REJECT family=models_selflight reason=converted_vertex_stage_has_no_uv_output\n");
+                    m_impl->legacySelflightMismatchLogged = true;
+                }
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            if (!source.skinned || !std::isfinite(pdaDisplayFactor))
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            const std::string key = keyFor(*renderable.asset, geometryIndex);
+            const std::string instanceKey = key + ":renderable:" + std::to_string(renderableIndex) +
+                ":slot:" + std::to_string(frameSlot);
+            const auto geometry = m_impl->geometry.find(key);
+            const auto instance = m_impl->frameSlots.find(instanceKey);
+            if (geometry == m_impl->geometry.end() || instance == m_impl->frameSlots.end() ||
+                !geometry->second.indices || !geometry->second.base)
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            const bool hardware4 = geometry->second.hardware4;
+            const std::shared_ptr<IR4GraphicsPipeline>& pipeline = accumulator ?
+                (hardware4 ? m_impl->emissiveHardwareSkin4AccumulatorPipeline :
+                    m_impl->emissiveCpuSkin0AccumulatorPipeline) :
+                (hardware4 ? m_impl->emissiveHardwareSkin4Pipeline :
+                    m_impl->emissiveCpuSkin0Pipeline);
+            const std::shared_ptr<IR4Buffer>& vertexBuffer = hardware4 ?
+                geometry->second.hardwareVertices : instance->second.vertices.buffer;
+            const std::size_t vertexOffset = hardware4 ? 0u : instance->second.vertices.offset;
+            if (m_impl->admittedThisFrame.find(instanceKey) == m_impl->admittedThisFrame.end() ||
+                !vertexBuffer || !pipeline)
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            if (!uploadedParameters)
+            {
+                if (!backend.UploadFrameData(fragmentGlobals.data(), fragmentGlobals.size(),
+                        256u, pdaParameters, error))
+                    return false;
+                uploadedParameters = true;
+            }
+            R4MscStageBindings vertex{R4ShaderStage::Vertex, 48u, {
+                {R4MscResourceType::ConstantBuffer, 0u, instance->second.vertexGlobals.buffer,
+                    instance->second.vertexGlobals.offset, kVertexGlobalsSize},
+                {R4MscResourceType::ConstantBuffer, 24u, instance->second.transforms.buffer,
+                    instance->second.transforms.offset, kTransformsSize},
+            }};
+            R4MscStageBindings fragment{R4ShaderStage::Fragment, 72u, {
+                {R4MscResourceType::Texture, 0u, {}, 0u, 0u, geometry->second.base},
+                {R4MscResourceType::ConstantBuffer, 24u, pdaParameters.buffer,
+                    pdaParameters.offset, kEmissiveFragmentGlobalsSize},
+                {R4MscResourceType::Sampler, 48u, {}, 0u, 0u, {}, m_impl->sampler},
+            }};
+            R4IndexedDrawDesc draw;
+            draw.indexBuffer = geometry->second.indices;
+            draw.indexCount = geometry->second.indexCount;
+            draw.indexType = R4IndexType::UInt16;
+            if (!backend.BindGraphicsPipeline(pipeline, error) ||
+                !backend.BindMscResources(vertex, error) || !backend.BindMscResources(fragment, error) ||
+                !backend.BindVertexBuffer(6u, vertexBuffer, vertexOffset, error) ||
+                !backend.SetStencilReference(1u, error) || !backend.DrawIndexed(draw, error))
+                return false;
+            if (accumulator) ++m_telemetry.emissiveAccumulatorDraws;
+            else ++m_telemetry.emissiveDraws;
         }
     }
     return true;

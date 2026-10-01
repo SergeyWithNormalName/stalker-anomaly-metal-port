@@ -3,6 +3,7 @@
 //////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include <dinput.h>
 #include ".\uicheckbutton.h"
 #include "UIXmlInit.h"
 #include "UIHint.h"
@@ -111,4 +112,25 @@ bool CUICheckButton::OnMouseDown(int mouse_btn)
 bool CUICheckButton::OnMouseAction(float x, float y, EUIMessages mouse_action)
 {
 	return CUIWindow::OnMouseAction(x, y, mouse_action);
+}
+
+bool CUICheckButton::OnKeyboardAction(int dik, EUIMessages keyboard_action)
+{
+	// Dialog keyboard dispatch visits every enabled child, including controls
+	// in other settings panels. Only the control under the cursor may toggle.
+	if (keyboard_action == WINDOW_KEY_PRESSED && IsShown() && CursorOverWindow())
+	{
+		if (dik == DIK_RETURN || dik == DIK_SPACE || dik == (0xed + 100) /* MOUSE_1 */)
+		{
+			if (GetButtonState() == BUTTON_NORMAL)
+				SetButtonState(BUTTON_PUSHED);
+			else
+				SetButtonState(BUTTON_NORMAL);
+
+			GetMessageTarget()->SendMessage(this, BUTTON_CLICKED, NULL);
+			return true;
+		}
+	}
+
+	return inherited::OnKeyboardAction(dik, keyboard_action);
 }

@@ -1,0 +1,205 @@
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -469,6 +469,20 @@
+     };
+     std::vector<ShadowGroup> shadowGroups;
+     bool shadowInstancing = false;
++    bool shadowStateCensus = false;
++    bool censusTargetSet = false;
++    std::uint32_t censusTargetFrame = 0;
++    bool censusStarted = false;
++    bool censusFinished = false;
++    std::uint32_t censusFrame = 0;
++    struct CensusView
++    {
++        std::uint8_t family;
++        std::uint64_t identity;
++        std::uint32_t face;
++        std::array<float, 16> lightViewProjection;
++    };
++    std::vector<CensusView> censusedViews;
+     bool reuseVisibleGlobals = std::getenv("XRAY_METAL_E08_FLORA_REUSE_GLOBALS") != nullptr;
+     std::vector<std::uint8_t> visibleVertexGlobals;
+     std::vector<std::uint8_t> visibleFragmentGlobals;
+@@ -496,6 +510,26 @@
+     m_status.clear();
+     m_telemetry = {};
+     m_impl = std::make_unique<Impl>();
++    const char* censusFlag = std::getenv("XRAY_METAL_FLORA_SHADOW_STATE_CENSUS");
++    m_impl->shadowStateCensus = censusFlag && std::strcmp(censusFlag, "1") == 0;
++    if (m_impl->shadowStateCensus)
++    {
++        if (const char* target = std::getenv("XRAY_METAL_FLORA_SHADOW_STATE_CENSUS_FRAME"))
++        {
++            char* end = nullptr;
++            const unsigned long long frame = std::strtoull(target, &end, 10);
++            if (!*target || !end || *end || frame > std::numeric_limits<std::uint32_t>::max())
++            {
++                std::fprintf(stderr, "METAL_FLORA_SHADOW_STATE_CENSUS_DISABLED reason=invalid_frame\n");
++                m_impl->shadowStateCensus = false;
++            }
++            else
++            {
++                m_impl->censusTargetSet = true;
++                m_impl->censusTargetFrame = static_cast<std::uint32_t>(frame);
++            }
++        }
++    }
+     std::unordered_map<std::string, R4FloraBlenderMaterial> materialFlags;
+     for (const R4FloraBlenderMaterial& material : options.shaderMaterials)
+     {
+@@ -1057,7 +1091,8 @@
+ 
+ bool MetalR4FloraAdapter::DrawShadowCasters(IR4Backend& backend,
+     const std::array<float, 16>& lightViewProjection,
+-    const R4FloraViewState& view, std::string& error)
++    const R4FloraViewState& view, std::string& error,
++    const R4FloraShadowCensusView& census)
+ {
+     if (!m_ready || !m_impl || !view.valid)
+         return true;
+@@ -1250,6 +1285,93 @@
+             if (!group.models.empty() &&
+                 !encodeCaster(m_impl->draws[group.representative], &group.models))
+                 return false;
++    if (m_impl->shadowStateCensus && m_impl->shadowInstancing &&
++        (census.family == 1u || census.family == 2u) &&
++        !view.shadowIgnoreAlpha && !view.shadowOnlyOffCamera && !m_impl->censusFinished)
++    {
++        if (!m_impl->censusStarted &&
++            (m_impl->censusTargetSet ? census.engineFrame == m_impl->censusTargetFrame :
++                census.engineFrame % 120u == 0u))
++        {
++            m_impl->censusStarted = true;
++            m_impl->censusFrame = census.engineFrame;
++        }
++        if (m_impl->censusStarted && census.engineFrame != m_impl->censusFrame)
++        {
++            std::fprintf(stderr, "METAL_FLORA_SHADOW_STATE_CENSUS_DONE frame=%u unique_views=%zu\n",
++                m_impl->censusFrame, m_impl->censusedViews.size());
++            m_impl->censusFinished = true;
++        }
++        if (m_impl->censusStarted && !m_impl->censusFinished)
++        {
++            const Impl::CensusView key{census.family, census.identity,
++                census.face, lightViewProjection};
++            const bool alreadySeen = std::any_of(m_impl->censusedViews.begin(),
++                m_impl->censusedViews.end(), [&key](const auto& previous) {
++                    return previous.family == key.family && previous.identity == key.identity &&
++                        previous.face == key.face && std::memcmp(previous.lightViewProjection.data(),
++                            key.lightViewProjection.data(), sizeof(Matrix4)) == 0;
++                });
++            // A hard cap bounds diagnostic work and log output in pathological
++            // scenes. It is explicit in the log and cannot silently imply a full census.
++            if (!alreadySeen && m_impl->censusedViews.size() < 1024u)
++            {
++                m_impl->censusedViews.push_back(key);
++                std::vector<std::size_t> groups;
++                std::vector<const IR4GraphicsPipeline*> pipelineKeys;
++                const auto pipelineFor = [&](const auto& draw) {
++                    return (draw.material == Impl::Material::LeafBump ?
++                        m_impl->leafInstancedShadowPipeline : m_impl->trunkInstancedShadowPipeline).get();
++                };
++                // Key order follows all immutable groups, matching the runtime
++                // draft's Prepare-time partition even when its first group is culled.
++                for (std::size_t index = 0; index < m_impl->shadowGroups.size(); ++index)
++                {
++                    const auto* pipeline = pipelineFor(m_impl->draws[
++                        m_impl->shadowGroups[index].representative]);
++                    if (std::find(pipelineKeys.begin(), pipelineKeys.end(), pipeline) == pipelineKeys.end())
++                        pipelineKeys.push_back(pipeline);
++                    if (!m_impl->shadowGroups[index].models.empty())
++                        groups.push_back(index);
++                }
++                std::vector<std::size_t> partitioned;
++                partitioned.reserve(groups.size());
++                for (const auto* pipeline : pipelineKeys)
++                    for (const auto index : groups)
++                        if (pipelineFor(m_impl->draws[m_impl->shadowGroups[index].representative]) == pipeline)
++                            partitioned.push_back(index);
++                const auto counts = [&](const auto& order) {
++                    std::array<std::size_t, 2> result{};
++                    const IR4GraphicsPipeline* lastPso = nullptr;
++                    const IR4Buffer* lastVb = nullptr;
++                    for (const auto index : order)
++                    {
++                        const auto& draw = m_impl->draws[m_impl->shadowGroups[index].representative];
++                        const auto* pso = pipelineFor(draw);
++                        if (pso != lastPso) { ++result[0]; lastPso = pso; }
++                        if (draw.vertices.get() != lastVb) { ++result[1]; lastVb = draw.vertices.get(); }
++                    }
++                    return result;
++                };
++                const auto current = counts(groups);
++                const auto grouped = counts(partitioned);
++                std::fprintf(stderr,
++                    "METAL_FLORA_SHADOW_STATE_CENSUS frame=%u family=%s identity=%llu face=%u "
++                    "view=%zu total_groups=%zu selected_groups=%zu broad_candidates=%zu instances=%zu "
++                    "current_pso_binds=%zu grouped_pso_binds=%zu current_vb_binds=%zu grouped_vb_binds=%zu\n",
++                    census.engineFrame, census.family == 1u ? "local" : "sun",
++                    static_cast<unsigned long long>(census.identity), census.face,
++                    m_impl->censusedViews.size(), m_impl->shadowGroups.size(), groups.size(), selected.size(),
++                    m_telemetry.shadowSubmittedVisuals, current[0], grouped[0], current[1], grouped[1]);
++            }
++            else if (!alreadySeen)
++            {
++                std::fprintf(stderr, "METAL_FLORA_SHADOW_STATE_CENSUS_TRUNCATED frame=%u cap=1024\n",
++                    census.engineFrame);
++                m_impl->censusFinished = true;
++            }
++        }
++    }
+     return true;
+ }
+ 
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -14,6 +14,16 @@
+ // This is deliberately a standalone admission adapter.  MetalR4EngineScene
+ // owns the G-buffer pass and may decide later whether to call it; the adapter
+ // never opens, closes, or submits a pass itself.
++// Observer provenance only. Family 1=production local, 2=production sun.
++// A default context excludes standalone and validation views from the census.
++struct R4FloraShadowCensusView
++{
++    std::uint32_t engineFrame = 0;
++    std::uint8_t family = 0;
++    std::uint64_t identity = 0;
++    std::uint32_t face = 0;
++};
++
+ struct R4FloraViewState
+ {
+     std::array<float, 16> view{};
+@@ -133,7 +143,8 @@
+     // the exact matrix used by the corresponding Windows shadow phase.
+     bool DrawShadowCasters(IR4Backend& backend,
+         const std::array<float, 16>& lightViewProjection,
+-        const R4FloraViewState& view, std::string& error);
++        const R4FloraViewState& view, std::string& error,
++        const R4FloraShadowCensusView& census = {});
+ 
+     // Diagnostic-only draw into an isolated scene-owned pass. Selects one
+     // implementation for this call and restores configured mode/telemetry.
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -3537,7 +3537,8 @@
+         }
+         std::array<float,16> tileMatrix{};
+         std::memcpy(tileMatrix.data(),lightViewProjections[tile].elements,sizeof(Matrix4));
+-        if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,tileMatrix,floraView,error))
++        if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,tileMatrix,floraView,error,
++                {view.engineFrame, 1u, record.lightIdentity, record.face}))
+             return false;
+         const auto sourceLight=std::find_if(snapshot->lights.begin(),snapshot->lights.end(),
+             [&](const auto& light) { return light.lightId==record.lightIdentity; });
+@@ -4534,7 +4535,8 @@
+                 !drawDefObjectsLodSunCasters(matrix,error)) return false;
+             std::array<float,16> lightVP{};
+             std::memcpy(lightVP.data(),matrix.elements,sizeof(Matrix4));
+-            if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,lightVP,floraView,error))
++            if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,lightVP,floraView,error,
++                    {view.engineFrame, 2u, cascade, 0u}))
+                 return false;
+             if (detail && detail->IsReady() && environment.grassShadows &&
+                 cascade<=environment.ssfxGrassShadows[0])

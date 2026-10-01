@@ -1,7 +1,20 @@
 #include "MetalR4FloraAdapter.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+
+class xrMemory
+{
+public:
+    xrMemory() {}
+    void mem_free(void* p);
+};
+xrMemory Memory;
+void xrMemory::mem_free(void* p)
+{
+    std::free(p);
+}
 
 int main(int argc, char** argv)
 {

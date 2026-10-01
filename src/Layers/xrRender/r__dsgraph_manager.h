@@ -23,6 +23,9 @@ public:
 		Fsphere bounds;
 		u32 visualType = 0;
 		u16 objectId = u16(-1);
+		// Legacy object and leaf shadow gates, resolved while the live engine
+		// renderable is available. Main-view geometry may remain non-casting.
+		bool castsShadow = true;
 		// Legacy R4 publishes L_hotness only when the active base texture is
 		// explicitly marked hot.  Preserve that resolved value in the CPU-only
 		// capture so Direct Metal never needs to borrow a CTexture or D3D state.
@@ -84,6 +87,8 @@ public:
 		// Explicit CPU-asset geometry subset selected by renderer-owned Metal
 		// admission. An empty list intentionally means no drawable geometry.
 		xr_vector<u32> eligibleGeometryIndices;
+		xr_vector<u32> emissiveGeometryIndices;
+		xr_vector<SelectedShaderFlags> geometryShaderFlags;
 		// Scope materials never fall through eligibleGeometryIndices. Each value
 		// identifies one immutable OGF leaf and its role in the 3DSS triplet.
 		xr_vector<ScopeLeaf> scopeLeaves;
@@ -138,6 +143,7 @@ public:
 	{
 		enum class Type : u8 { Point, Spot, OmniFace };
 		u64 identity = 0;
+        u64 parentIdentity = 0;
 		Type type = Type::Point;
 		Fvector position;
 		Fvector direction;
@@ -149,6 +155,8 @@ public:
 		bool active = false;
 		bool staticLight = false;
 		bool shadowed = false;
+		bool decorative = false;
+		float cameraDistance = 0.f;
 		bool hudMode = false;
 		u8 omniFace = 0xff;
 		shared_str projectorTexture;
@@ -193,6 +201,8 @@ public:
 	// as player_legs_controller and their explicit transforms.
 	xr_vector<MetalWorldRenderable>				metalWorldCaptureStaging;
 	bool									metalWorldCaptureActive = false;
+	bool									metalWorldCaptureObjectCastsShadow = false;
+	bool									metalWorldCaptureShadowAllowed = false;
 	IKinematics*							metalWorldCaptureKinematics = nullptr;
 	u32									metalWorldFrame = u32(-1);
 	xr_vector<MetalHudRenderable>					metalHudRenderables;
@@ -337,6 +347,8 @@ public:
 		metalWorldRenderables.clear();
 		metalWorldCaptureStaging.clear();
 		metalWorldCaptureActive = false;
+		metalWorldCaptureObjectCastsShadow = false;
+		metalWorldCaptureShadowAllowed = false;
 		metalWorldCaptureKinematics = nullptr;
 		metalWorldFrame = u32(-1);
 		metalHudRenderables.clear();

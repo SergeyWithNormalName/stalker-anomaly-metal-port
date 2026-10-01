@@ -1,0 +1,252 @@
+--- scratch/gameplay-rescue-20260929/prestate/luabind-policy.hpp	2026-09-06 15:15:14
++++ src/3rd party/luabind/detail/policy.hpp	2026-09-29 10:33:44
+@@ -34,6 +34,7 @@
+ #include <luabind/detail/class_registry.hpp>
+ #include <luabind/detail/class_cache.hpp>
+ #include <luabind/detail/implicit_cast.hpp>
++#include <luabind/detail/narrow_numeric_cast.hpp>
+ 
+ #include <sm_boost/typelist.hpp>
+ 
+@@ -353,7 +354,7 @@
+ 			{
+ 				return 0;
+ 			}
+-			return static_cast<char>(lua_tonumber(L, index));
++			return detail::narrow_numeric_cast<char>(lua_tonumber(L, index));
+ 		}
+ 		PRIMITIVE_MATCHER(char)
+ 		{
+@@ -373,7 +374,7 @@
+ 			{
+ 				return 0;
+ 			}
+-			return static_cast<char>(lua_tonumber(L, index));
++			return detail::narrow_numeric_cast<signed char>(lua_tonumber(L, index));
+ 		}
+ 		PRIMITIVE_MATCHER(signed char)
+ 		{
+@@ -393,7 +394,7 @@
+ 			{
+ 				return 0;
+ 			}
+-			return static_cast<unsigned char>(lua_tonumber(L, index));
++			return detail::narrow_numeric_cast<unsigned char>(lua_tonumber(L, index));
+ 		}
+ 		PRIMITIVE_MATCHER(unsigned char)
+ 		{
+@@ -414,7 +415,7 @@
+ 				return 0;
+ 			}
+ 
+-			return static_cast<short>(lua_tonumber(L, index));
++			return detail::narrow_numeric_cast<short>(lua_tonumber(L, index));
+ 		}
+ 		PRIMITIVE_MATCHER(short)
+ 		{
+@@ -433,7 +434,7 @@
+ 			{
+ 				return 0;
+ 			}
+-			return static_cast<unsigned short>(lua_tonumber(L, index));
++			return detail::narrow_numeric_cast<unsigned short>(lua_tonumber(L, index));
+ 		}
+ 		PRIMITIVE_MATCHER(unsigned short)
+ 		{
+--- /dev/null	2026-09-29 10:39:09
++++ src/3rd party/luabind/detail/narrow_numeric_cast.hpp	2026-09-29 10:37:56
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <cmath>
++#include <limits>
++#include <type_traits>
++
++namespace luabind { namespace detail {
++
++// A floating-to-narrow-integer cast outside the representable range is UB.
++// The installed Windows ChangeTeam byte boundary retains the low bits. ARM64
++// can pass the full register when the compiler assumes the cast was valid.
++// Define truncation and low-bit wrapping before the final representable cast;
++// word wrapping follows the same explicit policy, without a Windows claim.
++// Nonfinite Lua numbers have no integer bits and deliberately become zero.
++template <typename T>
++T narrow_numeric_cast(double value)
++{
++    static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool> && sizeof(T) <= 2u,
++        "narrow_numeric_cast is restricted to byte/word integral Lua arguments");
++    if (!std::isfinite(value))
++        return T{0};
++    const double integer = std::trunc(value);
++    constexpr double minimum = static_cast<double>((std::numeric_limits<T>::min)());
++    constexpr double maximum = static_cast<double>((std::numeric_limits<T>::max)());
++    if (integer >= minimum && integer <= maximum)
++        return static_cast<T>(integer);
++
++    using Unsigned = std::make_unsigned_t<T>;
++    constexpr double modulus = static_cast<double>((std::numeric_limits<Unsigned>::max)()) + 1.0;
++    double wrapped = std::fmod(integer, modulus);
++    if (wrapped < 0.0)
++        wrapped += modulus;
++    if constexpr (std::numeric_limits<T>::is_signed)
++        if (wrapped > maximum)
++            wrapped -= modulus;
++    return static_cast<T>(wrapped);
++}
++
++}} // namespace luabind::detail
+--- /dev/null	2026-09-29 10:39:09
++++ src/3rd party/luabind/tests/NarrowNumericProbe.cpp	2026-09-29 10:37:56
+@@ -0,0 +1,121 @@
++#include <cassert>
++#include <cstring>
++#include <cstdio>
++#include <limits>
++
++#include <luabind/luabind.hpp>
++
++namespace
++{
++using Converter = luabind::detail::primitive_converter<luabind::detail::Direction::lua_to_cpp>;
++
++template <typename T>
++T convert(lua_State* state)
++{
++    Converter converter;
++    return converter.apply(state, luabind::detail::by_value<T>{}, 1);
++}
++
++struct Case
++{
++    double number;
++    int u8, s8, u16, s16;
++};
++
++volatile int observedTeam = -1, observedSquad = -1, observedGroup = -1;
++
++// This separate typed callee exercises the optimized ARM64 byte-argument ABI,
++// including implicit promotion in the receiving method, like ChangeTeam.
++#if defined(_MSC_VER)
++__declspec(noinline)
++#else
++__attribute__((noinline))
++#endif
++void receive(unsigned char team, unsigned char squad, unsigned char group)
++{
++    observedTeam = team;
++    observedSquad = squad;
++    observedGroup = group;
++}
++
++int dispatch(lua_State* state)
++{
++    Converter converter;
++    void (*callback)(unsigned char, unsigned char, unsigned char) = receive;
++    callback(converter.apply(state, luabind::detail::by_value<unsigned char>{}, 1),
++        converter.apply(state, luabind::detail::by_value<unsigned char>{}, 2),
++        converter.apply(state, luabind::detail::by_value<unsigned char>{}, 3));
++    return 0;
++}
++
++bool run(lua_State* state)
++{
++    const Case cases[] = {
++        {0.0, 0, 0, 0, 0}, {6664.0, 8, 8, 6664, 6664},
++        {-1.0, 255, -1, 65535, -1}, {256.0, 0, 0, 256, 256},
++        {-256.0, 0, 0, 65280, -256}, {65536.0, 0, 0, 0, 0},
++        {65535.0, 255, -1, 65535, -1}, {32768.0, 0, 0, 32768, -32768},
++        {127.9, 127, 127, 127, 127}, {-129.9, 127, 127, 65407, -129},
++        {-0.9, 0, 0, 0, 0}, {255.75, 255, -1, 255, 255},
++        {std::numeric_limits<double>::quiet_NaN(), 0, 0, 0, 0},
++        {std::numeric_limits<double>::infinity(), 0, 0, 0, 0},
++        {-std::numeric_limits<double>::infinity(), 0, 0, 0, 0},
++        {std::numeric_limits<double>::max(), 0, 0, 0, 0},
++        {std::numeric_limits<double>::lowest(), 0, 0, 0, 0},
++    };
++    for (const Case& value : cases)
++    {
++        lua_settop(state, 0);
++        lua_pushnumber(state, value.number);
++        const int expectedChar = std::numeric_limits<char>::is_signed ? value.s8 : value.u8;
++        if (convert<unsigned char>(state) != value.u8 || convert<signed char>(state) != value.s8 ||
++            convert<unsigned short>(state) != value.u16 || convert<short>(state) != value.s16 ||
++            convert<char>(state) != expectedChar)
++        {
++            std::fprintf(stderr, "narrow conversion mismatch for %.17g\n", value.number);
++            return false;
++        }
++        if (Converter::match(state, luabind::detail::by_value<unsigned char>{}, 1) != 0)
++            return false;
++    }
++    lua_settop(state, 0);
++    lua_pushnil(state);
++    if (convert<char>(state) || convert<signed char>(state) || convert<unsigned char>(state) ||
++        convert<short>(state) || convert<unsigned short>(state))
++        return false;
++    lua_settop(state, 0);
++    lua_pushstring(state, "6664");
++    if (Converter::match(state, luabind::detail::by_value<unsigned char>{}, 1) != -1)
++        return false;
++
++    lua_settop(state, 0);
++    lua_pushcfunction(state, dispatch);
++    lua_pushnumber(state, 17.0);
++    lua_pushnumber(state, 6664.0);
++    lua_pushnumber(state, 257.0);
++    if (lua_pcall(state, 3, 0, 0) != 0 ||
++        observedTeam != 17 || observedSquad != 8 || observedGroup != 1)
++    {
++        std::fprintf(stderr, "typed callback observed %d/%d/%d\n",
++            observedTeam, observedSquad, observedGroup);
++        return false;
++    }
++    lua_settop(state, 0);
++    lua_pushnumber(state, 6664.0);
++    if (convert<int>(state) != 6664 || convert<unsigned int>(state) != 6664u ||
++        convert<long long>(state) != 6664ll || convert<unsigned long long>(state) != 6664ull)
++        return false;
++    std::printf("LUABIND_NARROW_NUMERIC PASS cases=%zu types=5 nil=0 callback=17/8/1 wide=unchanged char_signed=%u\n",
++        sizeof(cases) / sizeof(cases[0]), static_cast<unsigned>(std::numeric_limits<char>::is_signed));
++    return true;
++}
++} // namespace
++
++int main()
++{
++    lua_State* state = luaL_newstate();
++    if (!state) return 2;
++    const bool passed = run(state);
++    lua_close(state);
++    return passed ? 0 : 1;
++}
+--- /dev/null	2026-09-29 10:39:09
++++ script/test_luabind_narrow_numeric.sh	2026-09-29 10:37:11
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++project_root="$(cd "$(dirname "$0")/.." && pwd)"
++output_dir="${1:-$project_root/scratch/luabind-narrow-tests}"
++mkdir -p "$output_dir"
++if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists luajit; then
++    read -r -a lua_flags <<<"$(pkg-config --cflags --libs luajit)"
++elif [[ -f /opt/homebrew/include/luajit-2.1/lua.h ]]; then
++    lua_flags=(-I/opt/homebrew/include/luajit-2.1 -L/opt/homebrew/lib -lluajit-5.1)
++else
++    echo "LuaJIT development headers/library are required for the isolated probe." >&2
++    exit 2
++fi
++compiler="${CXX:-clang++}"
++common=(-std=c++17 -O2 -DNDEBUG -DLUABIND_NO_EXCEPTIONS -fms-extensions
++    -Wno-ignored-attributes -I"$project_root/src/3rd party" -I"$project_root/sdk/include"
++    "$project_root/src/3rd party/luabind/tests/NarrowNumericProbe.cpp")
++
++for mode in optimized unsigned-char ubsan; do
++    extra=(-Werror=return-type)
++    case "$mode" in
++        unsigned-char) extra+=(-funsigned-char) ;;
++        ubsan) extra+=(-fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=all) ;;
++    esac
++    "$compiler" "${common[@]}" "${extra[@]}" "${lua_flags[@]}" -o "$output_dir/$mode"
++    "$output_dir/$mode"
++done

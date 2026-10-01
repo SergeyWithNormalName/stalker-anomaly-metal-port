@@ -22,6 +22,12 @@
 #include <discord/discord.h>
 #include "render.h"
 #include <chrono>
+#if defined(XR_PLATFORM_APPLE)
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#endif
 
 // must be defined before include of FS_impl.h
 #define INCLUDE_FROM_ENGINE
@@ -374,12 +380,21 @@ extern int ps_framelimiter;
 extern u32 g_screenmode;
 
 CTimer FreezeTimer;
+#if defined(XR_PLATFORM_APPLE)
+static std::atomic<bool> g_freezeThreadStop{false};
+static std::mutex g_freezeThreadMutex;
+static std::condition_variable g_freezeThreadWake;
+#endif
 void mt_FreezeThread(void *ptr) {
 	float freezetime = 0.f;
 	float repeatcheck = 500.f;
 
 	while (true)
 	{
+#if defined(XR_PLATFORM_APPLE)
+		if (g_freezeThreadStop.load(std::memory_order_acquire))
+			break;
+#endif
 		PROF_EVENT();
 
 		if (g_loading_events.size())
@@ -397,7 +412,14 @@ void mt_FreezeThread(void *ptr) {
 		}
 		STOP_PROFILE;
 
+#if defined(XR_PLATFORM_APPLE)
+		std::unique_lock<std::mutex> lock(g_freezeThreadMutex);
+		g_freezeThreadWake.wait_for(lock, std::chrono::milliseconds(static_cast<int>(repeatcheck)), [] {
+			return g_freezeThreadStop.load(std::memory_order_acquire);
+		});
+#else
 		Sleep(repeatcheck);
+#endif
 	}
 }
 
@@ -493,6 +515,12 @@ void CRenderDevice::on_idle()
 	mFullTransformCam_prev = mFullTransformCam;
 
 	// Previous frame data -- 
+	if (dwFrame <= 1 || (mView_saved._11 == 0.0f && mView_saved._22 == 0.0f && mView_saved._33 == 0.0f && mView_saved._44 == 0.0f))
+	{
+		mView_saved = mView;
+		mProject_saved = mProject;
+		mFullTransform_saved = mFullTransform;
+	}
 	mView_prev = mView_saved;
 	mProject_prev = mProject_saved;
 	mFullTransform_prev = mFullTransform_saved; // Unused?
@@ -721,8 +749,24 @@ void CRenderDevice::Run()
 	}
 
 	// Start extra threads
+#if defined(XR_PLATFORM_APPLE)
+	// E01 fixture runs exposed a detached freeze monitor entering FlushLog
+	// after logger teardown. Join it before engine/core destruction.
+	g_freezeThreadStop.store(false, std::memory_order_release);
+	Debug._initialize(false);
+	std::thread freezeThread([] {
+		thread_name("Freeze detecting thread");
+		PROF_THREAD("Freeze detecting thread");
+		mt_FreezeThread(nullptr);
+	});
+#else
 	thread_spawn(mt_FreezeThread, "Freeze detecting thread", 0, 0);
-	thread_spawn(mt_DiscordThread, "X-RAY Discord thread", 0, 0);
+#endif
+	// Init_Discord disables the integration when Core::Create fails.  Do not
+	// leave an otherwise idle detached thread polling pApp during shutdown:
+	// it can race logger teardown and abort an otherwise clean fixture run.
+	if (use_discord)
+		thread_spawn(mt_DiscordThread, "X-RAY Discord thread", 0, 0);
 
 	// Message cycle
 	seqAppStart.Process(rp_AppStart);
@@ -746,6 +790,12 @@ void CRenderDevice::Run()
 	OnWM_Activate(WA_ACTIVE, 0);
 #endif
 	message_loop();
+
+#if defined(XR_PLATFORM_APPLE)
+	g_freezeThreadStop.store(true, std::memory_order_release);
+	g_freezeThreadWake.notify_all();
+	freezeThread.join();
+#endif
 
 	seqAppEnd.Process(rp_AppEnd);
 
@@ -837,6 +887,10 @@ void CRenderDevice::Pause(BOOL bOn, BOOL bTimer, BOOL bSound, LPCSTR reason)
 #ifndef DEDICATED_SERVER
 	if (bOn)
 	{
+#if defined(XR_PLATFORM_APPLE)
+		if (pInput)
+			pInput->SetRelativeMouseMode(false);
+#endif
 		if (!Paused())
 			bShowPauseString =
 #ifdef INGAME_EDITOR

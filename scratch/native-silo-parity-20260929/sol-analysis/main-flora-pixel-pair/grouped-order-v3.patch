@@ -1,0 +1,368 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.h
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+@@ -160,7 +160,9 @@
+         R4FloraViewState& frozenView,
+         std::string& error)>;
+     using MainFloraOracleDrawCallback = std::function<bool(
+-        IR4Backend& backend, const R4FloraViewState& frozenView, std::string& error)>;
++        IR4Backend& backend, const R4FloraViewState& frozenView, bool groupExactKeys,
++        MetalR4FloraAdapter::Telemetry& sampledTelemetry, std::size_t& exactGroupCount,
++        std::string& error)>;
+ 
+     MetalR4EngineScene();
+     ~MetalR4EngineScene();
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -4427,6 +4427,14 @@
+     const char* frameText = std::getenv("XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_FRAME");
+     if (!directory || !*directory || !frameText || !prepare || !draw || !view.valid)
+         return true;
++    const char* modeText = std::getenv("XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_MODE");
++    const std::string mode = modeText && *modeText ? modeText : "off-off";
++    if (mode != "off-off" && mode != "source-vs-grouped")
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=mode reason=unknown-mode\n");
++        return true;
++    }
++    const bool groupOnBranch = mode == "source-vs-grouped";
+     if (!*frameText || !std::all_of(frameText, frameText + std::strlen(frameText),
+             [](unsigned char ch) { return ch >= '0' && ch <= '9'; }))
+     {
+@@ -4514,19 +4522,21 @@
+     static const char* labels[4] = {"position", "diffuse", "auxiliary", "motion"};
+     for (std::size_t i = 0u; i < 4u; ++i)
+     {
+-        const std::string phase = "main-flora-copy-identity-mrt-" + std::to_string(i);
++        const std::string phase = "main-flora-" + mode + "-copy-identity-mrt-" + std::to_string(i);
+         if (!validateMainFloraColorPair(backend, scene.gBufferTargets[i], targets->offColor[i],
+                 "base", "off-copy", phase.c_str(), view.engineFrame, directory,
+                 true, false, false, error))
+             return failOpen("verify-copy-mrt", error);
+     }
+     if (!validateMainFloraDepthPair(backend, scene.depthTarget, targets->offDepthStencil,
+-            "main-flora-copy-identity-depth-stencil", view.engineFrame, directory, true, false, error))
++            ("main-flora-" + mode + "-copy-identity-depth-stencil").c_str(),
++            view.engineFrame, directory, true, false, error))
+         return failOpen("verify-copy-depth-stencil", error);
+ 
+     const auto drawBranch = [&](const char* label,
+         const std::array<std::shared_ptr<IR4Texture>, 4>& colors,
+-        const std::shared_ptr<IR4Texture>& depthStencil) {
++        const std::shared_ptr<IR4Texture>& depthStencil, const bool grouped,
++        MetalR4FloraAdapter::Telemetry& sampled, std::size_t& exactGroupCount) {
+         R4RenderPassDesc branch = productionPass;
+         branch.label = label; branch.useDrawable = false;
+         for (std::size_t i = 0u; i < branch.colorAttachments.size(); ++i)
+@@ -4543,7 +4553,7 @@
+         if (!backend.BeginRenderPass(branch, error)) return false;
+         passActive = true;
+         const bool drawn = backend.SetStencilReference(1u, error) &&
+-            (*draw)(backend, frozenFloraView, error);
++            (*draw)(backend, frozenFloraView, grouped, sampled, exactGroupCount, error);
+         std::string endError;
+         const bool ended = backend.EndRenderPass(endError);
+         passActive = false;
+@@ -4551,36 +4561,58 @@
+         if (!ended) { error = endError; return false; }
+         return true;
+     };
+-    if (!drawBranch("R4 main Flora pixel-pair OFF control", targets->offColor, targets->offDepthStencil))
++    std::array<MetalR4FloraAdapter::Telemetry, 2> sampled{};
++    std::array<std::size_t, 2> groupCounts{};
++    const char* onPassLabel = groupOnBranch ?
++        "R4 main Flora pixel-pair exact-key grouped-order candidate" :
++        "R4 main Flora pixel-pair OFF/OFF control branch";
++    if (!drawBranch("R4 main Flora pixel-pair source-order branch", targets->offColor,
++            targets->offDepthStencil, false, sampled[0], groupCounts[0]))
+         return failOpen("draw-off", error);
+-    if (!drawBranch("R4 main Flora pixel-pair ON control", targets->onColor, targets->onDepthStencil))
++    if (!drawBranch(onPassLabel, targets->onColor, targets->onDepthStencil,
++            groupOnBranch, sampled[1], groupCounts[1]))
+         return failOpen("draw-on", error);
++    if (sampled[0].draws != sampled[1].draws ||
++        sampled[0].submittedVisuals != sampled[1].submittedVisuals ||
++        sampled[0].culledVisuals != sampled[1].culledVisuals)
++        return failOpen("draw-count-mismatch", "source and candidate branches drew different visible Flora sets");
+ 
+     for (std::size_t i = 0u; i < 4u; ++i)
+     {
+-        const std::string phase = "main-flora-off-off-mrt-" + std::to_string(i);
++        const std::string phase = std::string("main-flora-") + mode + "-mrt-" + std::to_string(i);
+         if (!validateMainFloraColorPair(backend, targets->offColor[i], targets->onColor[i],
+                 "off", "on-control", phase.c_str(), view.engineFrame, directory,
+                 true, false, true, error))
+             return failOpen("compare-mrt", error);
+     }
+     if (!validateMainFloraColorPair(backend, scene.gBufferTargets[0], targets->offColor[0],
+-            "base", "flora-off", "main-flora-nonblank-position-delta", view.engineFrame,
++            "base", "flora-source-order", ("main-flora-" + mode + "-nonblank-position-delta").c_str(), view.engineFrame,
+             directory, false, true, true, error) ||
+         !validateMainFloraDepthPair(backend, targets->offDepthStencil, targets->onDepthStencil,
+-            "main-flora-off-off-depth-stencil", view.engineFrame, directory, true, false, error) ||
++            ("main-flora-" + mode + "-depth-stencil-pair").c_str(), view.engineFrame, directory, true, false, error) ||
+         !validateMainFloraDepthPair(backend, scene.depthTarget, targets->offDepthStencil,
+-            "main-flora-nonblank-depth-stencil-delta", view.engineFrame, directory, false, true, error))
++            ("main-flora-" + mode + "-nonblank-depth-stencil-delta").c_str(),
++            view.engineFrame, directory, false, true, error))
+         return failOpen("compare-depth-or-delta", error);
+ 
+     std::ofstream manifest(std::filesystem::path(directory) /
+-        ("main-flora-off-off-frame-" + std::to_string(view.engineFrame) + ".json"));
++        ("main-flora-" + mode + "-frame-" + std::to_string(view.engineFrame) + ".json"));
+     if (manifest)
+     {
+         manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
+-            << "{\n  \"schema\": \"main-flora-off-off-pixel-pair/v1\",\n"
++            << "{\n  \"schema\": \"main-flora-pixel-pair/v2\",\n"
+             << "  \"frame\": " << view.engineFrame << ",\n"
+-            << "  \"control\": \"same callback and frozen R4FloraViewState in both branches\",\n"
++            << "  \"mode\": \"" << mode << "\",\n"
++            << "  \"control\": \"same callback and frozen R4FloraViewState; every individual legacy draw retained\",\n"
++            << "  \"source_draws\": " << sampled[0].draws << ",\n"
++            << "  \"candidate_draws\": " << sampled[1].draws << ",\n"
++            << "  \"source_submitted_visuals\": " << sampled[0].submittedVisuals << ",\n"
++            << "  \"candidate_submitted_visuals\": " << sampled[1].submittedVisuals << ",\n"
++            << "  \"source_culled_visuals\": " << sampled[0].culledVisuals << ",\n"
++            << "  \"candidate_culled_visuals\": " << sampled[1].culledVisuals << ",\n"
++            << "  \"source_exact_key_group_count\": " << groupCounts[0] << ",\n"
++            << "  \"candidate_exact_key_group_count\": " << groupCounts[1] << ",\n"
++            << "  \"draws_are_instanced_or_merged\": false,\n"
+             << "  \"time_seconds\": " << frozenFloraView.timeSeconds << ",\n"
+             << "  \"wind_valid\": " << (frozenFloraView.windValid ? "true" : "false") << ",\n"
+             << "  \"static_globals_present\": " << (frozenFloraView.staticGlobals ? "true" : "false") << ",\n";
+@@ -4602,8 +4634,10 @@
+             << "  \"mrt_count\": 4,\n  \"depth_stencil_format\": \"D32S8\",\n"
+             << "  \"production_flora_draws\": \"still executed once by unchanged world callback after this control\"\n}\n";
+     }
+-    std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR frame=%u mode=off-off submitted=1 output=%s\n",
+-        view.engineFrame, directory);
++    std::fprintf(stderr,
++        "METAL_FLORA_MAIN_PIXEL_PAIR frame=%u mode=%s source_draws=%zu candidate_draws=%zu "
++        "group_count=%zu merged=0 output=%s\n", view.engineFrame, mode.c_str(),
++        sampled[0].draws, sampled[1].draws, groupCounts[1], directory);
+     if (!resumeProductionPass())
+         return false;
+     return true;
+@@ -7607,9 +7641,12 @@
+                 return true;
+             },
+             [this](IR4Backend& callbackBackend, const R4FloraViewState& frozenView,
+-                std::string& callbackError) {
+-                return impl && impl->flora && impl->flora->IsReady() &&
+-                    impl->flora->DrawIntoActiveGBuffer(callbackBackend, frozenView, callbackError);
++                const bool groupExactKeys, MetalR4FloraAdapter::Telemetry& sampled,
++                std::size_t& exactGroupCount, std::string& callbackError) {
++                if (!impl || !impl->flora || !impl->flora->IsReady())
++                { sampled = {}; exactGroupCount = 0u; return true; }
++                return impl->flora->DrawIntoActiveGBufferForValidation(callbackBackend,
++                    frozenView, groupExactKeys, sampled, exactGroupCount, callbackError);
+             });
+     }
+     return true;
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -129,6 +129,12 @@
+     bool DrawIntoActiveGBuffer(IR4Backend& backend,
+         const R4FloraViewState& view, std::string& error);
+ 
++    // Diagnostic-only source-order or stable exact-key reorder. Draws remain
++    // individual legacy draws with per-visual constants; adapter telemetry is restored.
++    bool DrawIntoActiveGBufferForValidation(IR4Backend& backend,
++        const R4FloraViewState& view, bool groupExactKeys,
++        Telemetry& sampledTelemetry, std::size_t& exactGroupCount, std::string& error);
++
+     // Requires the active sun/local shadow pass. lightViewProjection must be
+     // the exact matrix used by the corresponding Windows shadow phase.
+     bool DrawShadowCasters(IR4Backend& backend,
+@@ -150,6 +156,9 @@
+ 
+ private:
+     struct Impl;
++    bool DrawIntoActiveGBufferOrdered(IR4Backend& backend,
++        const R4FloraViewState& view, const std::vector<std::size_t>* order,
++        std::string& error);
+     std::unique_ptr<Impl> m_impl;
+     bool m_ready = false;
+     std::string m_status;
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -8,12 +8,14 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <cstdlib>
++#include <exception>
+ #include <numeric>
+ #include <fstream>
+ #include <iterator>
+ #include <limits>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <utility>
+ 
+ namespace
+ {
+@@ -449,7 +451,13 @@
+         bool hasBounds = false;
+         std::array<float, 3> boundsMinimum{};
+         std::array<float, 3> boundsMaximum{};
++        std::uint32_t vertexBase = 0u;
++        std::uint32_t vertexCount = 0u;
++        std::uint32_t indexBase = 0u;
+         std::uint32_t indexCount = 0;
++        std::size_t indexBufferOffset = 0u;
++        R4IndexType indexType = R4IndexType::UInt16;
++        std::int32_t baseVertex = 0;
+         std::shared_ptr<IR4Buffer> vertices;
+         std::shared_ptr<IR4Buffer> indices;
+         std::vector<std::shared_ptr<IR4Texture>> textures;
+@@ -735,6 +743,12 @@
+         {
+             draw.alphaTested = blenderMaterial->alphaBlend;
+             draw.objectLod = blenderMaterial->objectLod;
++        }
++        if (visual)
++        {
++            draw.vertexBase = visual->vertexBase;
++            draw.vertexCount = visual->vertexCount;
++            draw.indexBase = visual->indexBase;
+         }
+         draw.indexCount = visual ? visual->indexCount : 0u;
+         if (visual && visual->referencedPositionBounds.available)
+@@ -881,6 +895,87 @@
+ bool MetalR4FloraAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
+     const R4FloraViewState& view, std::string& error)
+ {
++    return DrawIntoActiveGBufferOrdered(backend, view, nullptr, error);
++}
++
++bool MetalR4FloraAdapter::DrawIntoActiveGBufferForValidation(IR4Backend& backend,
++    const R4FloraViewState& view, const bool groupExactKeys,
++    Telemetry& sampledTelemetry, std::size_t& exactGroupCount, std::string& error)
++{
++    exactGroupCount = 0u;
++    if (!m_ready || !view.valid)
++    { sampledTelemetry = m_telemetry; return true; }
++
++    const Telemetry savedTelemetry = m_telemetry;
++    std::vector<std::size_t> order;
++    if (groupExactKeys)
++    {
++        try
++        {
++            std::unordered_map<std::string, std::size_t> groupByKey;
++            std::vector<std::vector<std::size_t>> groups;
++            groupByKey.reserve(m_impl->draws.size());
++            groups.reserve(m_impl->draws.size());
++            for (std::size_t drawIndex = 0u; drawIndex < m_impl->draws.size(); ++drawIndex)
++            {
++                const Impl::Draw& draw = m_impl->draws[drawIndex];
++                const std::shared_ptr<IR4GraphicsPipeline>& pipeline =
++                    draw.material == Impl::Material::LeafBump ? m_impl->leafPipeline : m_impl->trunkPipeline;
++                std::string key;
++                key.reserve(128u + draw.textures.size() * sizeof(void*));
++                const auto append = [&key](const auto& value) {
++                    key.append(reinterpret_cast<const char*>(&value), sizeof(value));
++                };
++                const void* vertices = draw.vertices.get();
++                const void* indices = draw.indices.get();
++                const void* pso = pipeline.get();
++                const void* waves = m_impl->wavesTexture.get();
++                const void* sampler = m_impl->sampler.get();
++                append(vertices); append(indices); append(pso); append(waves); append(sampler);
++                append(draw.vertexBase); append(draw.vertexCount); append(draw.indexBase);
++                append(draw.indexBufferOffset); append(draw.indexCount); append(draw.indexType);
++                append(draw.baseVertex); append(draw.material); append(draw.alphaTested); append(draw.objectLod);
++                const std::size_t textureCount = draw.textures.size();
++                append(textureCount);
++                for (const auto& texture : draw.textures)
++                {
++                    const void* identity = texture.get();
++                    append(identity);
++                }
++                const auto found = groupByKey.find(key);
++                if (found != groupByKey.end())
++                    groups[found->second].push_back(drawIndex);
++                else
++                {
++                    const std::size_t groupIndex = groups.size();
++                    groupByKey.emplace(std::move(key), groupIndex);
++                    groups.push_back({drawIndex});
++                }
++            }
++            exactGroupCount = groups.size();
++            order.reserve(m_impl->draws.size());
++            for (const auto& group : groups)
++                order.insert(order.end(), group.begin(), group.end());
++        }
++        catch (const std::exception& exception)
++        {
++            error = std::string("main Flora exact-key reorder allocation failed: ") + exception.what();
++            m_telemetry = savedTelemetry;
++            return false;
++        }
++    }
++
++    const bool drawn = DrawIntoActiveGBufferOrdered(backend, view,
++        groupExactKeys ? &order : nullptr, error);
++    sampledTelemetry = m_telemetry;
++    m_telemetry = savedTelemetry;
++    return drawn;
++}
++
++bool MetalR4FloraAdapter::DrawIntoActiveGBufferOrdered(IR4Backend& backend,
++    const R4FloraViewState& view, const std::vector<std::size_t>* order,
++    std::string& error)
++{
+     if (!m_ready || !view.valid)
+         return true;
+     if (!view.staticGlobals)
+@@ -905,14 +1000,16 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
+-    for (Impl::Draw& draw : m_impl->draws)
+-    {
++    const auto drawOne = [&](const std::size_t drawIndex) {
++        if (drawIndex >= m_impl->draws.size())
++        { error = "main Flora validation draw order contains an invalid index"; return false; }
++        Impl::Draw& draw = m_impl->draws[drawIndex];
+         const Matrix4 wvp = multiply(vp, draw.model);
+         const Matrix4 wv = multiply(viewMatrix, draw.model);
+         if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
+         {
+             ++m_telemetry.culledVisuals;
+-            continue;
++            return true;
+         }
+         std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+         auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+@@ -1036,8 +1133,10 @@
+                 {R4MscResourceType::Sampler, 72u, {}, 0, 0, {}, m_impl->sampler}}};
+         R4IndexedDrawDesc indexed;
+         indexed.indexBuffer = draw.indices;
++        indexed.indexBufferOffset = draw.indexBufferOffset;
+         indexed.indexCount = draw.indexCount;
+-        indexed.indexType = R4IndexType::UInt16;
++        indexed.indexType = draw.indexType;
++        indexed.baseVertex = draw.baseVertex;
+         if (!backend.BindGraphicsPipeline(leaf ? m_impl->leafPipeline : m_impl->trunkPipeline, error) ||
+             !backend.BindVertexBuffer(6u, draw.vertices, 0, error) ||
+             !backend.BindMscResources(vs, error) || !backend.BindMscResources(ps, error) ||
+@@ -1045,6 +1144,17 @@
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
++        return true;
++    };
++    if (order)
++    {
++        for (const std::size_t drawIndex : *order)
++            if (!drawOne(drawIndex)) return false;
++    }
++    else
++    {
++        for (std::size_t drawIndex = 0u; drawIndex < m_impl->draws.size(); ++drawIndex)
++            if (!drawOne(drawIndex)) return false;
+     }
+     return true;
+ }

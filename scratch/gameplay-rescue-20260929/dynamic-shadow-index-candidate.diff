@@ -1,0 +1,253 @@
+--- scratch/gameplay-rescue-20260929/prestate/MetalR4DynamicWorldAdapter.cpp	2026-09-28 00:20:05
++++ src/Layers/xrRenderMetal/MetalR4DynamicWorldAdapter.cpp	2026-09-29 10:22:09
+@@ -1,4 +1,5 @@
+ #include "MetalR4DynamicWorldAdapter.h"
++#include "R4StaticShadowIndex.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -488,6 +489,55 @@
+     }
+     return hash ^ static_cast<std::uint64_t>(transforms->size());
+ }
++
++struct DynamicShadowFrameIndex
++{
++    xray::metal::R4StaticShadowIndex index;
++    std::shared_ptr<const R4EngineWorldSnapshot> owner;
++    std::uint32_t engineFrame = UINT32_MAX;
++    std::size_t slot = std::numeric_limits<std::size_t>::max();
++    std::size_t eligible = 0u;
++    std::size_t missingAssets = 0u;
++
++    void Invalidate() { owner.reset(); }
++
++    void Prepare(const std::shared_ptr<const R4EngineWorldSnapshot>& world,
++        const std::size_t acquiredSlot)
++    {
++        Invalidate();
++        index.entries.clear(); index.unbounded.clear(); index.nodes.clear(); index.candidates.clear();
++        eligible = missingAssets = 0u;
++        for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
++        {
++            const auto& renderable = world->renderables[renderableIndex];
++            if (!renderable.asset) { ++missingAssets; continue; }
++            if (!renderable.castsShadow) continue;
++            ++eligible;
++            const float radius = renderable.bounds[3];
++            std::array<float, 3> minimum{}, maximum{};
++            for (std::size_t axis = 0; axis < 3u; ++axis)
++            {
++                minimum[axis] = renderable.bounds[axis] - radius;
++                maximum[axis] = renderable.bounds[axis] + radius;
++            }
++            // Enclose the OLD local-sphere cube, not smaller skin/rest-pose
++            // bounds. Invalid/overflow/non-affine inputs stay unbounded.
++            index.Add(std::isfinite(radius) && radius >= 0.0f, minimum, maximum,
++                renderable.transform.data(), renderableIndex);
++        }
++        index.Finish();
++        engineFrame = world->engineFrame;
++        slot = acquiredSlot;
++        owner = world;
++    }
++
++    bool Matches(const std::shared_ptr<const R4EngineWorldSnapshot>& world,
++        const std::size_t acquiredSlot) const
++    {
++        return owner && world && owner == world && world->engineFrame == engineFrame &&
++            slot == acquiredSlot;
++    }
++};
+ 
+ bool readTextFile(const std::filesystem::path& path, std::string& value)
+ {
+@@ -1583,6 +1633,12 @@
+     std::unordered_map<std::string, std::string> rejected;
+     std::unordered_set<std::string> reportedSkinSkips;
+     std::unordered_set<std::string> reportedCpuDrawDiagnostics;
++    DynamicShadowFrameIndex shadowFrameIndex;
++    bool shadowIndexEnabled = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX") != nullptr;
++    bool shadowIndexOracle = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX_ORACLE") != nullptr;
++    std::uint64_t shadowIndexedViews = 0u;
++    std::uint64_t shadowFallbackViews = 0u;
++    std::uint64_t shadowBroadCandidates = 0u;
+     struct ObjectMotionHistory
+     {
+         std::array<float, 16> transform{};
+@@ -2026,6 +2082,8 @@
+ {
+     if (m_impl)
+     {
++        // No stale prepared snapshot may survive an early or failed Prewarm.
++        m_impl->shadowFrameIndex.Invalidate();
+         m_impl->initializeE07Profile();
+         m_impl->e07ObjectSamples.clear();
+         DiscardUnsubmittedFrame();
+@@ -2545,6 +2603,9 @@
+             }
+         }
+     }
++    // Publish the new immutable owner only after all Prewarm work succeeds.
++    if (m_impl->shadowIndexEnabled)
++        m_impl->shadowFrameIndex.Prepare(world, m_impl->instanceSlot);
+     m_telemetry.cachedGeometry = m_impl->geometry.size();
+     m_telemetry.rejectedGeometry = m_impl->rejected.size();
+     m_impl->pendingMotionFrame = true;
+@@ -2991,8 +3052,52 @@
+ 
+     E07ScopedTimer shadowTimer(m_telemetry.e07ShadowCpuMs, m_impl->e07ProfileEnabled);
+ 
+-    for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
++    const std::vector<std::size_t>* selected = nullptr;
++    if (m_impl->shadowIndexEnabled &&
++        m_impl->shadowFrameIndex.Matches(world, backend.ActiveFrameContextIndex()))
++        selected = &m_impl->shadowFrameIndex.index.Query(lightViewProjection.data());
++    if (m_impl->shadowIndexOracle)
++    {
++        if (selected) ++m_impl->shadowIndexedViews;
++        else ++m_impl->shadowFallbackViews;
++        m_impl->shadowBroadCandidates += selected ? selected->size() : world->renderables.size();
++        if (selected)
++        {
++            std::vector<std::size_t> linearAdmitted, indexedAdmitted;
++            const auto admitted = [&world, &lightViewProjection](const std::size_t index) {
++                const auto& renderable = world->renderables[index];
++                return renderable.asset && renderable.castsShadow &&
++                    !isOutsideDynamicMetalFrustum(renderable.bounds, renderable.transform,
++                        lightViewProjection, true) &&
++                    isFiniteMatrix(multiplyMatrix(lightViewProjection, renderable.transform));
++            };
++            for (std::size_t index = 0; index < world->renderables.size(); ++index)
++                if (admitted(index)) linearAdmitted.push_back(index);
++            for (const std::size_t index : *selected)
++                if (admitted(index)) indexedAdmitted.push_back(index);
++            if (linearAdmitted != indexedAdmitted)
++            {
++                error = "dynamic shadow broad phase changed the exact ordered caster list";
++                return false;
++            }
++        }
++        const std::uint64_t views = m_impl->shadowIndexedViews + m_impl->shadowFallbackViews;
++        if (views % 1000u == 0u)
++            std::fprintf(stderr,
++                "METAL_DYNAMIC_SHADOW_INDEX_ORACLE frame=%u indexed_views=%llu fallback_views=%llu candidate_checks=%llu misses=0\n",
++                world->engineFrame, static_cast<unsigned long long>(m_impl->shadowIndexedViews),
++                static_cast<unsigned long long>(m_impl->shadowFallbackViews),
++                static_cast<unsigned long long>(m_impl->shadowBroadCandidates));
++    }
++    if (selected)
+     {
++        rejected += m_impl->shadowFrameIndex.missingAssets;
++        culled += m_impl->shadowFrameIndex.eligible - selected->size();
++    }
++    const std::size_t renderableCount = selected ? selected->size() : world->renderables.size();
++    for (std::size_t ordinal = 0; ordinal < renderableCount; ++ordinal)
++    {
++        const std::size_t renderableIndex = selected ? (*selected)[ordinal] : ordinal;
+         const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
+         if (!renderable.asset)
+         {
+@@ -3200,8 +3305,102 @@
+         isOutsideDynamicMetalFrustum(invalidSphere, rightOutside, identity, true))
+     {
+         error = "dynamic OGF local-sphere frustum culling is not conservative";
++        return false;
++    }
++    auto shadowWorld = std::make_shared<R4EngineWorldSnapshot>();
++    shadowWorld->engineFrame = 41u;
++    auto shadowAsset = std::make_shared<R4EngineWorldAsset>();
++    std::uint32_t seed = 0xD7A2026u;
++    const auto random = [&seed]() {
++        seed = seed * 1664525u + 1013904223u;
++        return static_cast<float>(seed & 65535u) / 65535.0f;
++    };
++    for (std::size_t index = 0; index < 512u; ++index)
++    {
++        R4EngineWorldRenderable renderable;
++        renderable.asset = index % 13u ? shadowAsset : nullptr;
++        renderable.castsShadow = index % 7u != 0u;
++        renderable.transform = identity;
++        for (std::size_t axis = 0; axis < 3u; ++axis)
++        {
++            for (std::size_t component = 0; component < 3u; ++component)
++                renderable.transform[component * 4u + axis] = random() * 4.0f - 2.0f;
++            renderable.transform[12u + axis] = random() * 2000.0f - 1000.0f;
++            renderable.bounds[axis] = random() * 20.0f - 10.0f;
++        }
++        renderable.bounds[3] = random() * 10.0f;
++        if (index == 1u) renderable.bounds[3] = std::numeric_limits<float>::quiet_NaN();
++        if (index == 2u) renderable.bounds[3] = -1.0f;
++        if (index == 3u) renderable.transform[3] = 0.5f;
++        if (index == 4u) renderable.transform[0] = std::numeric_limits<float>::quiet_NaN();
++        if (index == 5u) renderable.bounds[0] = std::numeric_limits<float>::quiet_NaN();
++        if (index == 6u) renderable.bounds[0] = renderable.bounds[3] =
++            std::numeric_limits<float>::max();
++        shadowWorld->renderables.push_back(std::move(renderable));
++    }
++    DynamicShadowFrameIndex frameIndex;
++    frameIndex.Prepare(shadowWorld, 1u);
++    auto differentOwner = std::make_shared<R4EngineWorldSnapshot>(*shadowWorld);
++    if (!frameIndex.Matches(shadowWorld, 1u) || frameIndex.Matches(shadowWorld, 2u) ||
++        frameIndex.Matches(differentOwner, 1u) || frameIndex.Matches({}, 1u))
++    {
++        error = "dynamic shadow prepared owner/frame slot can admit a stale snapshot";
++        return false;
++    }
++    bool reducedChecks = false;
++    for (std::size_t viewIndex = 0; viewIndex < 128u; ++viewIndex)
++    {
++        auto vp = identity;
++        for (float& value : vp) value = (random() * 2.0f - 1.0f) * 0.01f;
++        if (viewIndex == 0u) vp = identity;
++        if (viewIndex == 1u) vp[0] = std::numeric_limits<float>::quiet_NaN();
++        if (viewIndex == 2u) vp[0] = std::numeric_limits<float>::max();
++        const auto& selected = frameIndex.index.Query(vp.data());
++        reducedChecks |= selected.size() < frameIndex.eligible;
++        std::vector<std::size_t> linearAdmitted, indexedAdmitted;
++        std::size_t linearCulled = 0u, linearRejected = 0u;
++        std::size_t indexedCulled = frameIndex.eligible - selected.size();
++        std::size_t indexedRejected = frameIndex.missingAssets;
++        const auto visit = [&](const std::size_t index, std::vector<std::size_t>& admitted,
++            std::size_t& culledCount, std::size_t& rejectedCount) {
++            const auto& renderable = shadowWorld->renderables[index];
++            if (!renderable.asset) { ++rejectedCount; return; }
++            if (!renderable.castsShadow) return;
++            if (isOutsideDynamicMetalFrustum(renderable.bounds, renderable.transform, vp, true))
++            { ++culledCount; return; }
++            if (!isFiniteMatrix(multiplyMatrix(vp, renderable.transform)))
++            { ++rejectedCount; return; }
++            admitted.push_back(index);
++        };
++        for (std::size_t index = 0; index < shadowWorld->renderables.size(); ++index)
++            visit(index, linearAdmitted, linearCulled, linearRejected);
++        for (const std::size_t index : selected)
++            visit(index, indexedAdmitted, indexedCulled, indexedRejected);
++        if (linearAdmitted != indexedAdmitted || linearCulled != indexedCulled ||
++            linearRejected != indexedRejected)
++        {
++            error = "dynamic shadow index changed ordered admission or rejection accounting";
++            return false;
++        }
++    }
++    if (!reducedChecks)
++    {
++        error = "dynamic shadow broad phase did not reduce independent caster checks";
++        return false;
++    }
++    frameIndex.Invalidate();
++    if (frameIndex.Matches(shadowWorld, 1u))
++    {
++        error = "dynamic shadow early Prewarm invalidation retained its old owner";
+         return false;
+     }
++    frameIndex.Prepare(shadowWorld, 1u);
++    ++shadowWorld->engineFrame;
++    if (frameIndex.Matches(shadowWorld, 1u))
++    {
++        error = "dynamic shadow index ignored its captured engine-frame stamp";
++        return false;
++    }
+     R4EngineWorldRenderable stableObject;
+     stableObject.objectId = 42u;
+     R4EngineWorldRenderable anonymousObject;

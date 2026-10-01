@@ -21,6 +21,10 @@ public:
     struct Options
     {
         std::filesystem::path shaderDirectory;
+        // Optional exact active SSFX ground-splash bundle. Keeping this
+        // independent lets the existing falling-rain MRT path remain usable
+        // while the one-target splash pass is admitted separately.
+        std::filesystem::path splashShaderDirectory;
         xray::metal::R4DdsBytesProvider ddsBytesProvider;
     };
 
@@ -28,7 +32,10 @@ public:
     {
         std::size_t capturedVertices = 0u;
         std::size_t submittedDrops = 0u;
+        std::size_t capturedSplashVertices = 0u;
+        std::size_t submittedSplashTriangles = 0u;
         std::size_t droppedVertices = 0u;
+        std::size_t droppedSplashVertices = 0u;
         float density = 0.0f;
         bool ssfx = false;
     };
@@ -48,9 +55,16 @@ public:
         const std::shared_ptr<IR4Texture>& position, const std::shared_ptr<IR4Texture>& sceneColor,
         const std::shared_ptr<IR4Texture>& accumulator, const std::shared_ptr<IR4Buffer>& staticGlobals,
         std::string& error);
+    // Called only from a separate one-color-target RGBA8 SSFX splash pass.
+    // The caller binds the scene depth attachment and the captured ssfx_rain
+    // refraction target is supplied explicitly as the shader's t1 input.
+    bool DrawSplashesIntoActiveForward(IR4Backend& backend,
+        const std::array<float, 16>& viewProjection,
+        const std::shared_ptr<IR4Texture>& refraction, std::string& error);
 
     bool IsReady() const { return m_ready; }
     bool HasDrops() const;
+    bool HasSplashes() const;
     const std::shared_ptr<IR4Texture>& MotionTarget() const;
     const std::shared_ptr<IR4Texture>& UnusedMrtTarget() const;
     const std::shared_ptr<IR4Texture>& RefractionTarget() const;

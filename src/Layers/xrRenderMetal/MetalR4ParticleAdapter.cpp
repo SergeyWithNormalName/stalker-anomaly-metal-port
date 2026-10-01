@@ -80,6 +80,23 @@ bool isSupportedDistortion(const xray::metal::particles::DrawRecord& record)
             record.shaderIdentity == "particles\\xadd");
 }
 
+bool preparedBufferRangesValid(const MetalR4ParticleAdapter::PreparedDraw& draw)
+{
+    if (!draw.vertices || !draw.indices || draw.vertexCount == 0u || draw.indexCount == 0u)
+        return false;
+    const std::size_t vertexBufferSize = draw.vertices->Size();
+    const std::size_t indexBufferSize = draw.indices->Size();
+    const std::size_t requiredVertexBytes =
+        static_cast<std::size_t>(draw.vertexCount) * sizeof(xray::metal::R4ParticleMscVertex);
+    const std::size_t requiredIndexBytes = static_cast<std::size_t>(draw.indexCount) * sizeof(std::uint16_t);
+    return draw.vertexByteSize == requiredVertexBytes && draw.indexByteSize == requiredIndexBytes &&
+        draw.vertexBufferOffset <= vertexBufferSize &&
+        draw.vertexByteSize <= vertexBufferSize - draw.vertexBufferOffset &&
+        draw.indexBufferOffset <= indexBufferSize &&
+        draw.indexByteSize <= indexBufferSize - draw.indexBufferOffset &&
+        draw.indexBufferOffset % sizeof(std::uint16_t) == 0u;
+}
+
 std::vector<MetalR4ParticleAdapter::PreparedDraw*> sortedDistortionDraws(
     std::vector<MetalR4ParticleAdapter::PreparedDraw>& draws)
 {
@@ -102,8 +119,8 @@ bool createBuffer(IR4Resources& resources, const R4BufferUsage usage, const char
     description.size = size;
     // Particle batches are produced after gameplay traversal and may first be
     // observed while the frame command buffer already owns an encoder. Shared
-    // storage keeps staging and per-draw constants legal without opening a
-    // nested blit/upload phase.
+    // storage keeps staging uploads legal without opening a nested
+    // blit/upload phase.
     description.storage = R4ResourceStorage::Shared;
     description.usage = usage;
     description.label = label;
@@ -191,10 +208,7 @@ struct MetalR4ParticleAdapter::Impl
     std::array<std::shared_ptr<IR4GraphicsPipeline>, 3> distortionPipelines;
     std::shared_ptr<IR4GraphicsPipeline> postprocessPipeline;
     std::array<std::shared_ptr<IR4Sampler>, 3> samplers;
-    std::shared_ptr<IR4Buffer> postprocessVertices;
     std::shared_ptr<IR4Buffer> postprocessIndices;
-    std::shared_ptr<IR4Buffer> postprocessGlobals;
-    std::shared_ptr<IR4Buffer> softGlobals;
     std::shared_ptr<IR4Texture> distortionTarget;
     std::uint32_t distortionWidth = 0u;
     std::uint32_t distortionHeight = 0u;
@@ -414,20 +428,10 @@ bool MetalR4ParticleAdapter::Configure(IR4Backend& backend, const Options& optio
             return true;
         }
     }
-    const PostprocessVertex postprocessVertices[4] = {};
     static constexpr std::uint16_t PostprocessIndices[6] = {0u, 1u, 2u, 2u, 1u, 3u};
-    std::array<std::uint8_t, 408> postprocessGlobals{};
-    if (!createBuffer(backend.Resources(), R4BufferUsage::Vertex,
-            "R4 combine_2 fullscreen vertices", postprocessVertices,
-            sizeof(postprocessVertices), m_impl->postprocessVertices, error) ||
-        !createBuffer(backend.Resources(), R4BufferUsage::Index,
+    if (!createBuffer(backend.Resources(), R4BufferUsage::Index,
             "R4 combine_2 fullscreen indices", PostprocessIndices,
-            sizeof(PostprocessIndices), m_impl->postprocessIndices, error) ||
-        !createBuffer(backend.Resources(), R4BufferUsage::Uniform,
-            "R4 combine_2 globals b0", postprocessGlobals.data(),
-            postprocessGlobals.size(), m_impl->postprocessGlobals, error) ||
-        !createEmptyBuffer(backend.Resources(), R4BufferUsage::Uniform,
-            "R4 soft-particle globals b0", 224u, m_impl->softGlobals, error))
+            sizeof(PostprocessIndices), m_impl->postprocessIndices, error))
     {
         m_ready = false;
         m_status = "combine_2 postprocess resources unavailable: " + error;
@@ -440,7 +444,23 @@ bool MetalR4ParticleAdapter::Configure(IR4Backend& backend, const Options& optio
 }
 
 bool MetalR4ParticleAdapter::StageFrame(IR4Resources& resources,
-    const xray::metal::particles::FrameBatch& frame, std::string& error)
+    const xray::metal::particles::FrameBatch& frame, std::string& error,
+    IR4Backend* frameBackend)
+{
+    FrameUploadFunction frameUpload;
+    if (frameBackend)
+    {
+        frameUpload = [frameBackend](const void* data, std::size_t size,
+            std::size_t alignment, R4FrameBufferSlice& slice, std::string& uploadError) {
+            return frameBackend->UploadFrameData(data, size, alignment, slice, uploadError);
+        };
+    }
+    return StageFrameImpl(resources, frame, error, frameBackend ? &frameUpload : nullptr);
+}
+
+bool MetalR4ParticleAdapter::StageFrameImpl(IR4Resources& resources,
+    const xray::metal::particles::FrameBatch& frame, std::string& error,
+    const FrameUploadFunction* frameUpload)
 {
     if (!m_impl)
     {
@@ -548,22 +568,46 @@ bool MetalR4ParticleAdapter::StageFrame(IR4Resources& resources,
             prepared.state.vertexCount = chunkVertices;
             prepared.state.firstIndex = 0u;
             prepared.state.indexCount = chunkIndices;
-            if (!createBuffer(resources, R4BufferUsage::Vertex, "R4 particle sprite vertices",
-                    vertices.data(), vertices.size() * sizeof(vertices.front()), prepared.vertices, error) ||
-                !createBuffer(resources, R4BufferUsage::Index, "R4 particle sprite quad indices",
-                    indices.data(), indices.size() * sizeof(indices.front()), prepared.indices, error))
+            prepared.vertexByteSize = vertices.size() * sizeof(vertices.front());
+            prepared.indexByteSize = indices.size() * sizeof(indices.front());
+            if (frameUpload)
             {
-                m_impl->draws.clear();
-                return false;
+                R4FrameBufferSlice vertexSlice, indexSlice;
+                if (!(*frameUpload)(vertices.data(), prepared.vertexByteSize, 16u,
+                        vertexSlice, error) ||
+                    !(*frameUpload)(indices.data(), prepared.indexByteSize, 16u,
+                        indexSlice, error) ||
+                    !vertexSlice.buffer || !indexSlice.buffer ||
+                    vertexSlice.size != prepared.vertexByteSize ||
+                    indexSlice.size != prepared.indexByteSize ||
+                    vertexSlice.offset > vertexSlice.buffer->Size() ||
+                    vertexSlice.size > vertexSlice.buffer->Size() - vertexSlice.offset ||
+                    indexSlice.offset > indexSlice.buffer->Size() ||
+                    indexSlice.size > indexSlice.buffer->Size() - indexSlice.offset ||
+                    indexSlice.offset % sizeof(std::uint16_t) != 0u)
+                {
+                    if (error.empty()) error = "particle frame upload returned an invalid vertex/index slice";
+                    m_impl->draws.clear();
+                    return false;
+                }
+                prepared.vertices = std::move(vertexSlice.buffer);
+                prepared.vertexBufferOffset = vertexSlice.offset;
+                prepared.indices = std::move(indexSlice.buffer);
+                prepared.indexBufferOffset = indexSlice.offset;
             }
-            if (m_ready)
+            else
             {
-                if (!createEmptyBuffer(resources, R4BufferUsage::Uniform,
-                        "R4 particle dynamic_transforms b0", 256u, prepared.transforms, error))
+                if (!createBuffer(resources, R4BufferUsage::Vertex, "R4 particle sprite vertices",
+                        vertices.data(), prepared.vertexByteSize, prepared.vertices, error) ||
+                    !createBuffer(resources, R4BufferUsage::Index, "R4 particle sprite quad indices",
+                        indices.data(), prepared.indexByteSize, prepared.indices, error))
                 {
                     m_impl->draws.clear();
                     return false;
                 }
+            }
+            if (m_ready)
+            {
                 prepared.texture = texture;
                 prepared.sampler = m_impl->samplers[record.baseSamplerClamp ? 1u : 0u];
                 if (colorPass)
@@ -602,6 +646,13 @@ bool MetalR4ParticleAdapter::StageFrame(IR4Resources& resources,
     return true;
 }
 
+void MetalR4ParticleAdapter::DiscardFrame()
+{
+    if (!m_impl) return;
+    m_impl->draws.clear();
+    m_telemetry = {};
+}
+
 bool MetalR4ParticleAdapter::DrawIntoActiveForward(IR4Backend& backend,
     const std::array<float, 16>& viewProjection,
     const std::shared_ptr<IR4Texture>& positionGbuffer,
@@ -617,21 +668,27 @@ bool MetalR4ParticleAdapter::DrawIntoActiveForward(IR4Backend& backend,
     }
     std::array<float, 16> softTexgen{};
     std::array<std::uint8_t, 224> softGlobals{};
-    if (!xray::metal::DeriveR4ParticleSoftTexgen(viewProjection, softTexgen, error) ||
-        !m_impl->softGlobals)
+    if (!xray::metal::DeriveR4ParticleSoftTexgen(viewProjection, softTexgen, error))
         return false;
     std::memcpy(softGlobals.data() + 160u, softTexgen.data(), sizeof(softTexgen));
-    if (!backend.Resources().UpdateBuffer(m_impl->softGlobals, 0u,
-            softGlobals.data(), softGlobals.size(), error))
+    R4FrameBufferSlice softGlobalsSlice;
+    if (!backend.UploadFrameData(softGlobals.data(), softGlobals.size(), 256u,
+            softGlobalsSlice, error))
+        return false;
+    std::array<std::uint8_t, 256> transforms{};
+    std::memcpy(transforms.data(), viewProjection.data(), sizeof(viewProjection));
+    R4FrameBufferSlice transformsSlice;
+    if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+            transformsSlice, error))
         return false;
     for (PreparedDraw& prepared : m_impl->draws)
     {
         if (!prepared.colorPass)
             continue;
-        if (!prepared.pipeline || !prepared.vertices || !prepared.indices || !prepared.transforms ||
+        if (!prepared.pipeline || !preparedBufferRangesValid(prepared) ||
             !prepared.texture || !prepared.sampler)
         {
-            error = "particle forward draw has incomplete prepared resources";
+            error = "particle forward draw has incomplete or out-of-range prepared resources";
             return false;
         }
         const bool soft = prepared.state.permutation == xray::metal::particles::Permutation::Soft;
@@ -640,26 +697,21 @@ bool MetalR4ParticleAdapter::DrawIntoActiveForward(IR4Backend& backend,
             error = "soft-particle draw requires the position G-buffer";
             return false;
         }
-        std::array<std::uint8_t, 256> transforms{};
-        std::memcpy(transforms.data(), viewProjection.data(), sizeof(viewProjection));
-        if (!backend.Resources().UpdateBuffer(prepared.transforms, 0u,
-                transforms.data(), transforms.size(), error))
-            return false;
         R4MscStageBindings vertexBindings;
         vertexBindings.stage = R4ShaderStage::Vertex;
         vertexBindings.tlabSize = soft ? 72u : 48u;
         if (soft)
         {
             vertexBindings.resources = {
-                {R4MscResourceType::ConstantBuffer, 0u, m_impl->softGlobals, 0u, 224u, nullptr, nullptr},
-                {R4MscResourceType::ConstantBuffer, 24u, prepared.transforms, 0u, 256u, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 0u, softGlobalsSlice.buffer, softGlobalsSlice.offset, softGlobalsSlice.size, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 24u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size, nullptr, nullptr},
                 {R4MscResourceType::ConstantBuffer, 48u, staticGlobals, 0u, 528u, nullptr, nullptr},
             };
         }
         else
         {
             vertexBindings.resources = {
-                {R4MscResourceType::ConstantBuffer, 0u, prepared.transforms, 0u, 256u, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 0u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size, nullptr, nullptr},
                 {R4MscResourceType::ConstantBuffer, 24u, staticGlobals, 0u, 528u, nullptr, nullptr},
             };
         }
@@ -682,10 +734,11 @@ bool MetalR4ParticleAdapter::DrawIntoActiveForward(IR4Backend& backend,
                 {R4MscResourceType::Sampler, 24u, nullptr, 0u, 0u, nullptr, prepared.sampler});
         R4IndexedDrawDesc draw;
         draw.indexBuffer = prepared.indices;
+        draw.indexBufferOffset = prepared.indexBufferOffset;
         draw.indexCount = prepared.indexCount;
         draw.indexType = R4IndexType::UInt16;
         if (!backend.BindGraphicsPipeline(prepared.pipeline, error) ||
-            !backend.BindVertexBuffer(6u, prepared.vertices, 0u, error) ||
+            !backend.BindVertexBuffer(6u, prepared.vertices, prepared.vertexBufferOffset, error) ||
             !backend.BindMscResources(vertexBindings, error) ||
             !backend.BindMscResources(fragmentBindings, error) ||
             !backend.DrawIndexed(draw, error))
@@ -710,29 +763,6 @@ bool MetalR4ParticleAdapter::PrepareRenderTargets(IR4Backend& backend, std::stri
     if (m_impl->distortionTarget && m_impl->distortionWidth == width &&
         m_impl->distortionHeight == height)
         return true;
-    const auto uv = [](float x, float y) {
-        PostprocessVertex vertex{};
-        vertex.texcoord0[0] = vertex.texcoord1[0] = vertex.texcoord2[0] =
-            vertex.texcoord3[0] = vertex.texcoord4[0] = x;
-        vertex.texcoord0[1] = vertex.texcoord1[1] = vertex.texcoord2[1] =
-            vertex.texcoord3[1] = vertex.texcoord4[1] = y;
-        vertex.texcoord5[0] = vertex.texcoord6[0] = x;
-        vertex.texcoord5[1] = vertex.texcoord6[1] = y;
-        return vertex;
-    };
-    std::array<PostprocessVertex, 4> vertices = {
-        uv(0.0f, 1.0f), uv(0.0f, 0.0f), uv(1.0f, 1.0f), uv(1.0f, 0.0f),
-    };
-    vertices[0].position[0] = 0.0f; vertices[0].position[1] = static_cast<float>(height);
-    vertices[1].position[0] = 0.0f; vertices[1].position[1] = 0.0f;
-    vertices[2].position[0] = static_cast<float>(width);
-    vertices[2].position[1] = static_cast<float>(height);
-    vertices[3].position[0] = static_cast<float>(width); vertices[3].position[1] = 0.0f;
-    for (PostprocessVertex& vertex : vertices)
-        vertex.position[3] = 1.0f;
-    if (!backend.Resources().UpdateBuffer(m_impl->postprocessVertices, 0u,
-            vertices.data(), sizeof(vertices), error))
-        return false;
     R4Texture2DDesc descriptor;
     descriptor.width = width;
     descriptor.height = height;
@@ -778,7 +808,7 @@ bool MetalR4ParticleAdapter::DrawIntoActiveDistortion(IR4Backend& backend,
     for (PreparedDraw* preparedPointer : sorted)
     {
         PreparedDraw& prepared = *preparedPointer;
-        if (!prepared.vertices || !prepared.indices || !prepared.transforms ||
+        if (!preparedBufferRangesValid(prepared) ||
             !prepared.texture || !prepared.sampler)
         {
             error = "particle distortion draw has incomplete prepared resources";
@@ -786,14 +816,15 @@ bool MetalR4ParticleAdapter::DrawIntoActiveDistortion(IR4Backend& backend,
         }
         std::array<std::uint8_t, 256> transforms{};
         std::memcpy(transforms.data(), viewProjection.data(), sizeof(viewProjection));
-        if (!backend.Resources().UpdateBuffer(prepared.transforms, 0u,
-                transforms.data(), transforms.size(), error))
+        R4FrameBufferSlice transformsSlice;
+        if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                transformsSlice, error))
             return false;
         R4MscStageBindings vertexBindings;
         vertexBindings.stage = R4ShaderStage::Vertex;
         vertexBindings.tlabSize = 48u;
         vertexBindings.resources = {
-            {R4MscResourceType::ConstantBuffer, 0u, prepared.transforms, 0u, 256u, nullptr, nullptr},
+            {R4MscResourceType::ConstantBuffer, 0u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size, nullptr, nullptr},
             {R4MscResourceType::ConstantBuffer, 24u, staticGlobals, 0u, 528u, nullptr, nullptr},
         };
         R4MscStageBindings fragmentBindings;
@@ -805,12 +836,13 @@ bool MetalR4ParticleAdapter::DrawIntoActiveDistortion(IR4Backend& backend,
         };
         R4IndexedDrawDesc draw;
         draw.indexBuffer = prepared.indices;
+        draw.indexBufferOffset = prepared.indexBufferOffset;
         draw.indexCount = prepared.indexCount;
         draw.indexType = R4IndexType::UInt16;
         const std::shared_ptr<IR4GraphicsPipeline>& pipeline =
             m_impl->distortionPipelines[pipelineIndex(prepared.state.cullMode)];
         if (!pipeline || !backend.BindGraphicsPipeline(pipeline, error) ||
-            !backend.BindVertexBuffer(6u, prepared.vertices, 0u, error) ||
+            !backend.BindVertexBuffer(6u, prepared.vertices, prepared.vertexBufferOffset, error) ||
             !backend.BindMscResources(vertexBindings, error) ||
             !backend.BindMscResources(fragmentBindings, error) ||
             !backend.DrawIndexed(draw, error))
@@ -845,14 +877,47 @@ bool MetalR4ParticleAdapter::DrawPostprocess(IR4Backend& backend,
         return true;
     if (!position || !image || !bloom || !lut || !staticGlobals ||
         staticGlobals->Size() < 528u || !m_impl->distortionTarget ||
-        !m_impl->postprocessPipeline || !m_impl->postprocessVertices ||
-        !m_impl->postprocessIndices || !m_impl->postprocessGlobals)
+        !m_impl->postprocessPipeline || !m_impl->postprocessIndices)
     {
         error = "combine_2 distortion postprocess resources are incomplete";
         return false;
     }
-    if (!backend.Resources().UpdateBuffer(m_impl->postprocessGlobals, 304u,
-            ssfxLut.data(), sizeof(ssfxLut), error))
+    std::uint32_t width = 0u;
+    std::uint32_t height = 0u;
+    backend.DrawableSize(width, height);
+    if (width == 0u || height == 0u)
+    {
+        error = "combine_2 postprocess requires a non-zero drawable size";
+        return false;
+    }
+    const auto uv = [](float x, float y) {
+        PostprocessVertex vertex{};
+        vertex.texcoord0[0] = vertex.texcoord1[0] = vertex.texcoord2[0] =
+            vertex.texcoord3[0] = vertex.texcoord4[0] = x;
+        vertex.texcoord0[1] = vertex.texcoord1[1] = vertex.texcoord2[1] =
+            vertex.texcoord3[1] = vertex.texcoord4[1] = y;
+        vertex.texcoord5[0] = vertex.texcoord6[0] = x;
+        vertex.texcoord5[1] = vertex.texcoord6[1] = y;
+        return vertex;
+    };
+    std::array<PostprocessVertex, 4> vertices = {
+        uv(0.0f, 1.0f), uv(0.0f, 0.0f), uv(1.0f, 1.0f), uv(1.0f, 0.0f),
+    };
+    vertices[0].position[0] = 0.0f; vertices[0].position[1] = static_cast<float>(height);
+    vertices[1].position[0] = 0.0f; vertices[1].position[1] = 0.0f;
+    vertices[2].position[0] = static_cast<float>(width);
+    vertices[2].position[1] = static_cast<float>(height);
+    vertices[3].position[0] = static_cast<float>(width); vertices[3].position[1] = 0.0f;
+    for (PostprocessVertex& vertex : vertices)
+        vertex.position[3] = 1.0f;
+    std::array<std::uint8_t, 408> postprocessGlobals{};
+    std::memcpy(postprocessGlobals.data() + 304u, ssfxLut.data(), sizeof(ssfxLut));
+    R4FrameBufferSlice postprocessVerticesSlice;
+    R4FrameBufferSlice postprocessGlobalsSlice;
+    if (!backend.UploadFrameData(vertices.data(), sizeof(vertices), 16u,
+            postprocessVerticesSlice, error) ||
+        !backend.UploadFrameData(postprocessGlobals.data(), postprocessGlobals.size(), 256u,
+            postprocessGlobalsSlice, error))
         return false;
     R4MscStageBindings fragmentBindings;
     fragmentBindings.stage = R4ShaderStage::Fragment;
@@ -863,7 +928,7 @@ bool MetalR4ParticleAdapter::DrawPostprocess(IR4Backend& backend,
         {R4MscResourceType::Texture, 48u, nullptr, 0u, 0u, lut, nullptr},
         {R4MscResourceType::Texture, 72u, nullptr, 0u, 0u, bloom, nullptr},
         {R4MscResourceType::Texture, 96u, nullptr, 0u, 0u, m_impl->distortionTarget, nullptr},
-        {R4MscResourceType::ConstantBuffer, 120u, m_impl->postprocessGlobals, 0u, 408u, nullptr, nullptr},
+        {R4MscResourceType::ConstantBuffer, 120u, postprocessGlobalsSlice.buffer, postprocessGlobalsSlice.offset, postprocessGlobalsSlice.size, nullptr, nullptr},
         {R4MscResourceType::ConstantBuffer, 144u, staticGlobals, 0u, 528u, nullptr, nullptr},
         {R4MscResourceType::Sampler, 168u, nullptr, 0u, 0u, nullptr, m_impl->samplers[2]},
         {R4MscResourceType::Sampler, 192u, nullptr, 0u, 0u, nullptr, m_impl->samplers[1]},
@@ -880,7 +945,7 @@ bool MetalR4ParticleAdapter::DrawPostprocess(IR4Backend& backend,
         {R4MscResourceType::ConstantBuffer, 0u, staticGlobals, 0u, 528u, nullptr, nullptr},
     };
     return backend.BindGraphicsPipeline(m_impl->postprocessPipeline, error) &&
-        backend.BindVertexBuffer(6u, m_impl->postprocessVertices, 0u, error) &&
+        backend.BindVertexBuffer(6u, postprocessVerticesSlice.buffer, postprocessVerticesSlice.offset, error) &&
         backend.BindMscResources(vertexBindings, error) &&
         backend.BindMscResources(fragmentBindings, error) &&
         backend.DrawIndexed(draw, error);
@@ -897,12 +962,21 @@ namespace
 class TestBuffer final : public IR4Buffer
 {
 public:
-    explicit TestBuffer(const R4BufferDesc& description) : m_description(description) {}
+    TestBuffer(const R4BufferDesc& description, const void* initialData = nullptr,
+        std::size_t initialDataSize = 0u)
+        : m_description(description), m_bytes(description.size)
+    {
+        if (initialData && initialDataSize != 0u)
+            std::memcpy(m_bytes.data(), initialData, initialDataSize);
+    }
     std::size_t Size() const override { return m_description.size; }
     std::size_t AllocationSize() const override { return m_description.size; }
     R4ResourceStorage Storage() const override { return m_description.storage; }
+    const std::vector<std::uint8_t>& Bytes() const { return m_bytes; }
+    std::vector<std::uint8_t>& Bytes() { return m_bytes; }
 private:
     R4BufferDesc m_description;
+    std::vector<std::uint8_t> m_bytes;
 };
 
 class TestResources final : public IR4Resources
@@ -917,7 +991,7 @@ public:
             return {};
         }
         ++uploads;
-        return std::make_shared<TestBuffer>(description);
+        return std::make_shared<TestBuffer>(description, data, dataSize);
     }
     bool UpdateBuffer(const std::shared_ptr<IR4Buffer>&, std::size_t, const void*, std::size_t,
         std::string&) override { return false; }
@@ -927,6 +1001,13 @@ public:
     bool UploadTexture2D(const std::shared_ptr<IR4Texture>&, std::uint32_t, std::uint32_t,
         const void*, std::size_t, std::size_t, std::size_t, std::string&) override { return false; }
     std::shared_ptr<IR4Sampler> CreateSampler(const R4SamplerDesc&, std::string&) override { return {}; }
+    std::shared_ptr<TestBuffer> CreateFrameArena(std::size_t size)
+    {
+        R4BufferDesc description;
+        description.size = size; description.storage = R4ResourceStorage::Shared;
+        description.usage = R4BufferUsage::Generic; description.label = "particle test upload arena";
+        return std::make_shared<TestBuffer>(description);
+    }
     std::size_t uploads = 0;
 };
 } // namespace
@@ -1072,6 +1153,163 @@ bool RunMetalR4ParticleAdapterSelfTest(std::string& error)
         adapter.LastTelemetry().rejectedDraws != 1u)
     {
         error = "particle adapter did not fail closed on a malformed quad index pattern";
+        return false;
+    }
+
+    // Exercise the upload-arena path with two chunks from one source record.
+    // Compare every uploaded byte against the compatibility CreateBuffer path,
+    // then discard and restage into reused arena addresses with different data.
+    constexpr std::uint32_t ArenaSpriteCount = kMaxSpritesPerUpload + 1u;
+    xray::metal::particles::FrameBatch arenaFrame;
+    arenaFrame.vertices.resize(static_cast<std::size_t>(ArenaSpriteCount) * 4u);
+    arenaFrame.indices.resize(static_cast<std::size_t>(ArenaSpriteCount) * 6u);
+    for (std::uint32_t sprite = 0u; sprite < ArenaSpriteCount; ++sprite)
+    {
+        const std::uint32_t baseVertex = sprite * 4u;
+        const std::uint32_t baseIndex = sprite * 6u;
+        for (std::uint32_t vertex = 0u; vertex < 4u; ++vertex)
+        {
+            auto& output = arenaFrame.vertices[baseVertex + vertex];
+            output.position[0] = static_cast<float>(sprite) * 0.001f + static_cast<float>(vertex);
+            output.position[1] = static_cast<float>(vertex & 1u);
+            output.position[2] = static_cast<float>((vertex >> 1u) & 1u);
+            output.texcoord[0] = static_cast<float>(vertex & 1u);
+            output.texcoord[1] = static_cast<float>((vertex >> 1u) & 1u);
+            output.d3dColor = 0xff000000u | sprite;
+        }
+        static constexpr std::uint32_t QuadPattern[6] = {0u, 1u, 2u, 0u, 2u, 3u};
+        for (std::uint32_t index = 0u; index < 6u; ++index)
+            arenaFrame.indices[baseIndex + index] = baseVertex + QuadPattern[index];
+    }
+    xray::metal::particles::DrawRecord arenaRecord = draw;
+    arenaRecord.shaderIdentity = "particle";
+    arenaRecord.textureIdentity = "fx\\test";
+    arenaRecord.hudMode = false;
+    arenaRecord.materialMetadataValid = true;
+    arenaRecord.materialFamily = xray::metal::particles::MaterialFamily::BlenderParticle;
+    arenaRecord.blendMode = xray::metal::particles::BlendMode::Blend;
+    arenaRecord.sourceBlend = xray::metal::particles::BlendFactor::SourceAlpha;
+    arenaRecord.destinationBlend = xray::metal::particles::BlendFactor::OneMinusSourceAlpha;
+    arenaRecord.firstVertex = 0u;
+    arenaRecord.vertexCount = ArenaSpriteCount * 4u;
+    arenaRecord.firstIndex = 0u;
+    arenaRecord.indexCount = ArenaSpriteCount * 6u;
+    arenaFrame.draws.push_back(arenaRecord);
+
+    MetalR4ParticleAdapter legacyArenaAdapter;
+    if (!legacyArenaAdapter.Prepare({}, status))
+    {
+        error = "particle arena self-test legacy adapter setup failed";
+        return false;
+    }
+    TestResources legacyArenaResources;
+    if (!legacyArenaAdapter.StageFrame(legacyArenaResources, arenaFrame, error) ||
+        legacyArenaAdapter.PreparedDraws().size() != 2u || legacyArenaResources.uploads != 4u)
+    {
+        if (error.empty()) error = "particle legacy upload path did not split at the sprite limit";
+        return false;
+    }
+
+    MetalR4ParticleAdapter arenaAdapter;
+    if (!arenaAdapter.Prepare({}, status))
+    {
+        error = "particle arena self-test adapter setup failed";
+        return false;
+    }
+    TestResources arenaResources;
+    auto arenaBuffer = arenaResources.CreateFrameArena(4u * 1024u * 1024u);
+    std::size_t arenaOffset = 32u;
+    std::size_t arenaUploads = 0u;
+    const auto fakeFrameUpload = [&](const void* data, std::size_t size, std::size_t alignment,
+        R4FrameBufferSlice& slice, std::string& uploadError) {
+        if (!data || size == 0u || alignment == 0u || (alignment & (alignment - 1u)) != 0u)
+        {
+            uploadError = "particle test frame uploader received an invalid range";
+            return false;
+        }
+        const std::size_t aligned = (arenaOffset + alignment - 1u) & ~(alignment - 1u);
+        if (aligned > arenaBuffer->Size() || size > arenaBuffer->Size() - aligned)
+        {
+            uploadError = "particle test frame arena capacity exceeded";
+            return false;
+        }
+        std::memcpy(arenaBuffer->Bytes().data() + aligned, data, size);
+        slice = {arenaBuffer, aligned, size};
+        arenaOffset = aligned + size;
+        ++arenaUploads;
+        return true;
+    };
+    const MetalR4ParticleAdapter::FrameUploadFunction uploader = fakeFrameUpload;
+    if (!arenaAdapter.StageFrameImpl(arenaResources, arenaFrame, error, &uploader) ||
+        arenaAdapter.PreparedDraws().size() != 2u || arenaUploads != 4u)
+    {
+        if (error.empty()) error = "particle frame-arena path did not split the large draw";
+        return false;
+    }
+    for (std::size_t chunk = 0u; chunk < 2u; ++chunk)
+    {
+        const auto& expected = legacyArenaAdapter.PreparedDraws()[chunk];
+        const auto& actual = arenaAdapter.PreparedDraws()[chunk];
+        const auto legacyVertices = std::dynamic_pointer_cast<TestBuffer>(expected.vertices);
+        const auto legacyIndices = std::dynamic_pointer_cast<TestBuffer>(expected.indices);
+        if (!legacyVertices || !legacyIndices || actual.vertices != arenaBuffer || actual.indices != arenaBuffer ||
+            actual.vertexBufferOffset == 0u || actual.indexBufferOffset == 0u ||
+            actual.vertexBufferOffset == actual.indexBufferOffset ||
+            actual.vertexBufferOffset > arenaBuffer->Size() ||
+            actual.vertexByteSize > arenaBuffer->Size() - actual.vertexBufferOffset ||
+            actual.indexBufferOffset > arenaBuffer->Size() ||
+            actual.indexByteSize > arenaBuffer->Size() - actual.indexBufferOffset ||
+            actual.vertexByteSize != expected.vertexByteSize || actual.indexByteSize != expected.indexByteSize ||
+            std::memcmp(legacyVertices->Bytes().data(),
+                arenaBuffer->Bytes().data() + actual.vertexBufferOffset, actual.vertexByteSize) != 0 ||
+            std::memcmp(legacyIndices->Bytes().data(),
+                arenaBuffer->Bytes().data() + actual.indexBufferOffset, actual.indexByteSize) != 0)
+        {
+            error = "particle frame-arena chunk bytes/offsets differ from legacy uploads";
+            return false;
+        }
+    }
+
+    arenaAdapter.DiscardFrame();
+    if (!arenaAdapter.PreparedDraws().empty() || arenaAdapter.LastTelemetry().preparedDraws != 0u)
+    {
+        error = "particle frame discard retained stale prepared arena draws";
+        return false;
+    }
+    xray::metal::particles::FrameBatch restageFrame;
+    restageFrame.vertices.assign(arenaFrame.vertices.begin(), arenaFrame.vertices.begin() + 4);
+    restageFrame.vertices.front().position[0] = -17.0f;
+    restageFrame.indices = {0u, 1u, 2u, 0u, 2u, 3u};
+    arenaRecord.vertexCount = 4u; arenaRecord.indexCount = 6u;
+    restageFrame.draws.push_back(arenaRecord);
+    TestResources legacyRestageResources;
+    MetalR4ParticleAdapter legacyRestageAdapter;
+    if (!legacyRestageAdapter.Prepare({}, status) ||
+        !legacyRestageAdapter.StageFrame(legacyRestageResources, restageFrame, error))
+    {
+        if (error.empty()) error = "particle discard/restage legacy setup failed";
+        return false;
+    }
+    arenaOffset = 32u; arenaUploads = 0u;
+    if (!arenaAdapter.StageFrameImpl(arenaResources, restageFrame, error, &uploader) ||
+        arenaAdapter.PreparedDraws().size() != 1u || arenaUploads != 2u)
+    {
+        if (error.empty()) error = "particle discard/restage retained stale chunk geometry";
+        return false;
+    }
+    const auto restagedExpectedVertices = std::dynamic_pointer_cast<TestBuffer>(
+        legacyRestageAdapter.PreparedDraws().front().vertices);
+    const auto restagedExpectedIndices = std::dynamic_pointer_cast<TestBuffer>(
+        legacyRestageAdapter.PreparedDraws().front().indices);
+    const auto& restaged = arenaAdapter.PreparedDraws().front();
+    if (!restagedExpectedVertices || !restagedExpectedIndices ||
+        restaged.vertexBufferOffset != 32u || restaged.indexBufferOffset == 0u ||
+        std::memcmp(restagedExpectedVertices->Bytes().data(),
+            arenaBuffer->Bytes().data() + restaged.vertexBufferOffset, restaged.vertexByteSize) != 0 ||
+        std::memcmp(restagedExpectedIndices->Bytes().data(),
+            arenaBuffer->Bytes().data() + restaged.indexBufferOffset, restaged.indexByteSize) != 0)
+    {
+        error = "particle restaged bytes do not match new geometry at reused arena offsets";
         return false;
     }
     error.clear();

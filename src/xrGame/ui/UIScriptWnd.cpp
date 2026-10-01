@@ -68,6 +68,14 @@ void CUIDialogWndEx::AddCallback(LPCSTR control_id, s16 evt, const ::luabind::fu
 	c->m_event = evt;
 }
 
+bool CUIDialogWndEx::HasCallback(CUIWindow* control, s16 event) const
+{
+	if (!control)
+		return false;
+	const event_comparer comparer(control, event);
+	return std::find_if(m_callbacks.begin(), m_callbacks.end(), comparer) != m_callbacks.end();
+}
+
 
 bool CUIDialogWndEx::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {

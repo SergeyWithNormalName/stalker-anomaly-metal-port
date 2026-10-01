@@ -1,6 +1,8 @@
 #include "stdafx.h"
 
 #include <cstring>
+#include <cmath>
+#include <unordered_map>
 
 #include "../../xrEngine/render.h"
 #include "../../xrEngine/irenderable.h"
@@ -11,6 +13,7 @@
 #include "FBasicVisual.h"
 #include "CHudInitializer.h"
 #include "MetalParticleCapture.h"
+#include "../xrRenderMetal/MetalR4SunCascadeCapture.h"
 
 #include "fhierrarhyvisual.h"
 #include "SkeletonCustom.h"
@@ -20,6 +23,8 @@
 #include "../../xrEngine/xr_object.h"
 
 using namespace R_dsgraph;
+
+extern ENGINE_API BOOL r2_advanced_pp;
 
 extern float r_ssaDISCARD;
 extern float r_ssaDONTSORT;
@@ -747,27 +752,131 @@ void CDSGraphManager::r_dsgraph_capture_metal_world()
 {
 	PROF_EVENT("r_dsgraph_capture_metal_world")
 	xray::metal::particles::ResetFrameBatch();
-	xr_vector<ISpatialShared> candidates;
+	struct CaptureCandidate
+	{
+		ISpatialShared spatial;
+		bool mainView = false;
+	};
+	xr_vector<CaptureCandidate> candidates;
+	std::unordered_map<ISpatial*, std::size_t> candidateIndices;
+	xr_vector<ISpatialShared> queryResults;
+	const auto appendCandidates = [&](const xr_vector<ISpatialShared>& query, const bool mainView)
+	{
+		for (const ISpatialShared& spatial : query)
+		{
+			if (!spatial)
+				continue;
+			const auto [entry, inserted] = candidateIndices.emplace(spatial.get(), candidates.size());
+			if (inserted)
+				candidates.push_back({spatial, mainView});
+			else if (mainView)
+				candidates[entry->second].mainView = true;
+		}
+	};
 	CFrustum frustum;
 	frustum.CreateFromMatrix(Device.mFullTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
-
-	if (g_SpatialSpace && psDeviceFlags.test(rsDrawDynamic))
+	const bool captureWorld = g_SpatialSpace && psDeviceFlags.test(rsDrawDynamic);
+	if (captureWorld)
 	{
-		g_SpatialSpace->q_frustum(
-			candidates,
-			ISpatial_DB::O_ORDERED,
-			STYPE_RENDERABLE | STYPE_RENDERABLESHADOW | STYPE_PARTICLE,
-			frustum);
+		g_SpatialSpace->q_frustum(queryResults, ISpatial_DB::O_ORDERED,
+			STYPE_RENDERABLE | STYPE_RENDERABLESHADOW | STYPE_PARTICLE, frustum);
+		appendCandidates(queryResults, true);
+	}
+
+	// Shadow producers need active spatial renderables that can affect the
+	// actual source light volumes, even when the main camera cannot see them.
+	// Sun uses the same Windows FixedConvexVolume cascade caster planes; local
+	// point/spot lights contribute a conservative range sphere and their tile
+	// LVP performs the final exact per-light cull later.
+	std::size_t shadowSpatialHits = 0u;
+	if (captureWorld)
+	{
+		const CEnvDescriptorMixer* current = g_pGamePersistent ?
+			g_pGamePersistent->Environment().CurrentEnv : nullptr;
+		const std::array<float, 3> sizes = {ps_ssfx_shadow_cascades.x,
+			ps_ssfx_shadow_cascades.y, ps_ssfx_shadow_cascades.z};
+		Fvector sunDirection;
+		if (current)
+			sunDirection.set(current->sun_dir);
+		else
+			sunDirection.set(0.f, -1.f, 0.f);
+		Fvector sunPosition;
+		sunPosition.mad(Device.vCameraPosition, sunDirection, -500.f);
+		if (light* adaptedSun = static_cast<light*>(RImplementation.Lights.sun_adapted._get()))
+			sunDirection.set(adaptedSun->direction);
+		sunPosition.mad(Device.vCameraPosition, sunDirection, -500.f);
+		Fvector forward{Device.mView._13, Device.mView._23, Device.mView._33};
+		const bool resetLastCascade = r2_advanced_pp && ps_sunshafts_mode && current &&
+			current->m_fSunShaftsIntensity >= 0.0001f;
+		const R4SunCascadeSet sunCascades = BuildMetalR4SunCascades(Device.mView,
+			Device.mProject, Device.vCameraPosition, forward, sunPosition, sunDirection,
+			sizes, 2048u, resetLastCascade, Device.dwFrame);
+		if (sunCascades.valid)
+		{
+			for (const R4SunCascade& cascade : sunCascades.cascades)
+			{
+				CFrustum casterFrustum;
+				casterFrustum._clear();
+				for (const std::array<float, 4>& values : cascade.casterPlanes)
+				{
+					Fplane plane;
+					plane.n.set(values[0], values[1], values[2]);
+					plane.d = values[3];
+					casterFrustum._add(plane);
+				}
+				g_SpatialSpace->q_frustum(queryResults, ISpatial_DB::O_ORDERED,
+					STYPE_RENDERABLE | STYPE_RENDERABLESHADOW, casterFrustum);
+				shadowSpatialHits += queryResults.size();
+				appendCandidates(queryResults, false);
+			}
+		}
+
+		const float fogDistance = current ? current->fog_distance :
+			std::numeric_limits<float>::max();
+		for (light* source : RImplementation.v_all_lights)
+		{
+			if (!source || !source->flags.bActive || !source->flags.bShadow ||
+				!source->SpatialComponent || source->flags.bHudMode)
+				continue;
+			const auto type = static_cast<IRender_Light::LT>(source->flags.type);
+			if (type != IRender_Light::POINT && type != IRender_Light::SPOT)
+				continue;
+			Fvector center;
+			center.set(source->SpatialComponent->spatial.sphere.P);
+			if (!frustum.testSphere_dirty(center,
+					source->SpatialComponent->spatial.sphere.R) ||
+				(source->flags.bStatic && !ps_r2_ls_flags.test(R2FLAG_R1LIGHTS)) ||
+				Device.vCameraPosition.distance_to_sqr(center) > _sqr(fogDistance) ||
+				!(source->get_LOD() > ps_r2_shadow_lod_min) ||
+				!std::isfinite(source->range) || source->range <= 0.f)
+				continue;
+			g_SpatialSpace->q_sphere(queryResults, ISpatial_DB::O_ORDERED,
+				STYPE_RENDERABLE | STYPE_RENDERABLESHADOW,
+				source->position, source->range);
+			shadowSpatialHits += queryResults.size();
+			appendCandidates(queryResults, false);
+		}
 	}
 
 	metalWorldCaptureStaging.clear();
 	metalWorldCaptureStaging.reserve(candidates.size());
 	metalWorldCaptureKinematics = nullptr;
 	metalWorldCaptureActive = true;
-	for (const ISpatialShared& spatial : candidates)
+	std::size_t cameraCandidateCount = 0u;
+	std::size_t shadowOnlyCandidateCount = 0u;
+	for (const CaptureCandidate& candidate : candidates)
 	{
+		const ISpatialShared& spatial = candidate.spatial;
 		if (!spatial)
 			continue;
+		if (candidate.mainView)
+			++cameraCandidateCount;
+		else
+		{
+			++shadowOnlyCandidateCount;
+			if (spatial->spatial.type & STYPE_PARTICLE)
+				continue;
+		}
 		IRenderable* renderable = spatial->dcast_Renderable();
 		if (!renderable || !renderable->renderable.visual)
 			continue;
@@ -776,7 +885,11 @@ void CDSGraphManager::r_dsgraph_capture_metal_world()
 		// m_legs_transform instead of substituting the actor's full visual/XFORM.
 		if (!(spatial->spatial.type & STYPE_PARTICLE))
 			set_Object(renderable);
+		metalWorldCaptureObjectCastsShadow = renderable->renderable_ShadowGenerate() != FALSE;
+		metalWorldCaptureShadowAllowed = true;
 		renderable->renderable_Render(dcast_IPortalTraverser());
+		metalWorldCaptureObjectCastsShadow = false;
+		metalWorldCaptureShadowAllowed = false;
 		if (!(spatial->spatial.type & STYPE_PARTICLE))
 			set_Object();
 	}
@@ -794,8 +907,9 @@ void CDSGraphManager::r_dsgraph_capture_metal_world()
 	if (lastLoggedFrame == u32(-1) || Device.dwFrame - lastLoggedFrame >= 300)
 	{
 		lastLoggedFrame = Device.dwFrame;
-		Msg("* METAL_WORLD_CAPTURE frame=%u spatial=%u renderables=%u", Device.dwFrame,
-		    u32(candidates.size()), capturedCount);
+		Msg("* METAL_WORLD_CAPTURE frame=%u spatial=%u main=%u shadow_only=%u shadow_hits=%u renderables=%u",
+			Device.dwFrame, u32(candidates.size()), u32(cameraCandidateCount),
+			u32(shadowOnlyCandidateCount), u32(shadowSpatialHits), capturedCount);
 	}
 }
 
@@ -910,11 +1024,16 @@ void CDSGraphManager::r_dsgraph_capture_metal_lights()
 		}
 
 		const u64 parentIdentity = static_cast<u64>(reinterpret_cast<uintptr_t>(source));
+		bool decorative = false;
+		for (CObject* object : source->decor_object)
+			decorative = decorative || (object && !object->getDestroy());
+		const float cameraDistance = Device.vCameraPosition.distance_to(sphereCenter);
 		const auto append = [&](const MetalLocalLight::Type type, const Fvector& direction,
 			const Fvector& right, const u8 omniFace)
 		{
 			MetalLocalLight target;
-			target.identity = (parentIdentity << 3u) | (omniFace == 0xff ? 0u : u64(omniFace + 1u));
+			target.parentIdentity = parentIdentity;
+            target.identity = (parentIdentity << 3u) | (omniFace == 0xff ? 0u : u64(omniFace + 1u));
 			target.type = type;
 			target.position.set(source->position);
 			target.direction.set(direction);
@@ -927,6 +1046,8 @@ void CDSGraphManager::r_dsgraph_capture_metal_lights()
 			target.active = true;
 			target.staticLight = source->flags.bStatic;
 			target.shadowed = source->flags.bShadow;
+			target.decorative = decorative;
+			target.cameraDistance = cameraDistance;
 			target.hudMode = source->flags.bHudMode;
 			target.omniFace = omniFace;
 			target.projectorTexture = source->projector_texture;

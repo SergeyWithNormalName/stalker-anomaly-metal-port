@@ -25,6 +25,8 @@ add_module(XRay.Engine.Interfaces.Input
   xr_input_xinput.h
 )
 
+include(XRay.Engine.Interfaces.Input.Gamepad)
+
 add_module(XRay.Engine.Interfaces.Physics
   SOURCES
   phdebug.cpp

@@ -3,6 +3,7 @@
 #include "IR4Backend.h"
 #include "R4DdsTexture.h"
 #include "R4LocalShadowAtlasFoundation.h"
+#include "R4LightMarker.h"
 
 #include <array>
 #include <filesystem>
@@ -20,6 +21,9 @@ public:
     {
         std::filesystem::path shaderDirectory;
         xray::metal::R4DdsBytesProvider ddsBytesProvider;
+        // Explicit resource for standalone GPU fixtures without engine XRFS.
+        // The engine leaves this empty and loads the archive-winning cookie.
+        std::shared_ptr<IR4Texture> defaultSpotCookie;
     };
 
     struct GBufferInputs
@@ -47,6 +51,7 @@ public:
         std::size_t requested = 0;
         std::size_t admitted = 0;
         std::size_t submitted = 0;
+        std::size_t markerResets = 0;
         std::size_t culled = 0;
         std::size_t skippedUnavailable = 0;
         std::size_t skippedInactive = 0;
@@ -68,6 +73,21 @@ public:
         const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
         std::string& error);
 
+    // One cursor and telemetry epoch spans every atlas batch in a GPU frame.
+    struct DrawState
+    {
+        xray::metal::R4LightMarker marker;
+        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
+        std::int64_t activeVisibilityBatch = -1;
+    };
+    void BeginFrame() { m_telemetry = {}; }
+    bool DrawBatchIntoActiveAccumulator(IR4Backend& backend, const GBufferInputs& inputs,
+        const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+        const std::vector<std::size_t>& lightIndices, DrawState& state, std::string& error);
+
+    bool ResolveProjectorTexture(IR4Backend& backend, const R4EngineLocalLight& light,
+        std::shared_ptr<IR4Texture>& texture, std::string& error);
+
     bool IsReady() const { return m_ready; }
     const std::string& Status() const { return m_status; }
     const Telemetry& LastTelemetry() const { return m_telemetry; }
@@ -80,8 +100,31 @@ public:
 private:
     std::unique_ptr<Impl> m_impl;
     bool m_ready = false;
+    bool m_activeOcclusionTransformsRequested = false;
     std::string m_status;
     Telemetry m_telemetry;
 };
 
+// Pure helper for the camera VP used by the local-light adapter. It shares the
+// adapter's historical `multiply(projection, view)` implementation so the
+// diagnostic query cannot silently substitute a separately ordered multiply.
+void BuildMetalR4LocalLightCameraViewProjection(
+    const std::array<float, 16>& view,
+    const std::array<float, 16>& projection,
+    std::array<float, 16>& viewProjection);
+
+// These two helpers share the exact model construction and multiply used by
+// the ordinary adapter upload path. They expose numeric provenance only.
+void BuildMetalR4LocalLightModel(const R4EngineLocalLight& light,
+    std::array<float, 16>& model, std::array<float, 4>* localPositionAbsMax = nullptr);
+void BuildMetalR4LocalLightWorldViewProjection(
+    const std::array<float, 16>& cameraViewProjection,
+    const std::array<float, 16>& model,
+    std::array<float, 16>& worldViewProjection);
+
 bool RunMetalR4LocalLightAdapterSelfTest(std::string& error);
+
+// Conservative world AABB of the exact accumulator mesh/model, not the lamp
+// position or shadow frustum. Diagnostic only; invalid bases fail open.
+bool BuildMetalR4LocalLightVolumeBounds(const R4EngineLocalLight& light,
+    std::array<float, 3>& minimum, std::array<float, 3>& maximum);

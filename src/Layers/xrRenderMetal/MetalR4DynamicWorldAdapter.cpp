@@ -1,8 +1,15 @@
 #include "MetalR4DynamicWorldAdapter.h"
+#include "R4StaticShadowIndex.h"
+#include "R4DynamicWorldPreparedState.h"
+#include "R4ComputeSkinFoundation.h"
+#include "R4ComputeSkinPoseJournal.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -11,6 +18,43 @@
 
 namespace
 {
+using E07Clock = std::chrono::steady_clock;
+
+double elapsedMilliseconds(const E07Clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(E07Clock::now() - start).count();
+}
+
+struct E07ScopedTimer
+{
+    double& totalMs;
+    bool enabled;
+    E07Clock::time_point start{};
+
+    E07ScopedTimer(double& total, const bool active) : totalMs(total), enabled(active)
+    {
+        if (enabled)
+            start = E07Clock::now();
+    }
+
+    ~E07ScopedTimer()
+    {
+        if (enabled)
+            totalMs += elapsedMilliseconds(start);
+    }
+};
+
+struct E07ObjectSample
+{
+    std::uint16_t objectId = 0xffffu;
+    std::uint32_t frame = 0;
+    bool viewFrustumVisible = false;
+    std::size_t bones = 0;
+    bool bonesKnown = false;
+    std::size_t assetGeometryCount = 0;
+    bool submittedToGbuffer = false;
+};
+
 constexpr std::uint32_t kFvfPositionMask = 0x000eu;
 constexpr std::uint32_t kFvfXyz = 0x0002u;
 constexpr std::uint32_t kFvfNormal = 0x0010u;
@@ -22,10 +66,28 @@ constexpr std::uint32_t kFvfTexCountShift = 8u;
 constexpr std::size_t kVertexGlobalsSize = 160u;
 constexpr std::size_t kTransformsSize = 256u;
 constexpr std::size_t kFragmentGlobalsSize = 176u;
+constexpr std::size_t kEmissiveFragmentGlobalsSize = 192u;
+constexpr std::size_t kEmissivePdaParamsOffset = 176u;
 constexpr std::size_t kFragmentGlobalsHotnessOffset = 144u;
 constexpr std::size_t kFragmentGlobalsHotnessSize = sizeof(float) * 4u;
+// SKIN_NONE's deffer_model_flat VS consumes normalized FLOAT2 TEXCOORD0.
+// Keep this stream separate from the G-buffer stream, whose Short2 is scaled
+// by 1024 for deffer_base_flat's source-specific UV contract.
+struct R4DynamicWorldEmissiveNoneVertex
+{
+    float position[4];
+    float normal[4];
+    float tangent[4];
+    float binormal[4];
+    float texcoord[2];
+    float positionT[4];
+};
+static_assert(sizeof(R4DynamicWorldEmissiveNoneVertex) == 88u,
+    "models_selflightl SKIN_NONE vertex stream must preserve Float2 TEXCOORD0");
 static_assert(kFragmentGlobalsHotnessOffset + kFragmentGlobalsHotnessSize <= kFragmentGlobalsSize,
     "dynamic-world L_hotness must fit the reflected $Globals b0 ABI");
+static_assert(kEmissivePdaParamsOffset + sizeof(float) * 4u == kEmissiveFragmentGlobalsSize,
+    "accum_emissivel pda_params must fit the reflected 192-byte $Globals b0 ABI");
 constexpr std::uint32_t kOgfVertexFormat1L = 0x12071980u;
 constexpr std::uint32_t kOgfVertexFormat2L = 0x240e3300u;
 constexpr std::uint32_t kOgfVertexFormat3L = 0x481c6600u;
@@ -34,7 +96,33 @@ constexpr std::size_t kInstanceFrameSlots = 3u;
 constexpr std::uint64_t kInstanceRetentionGenerations = 180u;
 constexpr std::size_t kMaxCachedDynamicInstances = 16384u;
 
+bool isModelLightplane(const R4EngineWorldGeometry& geometry)
+{
+    return geometry.shaderName == "models\\lightplanes";
+}
+
+bool isModelsSelflightL(const std::string& shaderName)
+{
+    std::string normalized;
+    normalized.reserve(shaderName.size());
+    for (const unsigned char character : shaderName)
+        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
+    return normalized == "models/selflightl";
+}
+
+bool isModelsSelflightFamily(const std::string& shaderName)
+{
+    std::string normalized;
+    normalized.reserve(shaderName.size());
+    for (const unsigned char character : shaderName)
+        normalized.push_back(character == '\\' ? '/' : static_cast<char>(std::tolower(character)));
+    return normalized == "models/selflight" || normalized == "models/selflightl";
+}
+
 struct Float3 { float x = 0, y = 0, z = 0; };
+
+using xray::metal::DynamicWorldPrewarmDisposition;
+using xray::metal::dynamicWorldPrewarmDisposition;
 
 bool hasPositiveHotness(const std::array<float, 4>& hotness)
 {
@@ -251,6 +339,81 @@ bool isFiniteMatrix(const std::array<float, 16>& matrix)
     return std::all_of(matrix.begin(), matrix.end(), [](const float value) { return std::isfinite(value); });
 }
 
+struct DynamicCpuVertexDiagnostic
+{
+    bool available = false;
+    std::size_t vertices = 0;
+    std::size_t nonFiniteUv = 0;
+    std::size_t nonFinitePosition = 0;
+    std::size_t nonFiniteClip = 0;
+    std::size_t nearZeroClipW = 0;
+    float minAbsClipW = std::numeric_limits<float>::infinity();
+};
+
+void accumulateCpuVertexDiagnostic(DynamicCpuVertexDiagnostic& result,
+    const std::array<float, 4>& position, const float u, const float v,
+    const std::array<float, 16>& worldViewProjection)
+{
+    ++result.vertices;
+    if (!std::isfinite(u) || !std::isfinite(v))
+        ++result.nonFiniteUv;
+    if (!std::all_of(position.begin(), position.end(),
+            [](const float component) { return std::isfinite(component); }))
+    {
+        ++result.nonFinitePosition;
+        return;
+    }
+    const float clipW = worldViewProjection[3] * position[0] +
+        worldViewProjection[7] * position[1] + worldViewProjection[11] * position[2] +
+        worldViewProjection[15] * position[3];
+    if (!std::isfinite(clipW))
+    {
+        ++result.nonFiniteClip;
+        return;
+    }
+    const float absClipW = std::abs(clipW);
+    result.minAbsClipW = std::min(result.minAbsClipW, absClipW);
+    if (absClipW <= 1.0e-6f)
+        ++result.nearZeroClipW;
+}
+
+DynamicCpuVertexDiagnostic diagnoseDynamicCpuVertices(
+    const std::vector<R4DynamicWorldBumpVertex>& vertices,
+    const std::array<float, 16>& worldViewProjection)
+{
+    DynamicCpuVertexDiagnostic result;
+    result.available = true;
+    for (const R4DynamicWorldBumpVertex& vertex : vertices)
+    {
+        accumulateCpuVertexDiagnostic(result,
+            {vertex.position[0], vertex.position[1], vertex.position[2], vertex.position[3]},
+            static_cast<float>(vertex.texcoord[0]), static_cast<float>(vertex.texcoord[1]),
+            worldViewProjection);
+    }
+    return result;
+}
+
+DynamicCpuVertexDiagnostic diagnoseDynamicCpuVertices(
+    const std::vector<R4DynamicWorldSkinnedVertex>& vertices,
+    const std::array<float, 16>& worldViewProjection)
+{
+    DynamicCpuVertexDiagnostic result;
+    result.available = true;
+    for (const R4DynamicWorldSkinnedVertex& vertex : vertices)
+    {
+        accumulateCpuVertexDiagnostic(result,
+            {vertex.position[0], vertex.position[1], vertex.position[2], vertex.position[3]},
+            vertex.texcoord[0], vertex.texcoord[1], worldViewProjection);
+    }
+    return result;
+}
+
+bool dynamicDrawDiagnosticsEnabled()
+{
+    const char* diagnostics = std::getenv("XRAY_METAL_DYNAMIC_DRAW_DIAGNOSTICS");
+    return diagnostics && std::strcmp(diagnostics, "1") == 0;
+}
+
 // The engine captures visual->vis.sphere in local space and its world matrix
 // separately.  For non-skinned geometry, the enclosing local cube is a
 // conservative bound.  Skinned geometry deliberately bypasses this check:
@@ -310,6 +473,55 @@ std::uint64_t hashBonePose(const std::shared_ptr<const std::vector<std::array<fl
     }
     return hash ^ static_cast<std::uint64_t>(transforms->size());
 }
+
+struct DynamicShadowFrameIndex
+{
+    xray::metal::R4StaticShadowIndex index;
+    std::shared_ptr<const R4EngineWorldSnapshot> owner;
+    std::uint32_t engineFrame = UINT32_MAX;
+    std::size_t slot = std::numeric_limits<std::size_t>::max();
+    std::size_t eligible = 0u;
+    std::size_t missingAssets = 0u;
+
+    void Invalidate() { owner.reset(); }
+
+    void Prepare(const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+        const std::size_t acquiredSlot)
+    {
+        Invalidate();
+        index.entries.clear(); index.unbounded.clear(); index.nodes.clear(); index.candidates.clear();
+        eligible = missingAssets = 0u;
+        for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
+        {
+            const auto& renderable = world->renderables[renderableIndex];
+            if (!renderable.asset) { ++missingAssets; continue; }
+            if (!renderable.castsShadow) continue;
+            ++eligible;
+            const float radius = renderable.bounds[3];
+            std::array<float, 3> minimum{}, maximum{};
+            for (std::size_t axis = 0; axis < 3u; ++axis)
+            {
+                minimum[axis] = renderable.bounds[axis] - radius;
+                maximum[axis] = renderable.bounds[axis] + radius;
+            }
+            // Enclose the OLD local-sphere cube, not smaller skin/rest-pose
+            // bounds. Invalid/overflow/non-affine inputs stay unbounded.
+            index.Add(std::isfinite(radius) && radius >= 0.0f, minimum, maximum,
+                renderable.transform.data(), renderableIndex);
+        }
+        index.Finish();
+        engineFrame = world->engineFrame;
+        slot = acquiredSlot;
+        owner = world;
+    }
+
+    bool Matches(const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+        const std::size_t acquiredSlot) const
+    {
+        return owner && world && owner == world && world->engineFrame == engineFrame &&
+            slot == acquiredSlot;
+    }
+};
 
 bool readTextFile(const std::filesystem::path& path, std::string& value)
 {
@@ -461,6 +673,46 @@ bool validateModelFlatVertexReflection(const std::filesystem::path& path, std::s
     return true;
 }
 
+bool validateModelLightplaneBundle(const std::filesystem::path& vertexPath,
+    const std::filesystem::path& fragmentPath, std::string& error)
+{
+    if (vertexPath.filename() != "model_def_lplanes.vs.metallib" ||
+        fragmentPath.filename() != "base_lplanes.ps.metallib" ||
+        vertexPath.parent_path() != fragmentPath.parent_path())
+    {
+        error = "dynamic model lightplanes require paired model_def_lplanes.vs/base_lplanes.ps metallibs";
+        return false;
+    }
+    std::filesystem::path vsJson = vertexPath;
+    std::filesystem::path psJson = fragmentPath;
+    vsJson.replace_extension(".json");
+    psJson.replace_extension(".json");
+    std::string vs, ps;
+    if (!std::filesystem::is_regular_file(vertexPath) ||
+        !std::filesystem::is_regular_file(fragmentPath) ||
+        !readTextFile(vsJson, vs) || !readTextFile(psJson, ps))
+    {
+        error = "dynamic model lightplanes metallibs or reflection JSON are unavailable";
+        return false;
+    }
+    static constexpr const char* VsTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+    static constexpr const char* PsTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    static constexpr const char* Inputs =
+        "\"vertex_inputs\":[{\"columnCount\":4,\"elementType\":\"Float\",\"index\":0,\"name\":\"position0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":1,\"name\":\"normal0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":2,\"name\":\"tangent0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":3,\"name\":\"binormal0\"},{\"columnCount\":2,\"elementType\":\"Float\",\"index\":4,\"name\":\"texcoord0\"}]";
+    if (vs.find(VsTlab) == std::string::npos || vs.find(Inputs) == std::string::npos ||
+        vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+        ps.find(PsTlab) == std::string::npos ||
+        ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+        ps.find("\"num_render_targets\":1") == std::string::npos)
+    {
+        error = "dynamic model lightplanes reflection does not match SKIN_0 vertex and additive fragment ABI";
+        return false;
+    }
+    return true;
+}
+
 bool isUnavailableXrfsTexture(const std::string& error)
 {
     return error.rfind("engine filesystem cannot open xrfs DDS: ", 0u) == 0u ||
@@ -575,6 +827,20 @@ std::string instanceIdentityKey(const std::string& geometry,
     return geometry + ":snapshot:" + std::to_string(snapshotIndex);
 }
 
+std::string objectMotionIdentityKey(const std::string& geometry,
+    const R4EngineWorldRenderable& renderable)
+{
+    if (renderable.objectId == 0xffffu)
+        return {};
+    // Include the model identity as well as geometry content. Object IDs can
+    // survive a model swap, and a zero/legacy content hash alone is not enough
+    // to prove that the new renderable has compatible motion history.
+    const std::string& assetName = renderable.assetName;
+    const std::uint64_t contentHash = renderable.asset ? renderable.asset->contentHash : 0u;
+    return geometry + ":model:" + assetName + ":content:" +
+        std::to_string(contentHash) + ":object:" + std::to_string(renderable.objectId);
+}
+
 bool uploadDds(IR4Resources& resources, const xray::metal::R4DdsTexture& dds,
     const char* label, std::shared_ptr<IR4Texture>& texture, std::string& error)
 {
@@ -595,6 +861,194 @@ bool uploadDds(IR4Resources& resources, const xray::metal::R4DdsTexture& dds,
     return true;
 }
 } // namespace
+
+namespace
+{
+bool validateSelflightLMSCReflection(const std::string& vs, const std::string& ps,
+    std::string& validationError)
+{
+    static constexpr const char* VsTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+    static constexpr const char* VsInputs =
+        "\"vertex_inputs\":[{\"columnCount\":4,\"elementType\":\"Float\",\"index\":0,\"name\":\"position0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":1,\"name\":\"normal0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":2,\"name\":\"tangent0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":3,\"name\":\"binormal0\"},{\"columnCount\":2,\"elementType\":\"Float\",\"index\":4,\"name\":\"texcoord0\"}]";
+    static constexpr const char* PsTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    if (vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+        vs.find("\"ResourceCount\":2") == std::string::npos ||
+        vs.find(VsTlab) == std::string::npos || vs.find(VsInputs) == std::string::npos)
+    {
+        validationError = "selflightl deffer_model_flat VS reflection does not match SKIN_0/TLAB48";
+        return false;
+    }
+    if (ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+        ps.find("\"ResourceCount\":3") == std::string::npos ||
+        ps.find(PsTlab) == std::string::npos ||
+        ps.find("\"num_render_targets\":1") == std::string::npos)
+    {
+        validationError = "selflightl accum_emissivel PS reflection does not match SRV/CBV/Sampler TLAB72 and one RT";
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+bool ValidateR4SelflightLMSCBundle(const std::filesystem::path& shaderDirectory,
+    std::string& error)
+{
+    const std::filesystem::path vertexPath = shaderDirectory / "deffer_model_flat.vs.metallib";
+    const std::filesystem::path fragmentPath = shaderDirectory / "accum_emissivel.ps.metallib";
+    std::filesystem::path vertexReflectionPath = vertexPath;
+    vertexReflectionPath.replace_extension(".reflection.json");
+    std::filesystem::path fragmentReflectionPath = fragmentPath;
+    fragmentReflectionPath.replace_extension(".reflection.json");
+    std::string vertexReflection;
+    std::string fragmentReflection;
+    if (!std::filesystem::is_regular_file(vertexPath) || !std::filesystem::is_regular_file(fragmentPath) ||
+        !readTextFile(vertexReflectionPath, vertexReflection) ||
+        !readTextFile(fragmentReflectionPath, fragmentReflection))
+    {
+        error = "selflightl MSC metallibs or *.reflection.json files are unavailable";
+        return false;
+    }
+    if (!validateSelflightLMSCReflection(vertexReflection, fragmentReflection, error))
+        return false;
+    return true;
+}
+
+bool ValidateR4SelflightLNoneMSCBundle(const std::filesystem::path& shaderDirectory,
+    std::string& error)
+{
+    static constexpr const char* VertexTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+    static constexpr const char* VertexInputs =
+        "\"vertex_inputs\":[{\"columnCount\":4,\"elementType\":\"Float\",\"index\":0,\"name\":\"position0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":1,\"name\":\"normal0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":2,\"name\":\"tangent0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":3,\"name\":\"binormal0\"},{\"columnCount\":2,\"elementType\":\"Float\",\"index\":4,\"name\":\"texcoord0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":5,\"name\":\"positiont0\"}]";
+    static constexpr const char* FragmentTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    const std::filesystem::path vertexPath = shaderDirectory / "deffer_model_flat.vs.metallib";
+    const std::filesystem::path fragmentPath = shaderDirectory / "accum_emissivel.ps.metallib";
+    std::filesystem::path vertexReflectionPath = vertexPath;
+    std::filesystem::path fragmentReflectionPath = fragmentPath;
+    vertexReflectionPath.replace_extension(".reflection.json");
+    fragmentReflectionPath.replace_extension(".reflection.json");
+    std::string vertexReflection;
+    std::string fragmentReflection;
+    if (!std::filesystem::is_regular_file(vertexPath) || !std::filesystem::is_regular_file(fragmentPath) ||
+        !readTextFile(vertexReflectionPath, vertexReflection) ||
+        !readTextFile(fragmentReflectionPath, fragmentReflection))
+    {
+        error = "selflightl SKIN_NONE MSC metallibs or *.reflection.json files are unavailable";
+        return false;
+    }
+    if (vertexReflection.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+        vertexReflection.find("\"ResourceCount\":2") == std::string::npos ||
+        vertexReflection.find(VertexTlab) == std::string::npos ||
+        vertexReflection.find(VertexInputs) == std::string::npos)
+    {
+        error = "selflightl deffer_model_flat SKIN_NONE VS reflection does not match its six-input/TLAB48 ABI";
+        return false;
+    }
+    if (fragmentReflection.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+        fragmentReflection.find("\"ResourceCount\":3") == std::string::npos ||
+        fragmentReflection.find(FragmentTlab) == std::string::npos ||
+        fragmentReflection.find("\"num_render_targets\":1") == std::string::npos)
+    {
+        error = "selflightl accum_emissivel PS reflection does not match SRV/CBV/Sampler TLAB72 and one RT";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateR4SelflightLSkin4MSCBundle(const std::filesystem::path& shaderDirectory,
+    std::string& error)
+{
+    static constexpr const char* VertexTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+    static constexpr const char* VertexInputs =
+        "\"vertex_inputs\":[{\"columnCount\":4,\"elementType\":\"Float\",\"index\":0,\"name\":\"position0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":1,\"name\":\"normal0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":2,\"name\":\"tangent0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":3,\"name\":\"binormal0\"},{\"columnCount\":2,\"elementType\":\"Float\",\"index\":4,\"name\":\"texcoord0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":5,\"name\":\"texcoord1\"}]";
+    static constexpr const char* FragmentTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    const std::filesystem::path vertexPath = shaderDirectory / "deffer_model_flat.vs.metallib";
+    const std::filesystem::path fragmentPath = shaderDirectory / "accum_emissivel.ps.metallib";
+    std::filesystem::path vertexReflectionPath = vertexPath;
+    std::filesystem::path fragmentReflectionPath = fragmentPath;
+    vertexReflectionPath.replace_extension(".reflection.json");
+    fragmentReflectionPath.replace_extension(".reflection.json");
+    std::string vertexReflection;
+    std::string fragmentReflection;
+    if (!std::filesystem::is_regular_file(vertexPath) || !std::filesystem::is_regular_file(fragmentPath) ||
+        !readTextFile(vertexReflectionPath, vertexReflection) ||
+        !readTextFile(fragmentReflectionPath, fragmentReflection))
+    {
+        error = "selflightl SKIN_4 MSC metallibs or *.reflection.json files are unavailable";
+        return false;
+    }
+    if (vertexReflection.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+        vertexReflection.find("\"ResourceCount\":2") == std::string::npos ||
+        vertexReflection.find(VertexTlab) == std::string::npos ||
+        vertexReflection.find(VertexInputs) == std::string::npos)
+    {
+        error = "selflightl deffer_model_flat SKIN_4 VS reflection does not match its six-input/TLAB48 ABI";
+        return false;
+    }
+    if (fragmentReflection.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+        fragmentReflection.find("\"ResourceCount\":3") == std::string::npos ||
+        fragmentReflection.find(FragmentTlab) == std::string::npos ||
+        fragmentReflection.find("\"num_render_targets\":1") == std::string::npos)
+    {
+        error = "selflightl accum_emissivel PS reflection does not match SRV/CBV/Sampler TLAB72 and one RT";
+        return false;
+    }
+    return true;
+}
+
+bool RunR4SelflightLMSCAdmissionSelfTest(const std::filesystem::path& shaderDirectory,
+    std::string& error)
+{
+    if (!std::filesystem::is_regular_file(shaderDirectory / "effects-msc-receipt.json"))
+    {
+        error = "selflightl admission self-test requires the receipted emissive bundle directory";
+        return false;
+    }
+    if (!ValidateR4SelflightLMSCBundle(shaderDirectory, error))
+    {
+        error = "selflightl positive receipt bundle admission failed: " + error;
+        return false;
+    }
+    const std::filesystem::path legacyFixture = std::filesystem::temp_directory_path() /
+        ("r4-selflightl-legacy-reflection-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code filesystemError;
+    if (!std::filesystem::create_directories(legacyFixture, filesystemError) || filesystemError)
+    {
+        error = "selflightl admission test could not create its temporary legacy-reflection fixture";
+        return false;
+    }
+    const auto cleanupFixture = [&]() {
+        std::error_code ignored;
+        std::filesystem::remove_all(legacyFixture, ignored);
+    };
+    for (const char* filename : {"deffer_model_flat.vs.metallib", "accum_emissivel.ps.metallib",
+             "deffer_model_flat.vs.json", "accum_emissivel.ps.json"})
+    {
+        std::ofstream fixtureFile(legacyFixture / filename, std::ios::binary);
+        if (!fixtureFile)
+        {
+            cleanupFixture();
+            error = "selflightl admission test could not create its legacy-named fixture file";
+            return false;
+        }
+    }
+    std::string negativeError;
+    const bool legacyNamesRejected = !ValidateR4SelflightLMSCBundle(legacyFixture, negativeError) &&
+        negativeError.find("*.reflection.json files are unavailable") != std::string::npos;
+    cleanupFixture();
+    if (!legacyNamesRejected)
+    {
+        error = "selflightl admission test did not reject legacy .json reflection names";
+        return false;
+    }
+    return true;
+}
 
 bool RepackR4DynamicWorldBumpVertices(const R4EngineWorldGeometry& source,
     std::vector<R4DynamicWorldBumpVertex>& vertices, std::string& error)
@@ -749,6 +1203,14 @@ bool repackR4DynamicWorldSkinned1WVertices(const R4EngineWorldGeometry& source,
         const Float3 skinnedNormal = normalized(transformDirection(transform, normal));
         const Float3 skinnedTangent = normalized(transformDirection(transform, tangent));
         const Float3 skinnedBinormal = normalized(transformDirection(transform, binormal));
+        float texcoord[2]{};
+        std::memcpy(texcoord, raw + 48u, sizeof(texcoord));
+        if (!std::isfinite(texcoord[0]) || !std::isfinite(texcoord[1]))
+        {
+            error = "dynamic SKIN_0 OGF TEXCOORD0 is non-finite at vertex " +
+                std::to_string(index);
+            return false;
+        }
         if ((sourceBounds && !include(*sourceBounds, position)) ||
             (skinnedBounds && !include(*skinnedBounds, skinnedPosition)))
         {
@@ -772,7 +1234,7 @@ bool repackR4DynamicWorldSkinned1WVertices(const R4EngineWorldGeometry& source,
         destination.binormal[0] = packNormal(skinnedBinormal.z);
         destination.binormal[1] = packNormal(skinnedBinormal.y);
         destination.binormal[2] = packNormal(skinnedBinormal.x);
-        std::memcpy(destination.texcoord, raw + 48u, sizeof(destination.texcoord));
+        std::memcpy(destination.texcoord, texcoord, sizeof(destination.texcoord));
     }
     return true;
 }
@@ -1004,6 +1466,46 @@ bool repackR4DynamicWorldSkinnedMultiWeightVertices(const R4EngineWorldGeometry&
     return true;
 }
 
+namespace
+{
+bool RepackR4DynamicWorldEmissiveNoneVertices(const R4EngineWorldGeometry& source,
+    const std::vector<R4DynamicWorldBumpVertex>& gbufferVertices,
+    std::vector<R4DynamicWorldEmissiveNoneVertex>& vertices, std::string& error)
+{
+    std::size_t normalOffset = 0u;
+    std::size_t uvOffset = 0u;
+    if (!rawOgfLayout(source, normalOffset, uvOffset, error) ||
+        gbufferVertices.size() != source.vertexCount)
+        return false;
+    vertices.assign(source.vertexCount, {});
+    for (std::uint32_t index = 0u; index < source.vertexCount; ++index)
+    {
+        const R4DynamicWorldBumpVertex& input = gbufferVertices[index];
+        R4DynamicWorldEmissiveNoneVertex& output = vertices[index];
+        std::memcpy(output.position, input.position, sizeof(output.position));
+        std::memcpy(output.normal, input.normal, sizeof(output.normal));
+        std::memcpy(output.tangent, input.tangent, sizeof(output.tangent));
+        std::memcpy(output.binormal, input.binormal, sizeof(output.binormal));
+        if (!readFloat2(*source.vertexBytes,
+                static_cast<std::size_t>(index) * source.vertexStride + uvOffset,
+                output.texcoord))
+        {
+            error = "selflightl SKIN_NONE raw FLOAT2 TEXCOORD0 is truncated";
+            vertices.clear();
+            return false;
+        }
+        if (!std::isfinite(output.texcoord[0]) || !std::isfinite(output.texcoord[1]))
+        {
+            error = "selflightl SKIN_NONE raw FLOAT2 TEXCOORD0 is non-finite";
+            vertices.clear();
+            return false;
+        }
+        std::memcpy(output.positionT, input.position, sizeof(output.positionT));
+    }
+    return true;
+}
+} // namespace
+
 bool RepackR4DynamicWorldSkinned1WVertices(const R4EngineWorldGeometry& source,
     const std::shared_ptr<const std::vector<std::array<float, 16>>>& boneTransforms,
     std::vector<R4DynamicWorldSkinnedVertex>& vertices, std::string& error)
@@ -1075,11 +1577,20 @@ struct MetalR4DynamicWorldAdapter::Impl
     struct CachedGeometry
     {
         std::shared_ptr<IR4Buffer> vertices;
+        std::shared_ptr<IR4Buffer> emissiveNoneVertices;
         std::shared_ptr<IR4Buffer> indices;
         std::shared_ptr<IR4Texture> baseTexture;
         std::shared_ptr<IR4Texture> bumpTexture;
         bool skinned = false;
         bool flat = false;
+        bool lightplane = false;
+        bool computeSkinAdmissionKnown = false;
+        xray::metal::R4ComputeSkinAdmission computeSkinAdmission =
+            xray::metal::R4ComputeSkinAdmission::Invalid;
+        std::uint32_t computeSkinInfluenceCount = 0u;
+        std::uint32_t maxReferencedBoneIndex = 0u;
+        std::vector<xray::metal::R4ComputeSkinVertex> computeSkinVertices;
+        std::shared_ptr<IR4Buffer> computeSkinInput;
     };
     struct CachedInstance
     {
@@ -1087,33 +1598,125 @@ struct MetalR4DynamicWorldAdapter::Impl
         std::shared_ptr<IR4Buffer> vertexGlobals;
         std::shared_ptr<IR4Buffer> transforms;
         std::shared_ptr<IR4Buffer> fragmentGlobals;
+        DynamicCpuVertexDiagnostic cpuVertexDiagnostic{};
+        std::array<float, 16> diagnosticWorldViewProjection{};
+        std::uint32_t diagnosticEngineFrame = UINT32_MAX;
+        std::uint64_t diagnosticPoseHash = 0u;
         std::uint64_t lastUsedGeneration = 0;
         std::uint64_t skinPoseHash = 0;
+        std::shared_ptr<IR4Buffer> skinPoseOutput;
+        std::uint64_t skinPoseWriteSerial = 0u;
         bool hasSkinPose = false;
+        std::uint64_t outputWriteSerial = 0u;
+        xray::metal::R4DynamicWorldPreparedState prepared;
     };
     std::shared_ptr<IR4GraphicsPipeline> staticPipeline;
     std::shared_ptr<IR4GraphicsPipeline> skinnedPipeline;
     std::shared_ptr<IR4GraphicsPipeline> flatStaticPipeline;
     std::shared_ptr<IR4GraphicsPipeline> flatSkinnedPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveStaticPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveSkinnedPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveAccumulatorStaticPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> emissiveAccumulatorSkinnedPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> modelLightplanePipeline;
     std::shared_ptr<IR4GraphicsPipeline> skinnedShadowPipeline;
     std::shared_ptr<IR4GraphicsPipeline> staticShadowPipeline;
-    static constexpr std::size_t kDynamicShadowBufferCapacity = 2048u * 256u;
-    std::array<std::shared_ptr<IR4Buffer>, kInstanceFrameSlots> shadowTransforms;
-    std::size_t dynamicShadowOffset = 0;
     std::shared_ptr<IR4Sampler> sampler;
     Options options;
     std::unordered_map<std::string, CachedGeometry> geometry;
     std::unordered_map<std::string, CachedInstance> instances;
     std::unordered_map<std::string, std::string> rejected;
     std::unordered_set<std::string> reportedSkinSkips;
+    std::unordered_set<std::string> reportedCpuDrawDiagnostics;
+    bool computeSkinOptIn = false;
+    bool computeSkinOracleOptIn = false;
+    bool computeSkinBackendDisabled = false;
+    bool computeSkinCpuRetry = false;
+    bool computeSkinFallbackLogged = false;
+    bool computeSkinFailureLogged = false;
+    bool computeSkinOracleInconclusiveLogged = false;
+    std::array<std::uint32_t, 5> computeSkinOracleSubmittedSamples{};
+    std::vector<std::uint32_t> computeSkinOraclePendingInfluenceCounts;
+    xray::metal::R4ComputeSkinFrameJournal<IR4Buffer, R4ComputeSkinJob> computeSkinJournal;
+    DynamicShadowFrameIndex shadowFrameIndex;
+    bool shadowIndexEnabled = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX") != nullptr;
+    bool shadowIndexOracle = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX_ORACLE") != nullptr;
+    std::uint64_t shadowIndexedViews = 0u;
+    std::uint64_t shadowFallbackViews = 0u;
+    std::uint64_t shadowBroadCandidates = 0u;
+    struct ObjectMotionHistory
+    {
+        std::array<float, 16> transform{};
+        std::uint32_t lastEngineFrame = 0;
+    };
+    std::unordered_map<std::string, ObjectMotionHistory> objectMotion;
+    std::unordered_map<std::string, ObjectMotionHistory> pendingObjectMotion;
+    std::uint32_t pendingMotionEngineFrame = 0;
+    bool pendingMotionFrame = false;
+    bool pendingMotionReset = false;
+    std::string e03CensusFlagPath;
+    bool e07ProfileInitialized = false;
+    bool e07ProfileEnabled = false;
+    bool e07FramesHeaderWritten = false;
+    bool e07ObjectsHeaderWritten = false;
+    std::uint64_t e07FramesWritten = 0;
+    std::ofstream e07Frames;
+    std::ofstream e07Objects;
+    std::vector<E07ObjectSample> e07ObjectSamples;
+    std::size_t e03CensusNextOrdinal = 0;
+    bool e03CensusStarted = false;
+    bool e03CensusFinished = false;
+    std::size_t forwardLightplanesThisFrame = 0;
+    bool legacySelflightMismatchLogged = false;
     std::uint32_t instanceFrame = UINT32_MAX;
     std::uint64_t instanceGeneration = 0;
+    xray::metal::R4DynamicWorldPrewarmState prewarm;
     std::size_t instanceSlot = 0;
     std::size_t instanceSlotCount = kInstanceFrameSlots;
+
+    void initializeE07Profile()
+    {
+        if (e07ProfileInitialized)
+            return;
+        e07ProfileInitialized = true;
+        const char* configuredPath = std::getenv("XRAY_METAL_E07_FRAMES");
+        if (!configuredPath || configuredPath[0] == '\0')
+            return;
+        const std::filesystem::path framesPath(configuredPath);
+        std::filesystem::path objectsPath(configuredPath);
+        objectsPath += ".objects.csv";
+        e07Frames.open(framesPath, std::ios::out | std::ios::app);
+        e07Objects.open(objectsPath, std::ios::out | std::ios::app);
+        e07ProfileEnabled = e07Frames.is_open() && e07Objects.is_open();
+        if (e07ProfileEnabled)
+        {
+            e07FramesHeaderWritten = e07Frames.tellp() > std::streampos(0);
+            e07ObjectsHeaderWritten = e07Objects.tellp() > std::streampos(0);
+        }
+        if (!e07ProfileEnabled)
+        {
+            e07Frames.close();
+            e07Objects.close();
+            std::fprintf(stderr, "METAL_E07_PROFILE enabled=false path=\"%s\" reason=\"cannot open CSV output\"\n",
+                configuredPath);
+        }
+    }
+
+    void closeE07Profile()
+    {
+        if (e07Frames.is_open())
+            e07Frames.close();
+        if (e07Objects.is_open())
+            e07Objects.close();
+    }
 };
 
 MetalR4DynamicWorldAdapter::MetalR4DynamicWorldAdapter() = default;
-MetalR4DynamicWorldAdapter::~MetalR4DynamicWorldAdapter() = default;
+MetalR4DynamicWorldAdapter::~MetalR4DynamicWorldAdapter()
+{
+    if (m_impl)
+        m_impl->closeE07Profile();
+}
 
 bool MetalR4DynamicWorldAdapter::Configure(IR4Backend& backend, const Options& options, std::string& status)
 {
@@ -1121,6 +1724,12 @@ bool MetalR4DynamicWorldAdapter::Configure(IR4Backend& backend, const Options& o
     m_status.clear();
     m_impl = std::make_unique<Impl>();
     m_impl->options = options;
+    if (const char* computeFlag = std::getenv("XRAY_METAL_COMPUTE_SKIN"))
+        m_impl->computeSkinOptIn = std::strcmp(computeFlag, "1") == 0;
+    if (const char* oracleFlag = std::getenv("XRAY_METAL_COMPUTE_SKIN_ORACLE"))
+        m_impl->computeSkinOracleOptIn = std::strcmp(oracleFlag, "1") == 0;
+    if (const char* censusFlagPath = std::getenv("XRAY_METAL_E03_CENSUS_FLAG_PATH"))
+        m_impl->e03CensusFlagPath = censusFlagPath;
     if (options.vertexMetallibPath.empty() && options.fragmentMetallibPath.empty())
     {
         m_status = "dynamic OGF MSC bundle is not configured";
@@ -1250,6 +1859,166 @@ bool MetalR4DynamicWorldAdapter::Configure(IR4Backend& backend, const Options& o
             std::fprintf(stderr, "METAL_DYNAMIC_OGF_FLAT_SKIP phase=skinned-configure reason=\"%s\"\n",
                 modelFlatError.c_str());
     }
+    if (!options.emissiveShaderDirectory.empty())
+    {
+        std::string emissiveError;
+        if (ValidateR4SelflightLMSCBundle(options.emissiveShaderDirectory, emissiveError))
+        {
+            const std::filesystem::path emissiveVertex =
+                options.emissiveShaderDirectory / "deffer_model_flat.vs.metallib";
+            const std::filesystem::path emissiveFragment =
+                options.emissiveShaderDirectory / "accum_emissivel.ps.metallib";
+            R4GraphicsPipelineDesc emissivePipeline;
+            emissivePipeline.label = "R4 dynamic models_selflightl accum_emissivel SKIN_0";
+            emissivePipeline.shaderKey = "r4-dynamic-selflightl-accum-emissivel-skin0-v1";
+            const std::string emissiveVertexPath = emissiveVertex.string();
+            const std::string emissiveFragmentPath = emissiveFragment.string();
+            emissivePipeline.vertexMetallibPath = emissiveVertexPath.c_str();
+            emissivePipeline.fragmentMetallibPath = emissiveFragmentPath.c_str();
+            emissivePipeline.vertexAttributes = {
+                {11, 6, offsetof(R4DynamicWorldSkinnedVertex, position), R4VertexFormat::Float4},
+                {12, 6, offsetof(R4DynamicWorldSkinnedVertex, normal), R4VertexFormat::UChar4Normalized},
+                {13, 6, offsetof(R4DynamicWorldSkinnedVertex, tangent), R4VertexFormat::UChar4Normalized},
+                {14, 6, offsetof(R4DynamicWorldSkinnedVertex, binormal), R4VertexFormat::UChar4Normalized},
+                {15, 6, offsetof(R4DynamicWorldSkinnedVertex, texcoord), R4VertexFormat::Float2},
+            };
+            emissivePipeline.vertexLayouts = {{6, sizeof(R4DynamicWorldSkinnedVertex)}};
+            emissivePipeline.colorFormats = {R4PixelFormat::BGRA8Unorm};
+            emissivePipeline.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+            emissivePipeline.depthCompare = R4CompareFunction::LessEqual;
+            emissivePipeline.depthWrite = false;
+            emissivePipeline.cullMode = R4CullMode::Back;
+            emissivePipeline.frontFace = R4Winding::Clockwise;
+            emissivePipeline.stencil.enabled = true;
+            emissivePipeline.stencil.frontFace.compare = R4CompareFunction::Always;
+            emissivePipeline.stencil.frontFace.readMask = 0xffu;
+            emissivePipeline.stencil.frontFace.writeMask = 0xffu;
+            emissivePipeline.stencil.frontFace.depthStencilPass = R4StencilOperation::Replace;
+            emissivePipeline.stencil.backFace = emissivePipeline.stencil.frontFace;
+            m_impl->emissiveSkinnedPipeline = backend.CreateGraphicsPipeline(
+                emissivePipeline, emissiveError);
+            if (m_impl->emissiveSkinnedPipeline)
+                std::fprintf(stderr,
+                    "METAL_EMISSIVE_SKIN0_PREPARED enabled=true bundle=\"%s\" VS=deffer_model_flat.vs PS=accum_emissivel.ps\n",
+                    options.emissiveShaderDirectory.generic_string().c_str());
+            else
+                std::fprintf(stderr, "METAL_EMISSIVE_SKIN0_PREPARED enabled=false reason=\"%s\"\n",
+                    emissiveError.c_str());
+            R4GraphicsPipelineDesc accumulatorPipeline = emissivePipeline;
+            accumulatorPipeline.label = "R4 dynamic selflightl first accumulator contribution";
+            accumulatorPipeline.shaderKey = "r4-dynamic-selflightl-accum-emissivel-rgba16f-v1";
+            accumulatorPipeline.colorFormats = {R4PixelFormat::RGBA16Float};
+            std::string accumulatorError;
+            m_impl->emissiveAccumulatorSkinnedPipeline = backend.CreateGraphicsPipeline(
+                accumulatorPipeline, accumulatorError);
+            if (!m_impl->emissiveAccumulatorSkinnedPipeline)
+                std::fprintf(stderr,
+                    "METAL_EMISSIVE_ACCUMULATOR_PREPARED enabled=false reason=\"%s\"\n",
+                    accumulatorError.c_str());
+            else
+                std::fprintf(stderr,
+                    "METAL_EMISSIVE_ACCUMULATOR_PREPARED enabled=true format=RGBA16Float blend=disabled\n");
+        }
+        else
+            std::fprintf(stderr, "METAL_EMISSIVE_SKIN0_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.c_str());
+    }
+    if (!options.emissiveNoneShaderDirectory.empty())
+    {
+        std::string emissiveError;
+        if (ValidateR4SelflightLNoneMSCBundle(options.emissiveNoneShaderDirectory, emissiveError))
+        {
+            const std::filesystem::path vertexPath =
+                options.emissiveNoneShaderDirectory / "deffer_model_flat.vs.metallib";
+            const std::filesystem::path fragmentPath =
+                options.emissiveNoneShaderDirectory / "accum_emissivel.ps.metallib";
+            const std::string vertexMetallib = vertexPath.string();
+            const std::string fragmentMetallib = fragmentPath.string();
+            R4GraphicsPipelineDesc emissive;
+            emissive.label = "R4 dynamic models_selflightl accum_emissivel SKIN_NONE bloom";
+            emissive.shaderKey = "r4-dynamic-selflightl-accum-emissivel-none-floatuv-bgra8-v2";
+            emissive.vertexMetallibPath = vertexMetallib.c_str();
+            emissive.fragmentMetallibPath = fragmentMetallib.c_str();
+            emissive.vertexAttributes = {
+                {11, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, position), R4VertexFormat::Float4},
+                {12, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, normal), R4VertexFormat::Float4},
+                {13, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, tangent), R4VertexFormat::Float4},
+                {14, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, binormal), R4VertexFormat::Float4},
+                {15, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, texcoord), R4VertexFormat::Float2},
+                {16, 6, offsetof(R4DynamicWorldEmissiveNoneVertex, positionT), R4VertexFormat::Float4},
+            };
+            emissive.vertexLayouts = {{6, sizeof(R4DynamicWorldEmissiveNoneVertex)}};
+            emissive.colorFormats = {R4PixelFormat::BGRA8Unorm};
+            emissive.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+            emissive.depthCompare = R4CompareFunction::LessEqual;
+            emissive.depthWrite = false;
+            emissive.cullMode = R4CullMode::Back;
+            emissive.frontFace = R4Winding::Clockwise;
+            emissive.stencil.enabled = true;
+            emissive.stencil.frontFace.compare = R4CompareFunction::Always;
+            emissive.stencil.frontFace.readMask = 0xffu;
+            emissive.stencil.frontFace.writeMask = 0xffu;
+            emissive.stencil.frontFace.depthStencilPass = R4StencilOperation::Replace;
+            emissive.stencil.backFace = emissive.stencil.frontFace;
+            m_impl->emissiveStaticPipeline = backend.CreateGraphicsPipeline(emissive, emissiveError);
+            if (m_impl->emissiveStaticPipeline)
+            {
+                R4GraphicsPipelineDesc accumulator = emissive;
+                accumulator.label = "R4 dynamic selflightl first accumulator SKIN_NONE";
+                accumulator.shaderKey = "r4-dynamic-selflightl-accum-emissivel-none-floatuv-rgba16f-v2";
+                accumulator.colorFormats = {R4PixelFormat::RGBA16Float};
+                m_impl->emissiveAccumulatorStaticPipeline = backend.CreateGraphicsPipeline(
+                    accumulator, emissiveError);
+            }
+            if (!m_impl->emissiveStaticPipeline || !m_impl->emissiveAccumulatorStaticPipeline)
+                std::fprintf(stderr, "METAL_EMISSIVE_NONE_PREPARED enabled=false reason=\"%s\"\n",
+                    emissiveError.empty() ? "SKIN_NONE emissive PSO unavailable" : emissiveError.c_str());
+            else
+                std::fprintf(stderr,
+                    "METAL_EMISSIVE_NONE_PREPARED enabled=true bloom=BGRA8 accumulator=RGBA16Float\n");
+        }
+        else
+            std::fprintf(stderr, "METAL_EMISSIVE_NONE_PREPARED enabled=false reason=\"%s\"\n",
+                emissiveError.c_str());
+    }
+    const std::filesystem::path lightplaneDirectory = options.vertexMetallibPath.parent_path();
+    const std::filesystem::path lightplaneVs = lightplaneDirectory / "model_def_lplanes.vs.metallib";
+    const std::filesystem::path lightplanePs = lightplaneDirectory / "base_lplanes.ps.metallib";
+    std::string lightplaneError;
+    if (validateModelLightplaneBundle(lightplaneVs, lightplanePs, lightplaneError))
+    {
+        R4GraphicsPipelineDesc lightplanePipeline;
+        lightplanePipeline.label = "R4 dynamic models lightplanes SKIN_0 MSC forward";
+        lightplanePipeline.shaderKey = "r4-dynamic-model-lightplanes-skin-0-msc-v1";
+        const std::string vsPath = lightplaneVs.string();
+        const std::string psPath = lightplanePs.string();
+        lightplanePipeline.vertexMetallibPath = vsPath.c_str();
+        lightplanePipeline.fragmentMetallibPath = psPath.c_str();
+        lightplanePipeline.vertexAttributes = {
+            {11, 6, offsetof(R4DynamicWorldSkinnedVertex, position), R4VertexFormat::Float4},
+            {12, 6, offsetof(R4DynamicWorldSkinnedVertex, normal), R4VertexFormat::UChar4Normalized},
+            {13, 6, offsetof(R4DynamicWorldSkinnedVertex, tangent), R4VertexFormat::UChar4Normalized},
+            {14, 6, offsetof(R4DynamicWorldSkinnedVertex, binormal), R4VertexFormat::UChar4Normalized},
+            {15, 6, offsetof(R4DynamicWorldSkinnedVertex, texcoord), R4VertexFormat::Float2},
+        };
+        lightplanePipeline.vertexLayouts = {{6, sizeof(R4DynamicWorldSkinnedVertex)}};
+        lightplanePipeline.colorFormats = {R4PixelFormat::RGBA8Unorm};
+        lightplanePipeline.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+        lightplanePipeline.depthCompare = R4CompareFunction::LessEqual;
+        lightplanePipeline.depthWrite = false;
+        lightplanePipeline.cullMode = R4CullMode::Back;
+        lightplanePipeline.frontFace = R4Winding::Clockwise;
+        lightplanePipeline.blend.enabled = true;
+        lightplanePipeline.blend.sourceRgb = lightplanePipeline.blend.sourceAlpha =
+            R4BlendFactor::SourceAlpha;
+        lightplanePipeline.blend.destinationRgb = lightplanePipeline.blend.destinationAlpha =
+            R4BlendFactor::One;
+        m_impl->modelLightplanePipeline = backend.CreateGraphicsPipeline(
+            lightplanePipeline, lightplaneError);
+    }
+    if (!m_impl->modelLightplanePipeline)
+        std::fprintf(stderr, "METAL_DYNAMIC_LIGHTPLANE_UNAVAILABLE reason=\"%s\"\n",
+            lightplaneError.c_str());
     R4SamplerDesc sampler;
     sampler.label = "R4 dynamic OGF base/bump sampler";
     sampler.maxAnisotropy = 8;
@@ -1308,12 +2077,6 @@ bool MetalR4DynamicWorldAdapter::Configure(IR4Backend& backend, const Options& o
         if (!m_impl->staticShadowPipeline)
             std::fprintf(stderr, "METAL_DYNAMIC_OGF_SHADOW_SKIP phase=static-pipeline reason=\"%s\"\n", shadowError.c_str());
 
-        for (std::size_t slot = 0; slot < kInstanceFrameSlots; ++slot)
-        {
-            R4BufferDesc shadowDesc{Impl::kDynamicShadowBufferCapacity, R4ResourceStorage::Shared,
-                R4BufferUsage::Uniform, "R4 dynamic OGF shadow caster transforms"};
-            m_impl->shadowTransforms[slot] = backend.Resources().CreateBuffer(shadowDesc, nullptr, 0u, shadowError);
-        }
     }
     m_enabled = true;
     m_status = m_impl->skinnedPipeline ?
@@ -1327,25 +2090,43 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
     const R4DynamicWorldViewState& view,
     const std::shared_ptr<const R4EngineWorldSnapshot>& world, std::string& error)
 {
+    if (m_impl)
+    {
+        // Readiness belongs to this invocation, not an engine-frame number.
+        // Repeated simulation frames and drawable retries must invalidate it.
+        // No stale prepared snapshot may survive an early or failed Prewarm.
+        m_impl->shadowFrameIndex.Invalidate();
+        m_impl->initializeE07Profile();
+        m_impl->e07ObjectSamples.clear();
+        DiscardUnsubmittedFrame();
+        if (m_impl->prewarm.Begin())
+            for (auto& instance : m_impl->instances) instance.second.prepared = {};
+        m_impl->computeSkinJournal.Begin(m_impl->prewarm.epoch);
+    }
     if (!m_enabled || !view.valid || !world)
         return true;
     if (m_impl->instanceFrame != world->engineFrame)
     {
         m_impl->instanceFrame = world->engineFrame;
         ++m_impl->instanceGeneration;
-        // One generation slot per backend frame context (at least three). A
-        // slot is rewritten only after that many subsequent submitted frames;
-        // BeginFrame waits for the old context, while retainedResources keeps
-        // each prior binding alive through command-buffer completion.
-        m_impl->instanceSlotCount = std::max<std::size_t>(
-            kInstanceFrameSlots, static_cast<std::size_t>(backend.FrameContextCount()));
-        m_impl->instanceSlot = static_cast<std::size_t>(
-            backend.ActiveFrameContextIndex() % m_impl->instanceSlotCount);
-        m_impl->dynamicShadowOffset = 0;
     }
+    // Simulation frames may repeat while drawable submissions advance. Only
+    // the acquired backend context determines which GPU-owned slot is safe to
+    // rewrite; shadow ranges start fresh for each encoded scene frame.
+    if (backend.FrameContextCount() > kInstanceFrameSlots ||
+        backend.ActiveFrameContextIndex() >= kInstanceFrameSlots)
+    {
+        error = "dynamic OGF backend frame slot exceeds prepared resources";
+        return false;
+    }
+    m_impl->instanceSlotCount = kInstanceFrameSlots;
+    m_impl->instanceSlot = backend.ActiveFrameContextIndex();
+    m_impl->forwardLightplanesThisFrame = 0;
     m_telemetry = {};
     m_telemetry.engineFrame = world->engineFrame;
     m_telemetry.renderables = world->renderables.size();
+    m_impl->pendingMotionReset = view.cameraCut || !view.previousValid;
+    m_impl->pendingMotionEngineFrame = view.engineFrame;
     if (m_impl->instanceGeneration > kInstanceRetentionGenerations)
     {
         for (auto instance = m_impl->instances.begin(); instance != m_impl->instances.end();)
@@ -1362,18 +2143,76 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
     }
     IR4Resources& resources = backend.Resources();
     const std::array<float, 16> viewProjection = multiplyMatrix(view.projection, view.view);
+    std::string computeSkinOracleCandidateKey;
     for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
     {
         const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
+        if (m_impl->e07ProfileEnabled)
+        {
+            E07ObjectSample sample;
+            sample.objectId = renderable.objectId;
+            sample.frame = world->engineFrame;
+            sample.viewFrustumVisible = !isOutsideDynamicMetalFrustum(
+                renderable.bounds, renderable.transform, viewProjection, view.valid);
+            sample.bonesKnown = bool(renderable.boneTransforms);
+            sample.bones = sample.bonesKnown ? renderable.boneTransforms->size() : 0u;
+            sample.assetGeometryCount = renderable.asset ? renderable.asset->geometry.size() : 0u;
+            m_impl->e07ObjectSamples.push_back(sample);
+        }
         if (hasPositiveHotness(renderable.hotness))
             ++m_telemetry.hotRenderables;
         if (!renderable.asset || renderable.asset->hasUnresolvedGeometryLinks)
             continue;
+        std::uint64_t renderablePoseHash = 0u;
+        bool renderablePoseHashReady = false;
+        bool computePoseValidationAttempted = false;
+        bool computePoseValid = false;
+        bool computeBoneSliceAttempted = false;
+        bool computeBoneSliceReady = false;
+        R4FrameBufferSlice computeBoneSlice;
+        const auto ensureComputePose = [&]() {
+            if (computePoseValidationAttempted) return computePoseValid;
+            computePoseValidationAttempted = true;
+            if (!renderable.boneTransforms || renderable.boneTransforms->empty() ||
+                renderable.boneTransforms->size() > UINT32_MAX ||
+                renderable.boneTransforms->size() > std::numeric_limits<std::size_t>::max() /
+                    sizeof(std::array<float, 16>))
+                return false;
+            computePoseValid = true;
+            for (const auto& bone : *renderable.boneTransforms)
+                for (const float value : bone)
+                    computePoseValid = computePoseValid && std::isfinite(value);
+            return computePoseValid;
+        };
+        const auto ensureComputeBoneSlice = [&]() {
+            if (computeBoneSliceAttempted) return computeBoneSliceReady;
+            computeBoneSliceAttempted = true;
+            if (!ensureComputePose()) return false;
+            const std::size_t bytes = renderable.boneTransforms->size() * sizeof(std::array<float, 16>);
+            std::string uploadError;
+            computeBoneSliceReady = backend.UploadFrameData(renderable.boneTransforms->data(),
+                bytes, 256u, computeBoneSlice, uploadError);
+            if (!computeBoneSliceReady && !uploadError.empty() && !m_impl->computeSkinFallbackLogged)
+            {
+                std::fprintf(stderr, "METAL_COMPUTE_SKIN_FALLBACK reason=bone-upload error=\"%s\"\n",
+                    uploadError.c_str());
+                m_impl->computeSkinFallbackLogged = true;
+            }
+            return computeBoneSliceReady;
+        };
         for (std::size_t index = 0; index < renderable.asset->geometry.size(); ++index)
         {
             const R4EngineWorldGeometry& source = renderable.asset->geometry[index];
+            const bool lightplane = isModelLightplane(source);
             const SkinnedFormat skinFormat = classifySkinnedFormat(source);
             const bool skinned = skinFormat != SkinnedFormat::NotSkinned;
+            if (lightplane && (!skinned || !m_impl->modelLightplanePipeline))
+            {
+                error = !skinned ?
+                    "models\\lightplanes requires the CPU-skinned SKIN_0 vertex contract" :
+                    "models\\lightplanes requires its validated forward MSC pipeline";
+                return false;
+            }
             if (skinned)
             {
                 ++m_telemetry.skinnedCandidates;
@@ -1383,8 +2222,11 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
             }
             else
                 ++m_telemetry.nonSkinnedCandidates;
-            if (!skinned && isOutsideDynamicMetalFrustum(renderable.bounds,
-                    renderable.transform, viewProjection, view.valid))
+            const bool mainViewVisible = !isOutsideDynamicMetalFrustum(renderable.bounds,
+                    renderable.transform, viewProjection, view.valid);
+            const DynamicWorldPrewarmDisposition prewarmDisposition =
+                dynamicWorldPrewarmDisposition(mainViewVisible, renderable.castsShadow, skinned);
+            if (prewarmDisposition == DynamicWorldPrewarmDisposition::Skip)
             {
                 ++m_telemetry.frustumRejected;
                 continue;
@@ -1400,6 +2242,7 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                 xray::metal::R4DdsTexture bump;
                 Impl::CachedGeometry cached;
                 cached.skinned = skinned;
+                cached.lightplane = lightplane;
                 bool flat = false;
                 std::vector<R4DynamicWorldBumpVertex> repacked;
                 const bool unsupportedSkinnedFormat = skinned && !supportedSkinnedFormat(skinFormat);
@@ -1424,7 +2267,12 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                         source.shaderName.c_str(), basePath.generic_string().c_str(), localError.c_str());
                     continue;
                 }
-                if (!xray::metal::LoadR4DdsTexture(bumpPath, m_impl->options.ddsBytesProvider, bump, localError))
+                if (lightplane)
+                {
+                    flat = true;
+                    cached.flat = true;
+                }
+                else if (!xray::metal::LoadR4DdsTexture(bumpPath, m_impl->options.ddsBytesProvider, bump, localError))
                 {
                     const bool flatPipelineAvailable = skinned ? bool(m_impl->flatSkinnedPipeline) :
                         bool(m_impl->flatStaticPipeline);
@@ -1463,6 +2311,30 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                     if (cached.vertices &&
                         !resources.UpdateBuffer(cached.vertices, 0, repacked.data(), vertexDesc.size, localError))
                         cached.vertices.reset();
+                    if ((m_impl->emissiveAccumulatorStaticPipeline || m_impl->emissiveStaticPipeline) &&
+                        isModelsSelflightL(source.shaderName))
+                    {
+                        std::vector<R4DynamicWorldEmissiveNoneVertex> emissiveVertices;
+                        std::string emissiveError;
+                        if (RepackR4DynamicWorldEmissiveNoneVertices(source, repacked,
+                                emissiveVertices, emissiveError))
+                        {
+                            const std::size_t byteCount = emissiveVertices.size() *
+                                sizeof(R4DynamicWorldEmissiveNoneVertex);
+                            R4BufferDesc emissiveDesc{byteCount, R4ResourceStorage::Private,
+                                R4BufferUsage::Vertex, "R4 selflightl SKIN_NONE Float2 UV vertices"};
+                            cached.emissiveNoneVertices = resources.CreateBuffer(
+                                emissiveDesc, nullptr, 0u, emissiveError);
+                            if (cached.emissiveNoneVertices && !resources.UpdateBuffer(
+                                    cached.emissiveNoneVertices, 0u, emissiveVertices.data(),
+                                    byteCount, emissiveError))
+                                cached.emissiveNoneVertices.reset();
+                        }
+                        if (!cached.emissiveNoneVertices)
+                            std::fprintf(stderr,
+                                "METAL_EMISSIVE_NONE_VERTEX_PREPARED enabled=false key=%s reason=\"%s\"\n",
+                                key.c_str(), emissiveError.c_str());
+                    }
                 }
                 if ((!skinned && !cached.vertices) || !cached.indices ||
                     !resources.UpdateBuffer(cached.indices, 0, source.indexData->data(), indexDesc.size, localError) ||
@@ -1481,6 +2353,13 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
             const auto geometry = m_impl->geometry.find(key);
             if (geometry == m_impl->geometry.end())
                 continue;
+            if (prewarmDisposition == DynamicWorldPrewarmDisposition::ShadowGeometryOnly)
+            {
+                ++m_telemetry.frustumRejected;
+                continue;
+            }
+            if (geometry->second.lightplane)
+                ++m_impl->forwardLightplanesThisFrame;
             if (geometry->second.skinned != skinned)
             {
                 std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s reason=\"cached skin classification mismatch\"\n",
@@ -1492,10 +2371,76 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
             const std::array<float, 16> vp = multiplyMatrix(view.projection, view.view);
             const std::array<float, 16> wvp = multiplyMatrix(vp, renderable.transform);
             const std::array<float, 16> wv = multiplyMatrix(view.view, renderable.transform);
+            if (skinned && !renderablePoseHashReady)
+            {
+                renderablePoseHash = hashBonePose(renderable.boneTransforms);
+                renderablePoseHashReady = true;
+            }
+            const std::uint64_t diagnosticPoseHash = skinned ? renderablePoseHash : 0u;
+            DynamicCpuVertexDiagnostic cpuVertexDiagnostic;
+            const bool collectCpuVertexDiagnostic = dynamicDrawDiagnosticsEnabled();
+            bool cpuVertexDiagnosticAvailable = false;
+            if (collectCpuVertexDiagnostic)
+            {
+                std::string diagnosticError;
+                if (skinned)
+                {
+                    std::vector<R4DynamicWorldSkinnedVertex> repackedForDiagnostic;
+                    bool diagnosticRepacked = false;
+                    {
+                        E07ScopedTimer timer(m_telemetry.e07SkinMs, m_impl->e07ProfileEnabled);
+                        diagnosticRepacked = repackR4DynamicWorldSkinnedVertices(source,
+                            renderable.boneTransforms, repackedForDiagnostic, diagnosticError, nullptr, nullptr);
+                    }
+                    if (diagnosticRepacked)
+                    {
+                        if (m_impl->e07ProfileEnabled)
+                            m_telemetry.e07SkinnedVerticesComputed += repackedForDiagnostic.size();
+                        cpuVertexDiagnostic = diagnoseDynamicCpuVertices(repackedForDiagnostic, wvp);
+                        cpuVertexDiagnosticAvailable = true;
+                    }
+                }
+                else
+                {
+                    std::vector<R4DynamicWorldBumpVertex> repackedForDiagnostic;
+                    if (RepackR4DynamicWorldBumpVertices(source, repackedForDiagnostic, diagnosticError))
+                    {
+                        cpuVertexDiagnostic = diagnoseDynamicCpuVertices(repackedForDiagnostic, wvp);
+                        cpuVertexDiagnosticAvailable = true;
+                    }
+                }
+                if (!cpuVertexDiagnosticAvailable)
+                    std::fprintf(stderr,
+                        "METAL_DYNAMIC_CPU_VERTEX_DIAGNOSTIC frame=%u object=%u asset=\"%s\" geometry=%zu available=false reason=\"%s\"\n",
+                        world->engineFrame, renderable.objectId, renderable.assetName.c_str(), index,
+                        diagnosticError.empty() ? "repacked vertex stream unavailable" : diagnosticError.c_str());
+            }
+            std::array<float, 16> vp_prev = vp;
+            std::array<float, 16> wvp_prev = wvp;
+            if (view.previousValid && !view.cameraCut)
+            {
+                vp_prev = multiplyMatrix(view.previousProjection, view.previousView);
+                const std::string identity = objectMotionIdentityKey(key, renderable);
+                const auto motionIt = identity.empty() ? m_impl->objectMotion.end() :
+                    m_impl->objectMotion.find(identity);
+                if (motionIt != m_impl->objectMotion.end() &&
+                    motionIt->second.lastEngineFrame == view.previousFrame)
+                {
+                    wvp_prev = multiplyMatrix(vp_prev, motionIt->second.transform);
+                }
+                else
+                {
+                    wvp_prev = multiplyMatrix(vp_prev, renderable.transform);
+                }
+            }
+            const std::string motionIdentity = objectMotionIdentityKey(key, renderable);
+            if (!motionIdentity.empty())
+                m_impl->pendingObjectMotion[motionIdentity] =
+                    { renderable.transform, view.engineFrame };
             std::array<std::uint8_t, kVertexGlobalsSize> vsGlobals{};
             std::array<std::uint8_t, kTransformsSize> transforms{};
-            std::memcpy(vsGlobals.data(), wvp.data(), sizeof(wvp));
-            std::memcpy(vsGlobals.data() + 64, vp.data(), sizeof(vp));
+            std::memcpy(vsGlobals.data(), wvp_prev.data(), sizeof(wvp_prev));
+            std::memcpy(vsGlobals.data() + 64, vp_prev.data(), sizeof(vp_prev));
             std::memcpy(transforms.data(), wvp.data(), sizeof(wvp));
             std::memcpy(transforms.data() + 64, wv.data(), sizeof(wv));
             std::memcpy(transforms.data() + 128, renderable.transform.data(), sizeof(renderable.transform));
@@ -1530,6 +2475,9 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                             key.c_str(), renderableIndex);
                         continue;
                     }
+                    m_impl->computeSkinJournal.Cancel(oldest->first);
+                    if (computeSkinOracleCandidateKey == oldest->first)
+                        computeSkinOracleCandidateKey.clear();
                     m_impl->instances.erase(oldest);
                     ++m_telemetry.instanceCachePruned;
                 }
@@ -1540,17 +2488,195 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
             if (skinned)
             {
                 std::string localError;
-                const std::uint64_t poseHash = hashBonePose(renderable.boneTransforms);
+                const std::uint64_t poseHash = diagnosticPoseHash;
                 const bool canReuseSkinnedVertices = existing != m_impl->instances.end() &&
-                    existing->second.skinnedVertices && existing->second.hasSkinPose &&
-                    existing->second.skinPoseHash == poseHash;
-                if (!canReuseSkinnedVertices)
+                    xray::metal::R4ComputeSkinPoseMatches(existing->second.hasSkinPose,
+                        existing->second.skinPoseHash, existing->second.skinPoseOutput,
+                        existing->second.skinPoseWriteSerial, poseHash,
+                        existing->second.skinnedVertices, existing->second.outputWriteSerial);
+                bool queuedGpuSkin = false;
+                if (!canReuseSkinnedVertices &&
+                    xray::metal::R4ComputeSkinShouldDispatch(m_impl->computeSkinOptIn,
+                        m_impl->computeSkinBackendDisabled, m_impl->computeSkinCpuRetry))
                 {
+                    std::string localComputeError;
+                    Impl::CachedGeometry& cached = geometry->second;
+                    if (!cached.computeSkinAdmissionKnown)
+                    {
+                        std::string admissionError;
+                        cached.computeSkinAdmission = xray::metal::PrepareR4ComputeSkinVertices(
+                            source, std::numeric_limits<std::size_t>::max(),
+                            cached.computeSkinVertices, cached.computeSkinInfluenceCount, admissionError);
+                        cached.computeSkinAdmissionKnown = true;
+                        if (cached.computeSkinAdmission == xray::metal::R4ComputeSkinAdmission::Ready)
+                        {
+                            for (const auto& vertex : cached.computeSkinVertices)
+                                for (std::uint32_t i = 0; i < cached.computeSkinInfluenceCount; ++i)
+                                    cached.maxReferencedBoneIndex = std::max(
+                                        cached.maxReferencedBoneIndex, vertex.bones[i]);
+                        }
+                        else
+                        {
+                            cached.computeSkinVertices.clear();
+                            if (!admissionError.empty() && !m_impl->computeSkinFallbackLogged)
+                            {
+                                std::fprintf(stderr,
+                                    "METAL_COMPUTE_SKIN_FALLBACK key=%s reason=\"%s\"\n",
+                                    key.c_str(), admissionError.c_str());
+                                m_impl->computeSkinFallbackLogged = true;
+                            }
+                        }
+                    }
+                    if (cached.computeSkinAdmission == xray::metal::R4ComputeSkinAdmission::Ready &&
+                        renderable.boneTransforms &&
+                        cached.maxReferencedBoneIndex < renderable.boneTransforms->size() &&
+                        renderable.boneTransforms->size() <= UINT32_MAX &&
+                        ensureComputePose())
+                    {
+                        const std::size_t canonicalBytes = cached.computeSkinVertices.size() *
+                            sizeof(xray::metal::R4ComputeSkinVertex);
+                        if (!cached.computeSkinInput && canonicalBytes != 0u)
+                        {
+                            R4BufferDesc inputDesc{canonicalBytes, R4ResourceStorage::Private,
+                                R4BufferUsage::Generic, "R4 immutable canonical compute-skin input"};
+                            cached.computeSkinInput = resources.CreateBuffer(inputDesc,
+                                cached.computeSkinVertices.data(), canonicalBytes, localComputeError);
+                        }
+                        xray::metal::R4ComputeSkinBounds bounds;
+                        const bool boundsReady = cached.computeSkinInput &&
+                            xray::metal::CheckR4ComputeSkinBounds(cached.computeSkinVertices,
+                                cached.computeSkinInfluenceCount, *renderable.boneTransforms,
+                                renderable.transform, renderable.bounds[3], bounds, localComputeError) ==
+                                    xray::metal::R4ComputeSkinAdmission::Ready;
+                        if (boundsReady && ensureComputeBoneSlice() &&
+                            cached.computeSkinVertices.size() <= UINT32_MAX &&
+                            cached.computeSkinVertices.size() <=
+                                std::numeric_limits<std::size_t>::max() / sizeof(R4DynamicWorldSkinnedVertex))
+                        {
+                            const std::size_t outputBytes = cached.computeSkinVertices.size() *
+                                sizeof(R4DynamicWorldSkinnedVertex);
+                            bool insertedForCompute = false;
+                            if (existing == m_impl->instances.end())
+                            {
+                                existing = m_impl->instances.emplace(instanceKey,
+                                    Impl::CachedInstance{}).first;
+                                insertedForCompute = true;
+                            }
+                            Impl::CachedInstance& instance = existing->second;
+                            if (!instance.skinnedVertices || instance.skinnedVertices->Size() != outputBytes)
+                            {
+                                m_impl->computeSkinJournal.Cancel(instanceKey);
+                                if (computeSkinOracleCandidateKey == instanceKey)
+                                    computeSkinOracleCandidateKey.clear();
+                                R4BufferDesc outputDesc{outputBytes, R4ResourceStorage::Private,
+                                    R4BufferUsage::Vertex, "R4 dynamic OGF GPU-skinned SKIN_0 vertices"};
+                                auto replacement = resources.CreateBuffer(outputDesc, nullptr, 0u, localComputeError);
+                                if (replacement)
+                                {
+                                    instance.skinnedVertices = std::move(replacement);
+                                    instance.hasSkinPose = false;
+                                    instance.skinPoseHash = 0u;
+                                    instance.skinPoseOutput.reset();
+                                    instance.skinPoseWriteSerial = 0u;
+                                    xray::metal::AdvanceR4ComputeSkinWriteSerial(instance.outputWriteSerial);
+                                }
+                            }
+                            if (instance.skinnedVertices && instance.skinnedVertices->Size() == outputBytes)
+                            {
+                                R4ComputeSkinJob job;
+                                job.canonicalInput = cached.computeSkinInput;
+                                job.inputOffset = 0u;
+                                job.inputSize = canonicalBytes;
+                                job.bones = computeBoneSlice;
+                                job.output = instance.skinnedVertices;
+                                job.outputOffset = 0u;
+                                job.outputSize = outputBytes;
+                                job.vertexCount = static_cast<std::uint32_t>(cached.computeSkinVertices.size());
+                                job.influenceCount = cached.computeSkinInfluenceCount;
+                                job.boneCount = static_cast<std::uint32_t>(renderable.boneTransforms->size());
+                                job.maxReferencedBoneIndex = cached.maxReferencedBoneIndex;
+                                bool attachedOracleRequest = false;
+                                constexpr std::size_t kOracleMaxExpectedBytes = 4u * 1024u * 1024u;
+                                const std::uint32_t influenceClass = job.influenceCount;
+                                const bool oracleCandidateAvailable =
+                                    m_impl->computeSkinOracleOptIn && influenceClass >= 1u &&
+                                    influenceClass <= 4u &&
+                                    m_impl->computeSkinOracleSubmittedSamples[influenceClass] < 2u &&
+                                    outputBytes <= kOracleMaxExpectedBytes &&
+                                    (computeSkinOracleCandidateKey.empty() ||
+                                        computeSkinOracleCandidateKey == instanceKey);
+                                if (oracleCandidateAvailable)
+                                {
+                                    std::vector<R4DynamicWorldSkinnedVertex> expectedVertices;
+                                    std::string oracleError;
+                                    if (RepackR4DynamicWorldSkinnedVertices(source,
+                                            renderable.boneTransforms, expectedVertices, oracleError) &&
+                                        expectedVertices.size() == cached.computeSkinVertices.size() &&
+                                        expectedVertices.size() <= std::numeric_limits<std::size_t>::max() /
+                                            sizeof(R4DynamicWorldSkinnedVertex) &&
+                                        expectedVertices.size() * sizeof(R4DynamicWorldSkinnedVertex) == outputBytes)
+                                    {
+                                        auto request = std::make_shared<R4ComputeSkinOracleRequest>();
+                                        request->stableKey = instanceKey;
+                                        request->expectedBytes.resize(outputBytes);
+                                        std::memcpy(request->expectedBytes.data(), expectedVertices.data(), outputBytes);
+                                        request->poseHash = poseHash;
+                                        request->outputWriteSerial = instance.outputWriteSerial;
+                                        request->prewarmEpoch = m_impl->prewarm.epoch;
+                                        request->engineFrame = world->engineFrame;
+                                        job.oracle = std::move(request);
+                                        attachedOracleRequest = true;
+                                    }
+                                    else if (!m_impl->computeSkinOracleInconclusiveLogged)
+                                    {
+                                        const char* reason = oracleError.empty() ?
+                                            "CPU reference size did not match the compute job" : oracleError.c_str();
+                                        std::fprintf(stderr,
+                                            "METAL_COMPUTE_SKIN_ORACLE_INCONCLUSIVE key=%s reason=\"%s\"\n",
+                                            instanceKey.c_str(), reason);
+                                        m_impl->computeSkinOracleInconclusiveLogged = true;
+                                    }
+                                }
+                                queuedGpuSkin = m_impl->computeSkinJournal.Queue(instanceKey,
+                                    std::move(job), instance.skinnedVertices, m_impl->prewarm.epoch,
+                                    instance.outputWriteSerial, poseHash);
+                                if (queuedGpuSkin && attachedOracleRequest)
+                                    computeSkinOracleCandidateKey = instanceKey;
+                                else if (queuedGpuSkin && computeSkinOracleCandidateKey == instanceKey)
+                                    computeSkinOracleCandidateKey.clear();
+                            }
+                            if (!queuedGpuSkin && insertedForCompute)
+                            {
+                                m_impl->instances.erase(existing);
+                                existing = m_impl->instances.end();
+                            }
+                        }
+                    }
+                    if (!queuedGpuSkin && !localComputeError.empty() && !m_impl->computeSkinFallbackLogged)
+                    {
+                        std::fprintf(stderr,
+                            "METAL_COMPUTE_SKIN_FALLBACK key=%s reason=\"%s\"\n",
+                            key.c_str(), localComputeError.c_str());
+                        m_impl->computeSkinFallbackLogged = true;
+                    }
+                }
+                if (!canReuseSkinnedVertices && !queuedGpuSkin)
+                {
+                    m_impl->computeSkinJournal.Cancel(instanceKey);
+                    if (computeSkinOracleCandidateKey == instanceKey)
+                        computeSkinOracleCandidateKey.clear();
                     std::vector<R4DynamicWorldSkinnedVertex> repacked;
                     PositionBounds sourceBounds;
                     PositionBounds skinnedBounds;
-                    if (!repackR4DynamicWorldSkinnedVertices(source, renderable.boneTransforms,
-                            repacked, localError, &sourceBounds, &skinnedBounds))
+                    bool skinRepacked = false;
+                    {
+                        E07ScopedTimer timer(m_telemetry.e07SkinMs, m_impl->e07ProfileEnabled);
+                        skinRepacked = repackR4DynamicWorldSkinnedVertices(source,
+                            renderable.boneTransforms, repacked, localError, &sourceBounds, &skinnedBounds);
+                    }
+                    if (skinRepacked && m_impl->e07ProfileEnabled)
+                        m_telemetry.e07SkinnedVerticesComputed += repacked.size();
+                    if (!skinRepacked)
                     {
                         countInfluenceClass(skinFormat, m_telemetry.skinned1WRejected,
                             m_telemetry.skinned2WRejected, m_telemetry.skinned3WRejected,
@@ -1565,13 +2691,16 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                         continue;
                     }
                     PositionBounds worldBounds;
-                    for (const R4DynamicWorldSkinnedVertex& vertex : repacked)
                     {
-                        const Float3 position{vertex.position[0], vertex.position[1], vertex.position[2]};
-                        if (!include(worldBounds, transformPoint(renderable.transform, position)))
+                        E07ScopedTimer timer(m_telemetry.e07SkinBoundsMs, m_impl->e07ProfileEnabled);
+                        for (const R4DynamicWorldSkinnedVertex& vertex : repacked)
                         {
-                            localError = "dynamic SKIN_0 world transform produced a non-finite position";
-                            break;
+                            const Float3 position{vertex.position[0], vertex.position[1], vertex.position[2]};
+                            if (!include(worldBounds, transformPoint(renderable.transform, position)))
+                            {
+                                localError = "dynamic SKIN_0 world transform produced a non-finite position";
+                                break;
+                            }
                         }
                     }
                     const float sourceRadius = radius(sourceBounds);
@@ -1606,34 +2735,68 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                         Impl::CachedInstance instance;
                         R4BufferDesc vertexDesc{vertexBytes, R4ResourceStorage::Private,
                             R4BufferUsage::Vertex, "R4 dynamic OGF CPU-skinned SKIN_0 vertices"};
-                        instance.skinnedVertices = resources.CreateBuffer(vertexDesc, nullptr, 0, localError);
-                        if (!instance.skinnedVertices ||
-                            !resources.UpdateBuffer(instance.skinnedVertices, 0, repacked.data(), vertexBytes, localError))
+                        bool uploaded = false;
+                        {
+                            E07ScopedTimer timer(m_telemetry.e07SkinUploadMs, m_impl->e07ProfileEnabled);
+                            instance.skinnedVertices = resources.CreateBuffer(vertexDesc, nullptr, 0, localError);
+                            uploaded = instance.skinnedVertices && resources.UpdateBuffer(
+                                instance.skinnedVertices, 0, repacked.data(), vertexBytes, localError);
+                        }
+                        if (!uploaded)
                         {
                             std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIN_SKIP key=%s instance=%zu reason=\"%s\"\n",
                                 key.c_str(), renderableIndex, localError.c_str());
                             continue;
                         }
+                        if (m_impl->e07ProfileEnabled)
+                            m_telemetry.e07SkinnedBytesUploaded += vertexBytes;
+                        xray::metal::AdvanceR4ComputeSkinWriteSerial(instance.outputWriteSerial);
                         instance.skinPoseHash = poseHash;
+                        instance.skinPoseOutput = instance.skinnedVertices;
+                        instance.skinPoseWriteSerial = instance.outputWriteSerial;
                         instance.hasSkinPose = true;
                         existing = m_impl->instances.emplace(instanceKey, std::move(instance)).first;
                     }
-                    else if (!existing->second.skinnedVertices ||
-                        !resources.UpdateBuffer(existing->second.skinnedVertices, 0,
-                            repacked.data(), vertexBytes, localError))
-                    {
-                        std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIN_SKIP key=%s instance=%zu reason=\"%s\"\n",
-                            key.c_str(), renderableIndex, localError.c_str());
-                        continue;
-                    }
                     else
                     {
+                        bool uploaded = false;
+                        {
+                            E07ScopedTimer timer(m_telemetry.e07SkinUploadMs, m_impl->e07ProfileEnabled);
+                            uploaded = existing->second.skinnedVertices && resources.UpdateBuffer(
+                                existing->second.skinnedVertices, 0, repacked.data(), vertexBytes, localError);
+                        }
+                        if (!uploaded)
+                        {
+                            std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIN_SKIP key=%s instance=%zu reason=\"%s\"\n",
+                                key.c_str(), renderableIndex, localError.c_str());
+                            continue;
+                        }
+                        if (m_impl->e07ProfileEnabled)
+                            m_telemetry.e07SkinnedBytesUploaded += vertexBytes;
+                        xray::metal::AdvanceR4ComputeSkinWriteSerial(existing->second.outputWriteSerial);
                         existing->second.skinPoseHash = poseHash;
+                        existing->second.skinPoseOutput = existing->second.skinnedVertices;
+                        existing->second.skinPoseWriteSerial = existing->second.outputWriteSerial;
                         existing->second.hasSkinPose = true;
                     }
                 }
                 else
-                    ++m_telemetry.skinnedVerticesReused;
+                {
+                    if (canReuseSkinnedVertices)
+                    {
+                        // A later duplicate snapshot entry may match the last
+                        // committed pose after an earlier same-key entry queued
+                        // a different provisional GPU pose.
+                        m_impl->computeSkinJournal.Cancel(instanceKey);
+                        if (computeSkinOracleCandidateKey == instanceKey)
+                            computeSkinOracleCandidateKey.clear();
+                        ++m_telemetry.skinnedVerticesReused;
+                    }
+                }
+                // Both freshly repacked and current-pose cache-hit buffers
+                // are valid shadow inputs for this unique Prewarm invocation.
+                if (!queuedGpuSkin && existing != m_impl->instances.end() && existing->second.skinnedVertices)
+                    existing->second.prepared.PublishSkin(m_impl->prewarm.epoch);
             }
             if (existing != m_impl->instances.end() && existing->second.vertexGlobals &&
                 existing->second.transforms && existing->second.fragmentGlobals)
@@ -1649,10 +2812,24 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
                     std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s instance=%zu reason=\"%s\"\n",
                         key.c_str(), renderableIndex, localError.empty() ?
                         "dynamic OGF instance uniform update failed" : localError.c_str());
+                    m_impl->computeSkinJournal.Cancel(instanceKey);
+                    if (computeSkinOracleCandidateKey == instanceKey)
+                        computeSkinOracleCandidateKey.clear();
                     m_impl->instances.erase(existing);
+                    existing = m_impl->instances.end();
                 }
                 else
+                {
                     existing->second.lastUsedGeneration = m_impl->instanceGeneration;
+                    existing->second.prepared.PublishMain(m_impl->prewarm.epoch);
+                }
+                if (collectCpuVertexDiagnostic && existing != m_impl->instances.end())
+                {
+                    existing->second.cpuVertexDiagnostic = cpuVertexDiagnostic;
+                    existing->second.diagnosticWorldViewProjection = wvp;
+                    existing->second.diagnosticEngineFrame = view.engineFrame;
+                    existing->second.diagnosticPoseHash = diagnosticPoseHash;
+                }
                 continue;
             }
             Impl::CachedInstance& instance = existing == m_impl->instances.end() ?
@@ -1671,16 +2848,137 @@ bool MetalR4DynamicWorldAdapter::Prewarm(IR4Backend& backend,
             {
                 std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s reason=\"%s\"\n", key.c_str(),
                     error.empty() ? "dynamic OGF uniform allocation failed" : error.c_str());
+                m_impl->computeSkinJournal.Cancel(instanceKey);
+                if (computeSkinOracleCandidateKey == instanceKey)
+                    computeSkinOracleCandidateKey.clear();
                 m_impl->instances.erase(instanceKey);
                 error.clear();
                 continue;
             }
             instance.lastUsedGeneration = m_impl->instanceGeneration;
+            instance.prepared.PublishMain(m_impl->prewarm.epoch);
+            if (collectCpuVertexDiagnostic)
+            {
+                instance.cpuVertexDiagnostic = cpuVertexDiagnostic;
+                instance.diagnosticWorldViewProjection = wvp;
+                instance.diagnosticEngineFrame = view.engineFrame;
+                instance.diagnosticPoseHash = diagnosticPoseHash;
+            }
         }
     }
+    // Complete CPU-only Prewarm products before dispatch so no later adapter
+    // preparation can fail after provisional GPU writes have been encoded.
+    if (m_impl->shadowIndexEnabled)
+        m_impl->shadowFrameIndex.Prepare(world, m_impl->instanceSlot);
+    if (xray::metal::R4ComputeSkinShouldDispatch(m_impl->computeSkinOptIn,
+            m_impl->computeSkinBackendDisabled, m_impl->computeSkinCpuRetry) &&
+        m_impl->computeSkinJournal.QueuedJobCount() != 0u)
+    {
+        const std::vector<R4ComputeSkinJob> jobs = m_impl->computeSkinJournal.TakeJobs();
+        std::string computeError;
+        if (!backend.EncodeComputeSkinJobs(jobs, computeError))
+        {
+            m_impl->computeSkinJournal.Discard();
+            m_impl->computeSkinBackendDisabled = true;
+            if (!m_impl->computeSkinFailureLogged)
+            {
+                std::fprintf(stderr,
+                    "METAL_COMPUTE_SKIN_DISABLED frame=%u reason=pre-dispatch-no-write error=\"%s\"\n",
+                    world->engineFrame, computeError.empty() ? "backend rejected job batch" :
+                        computeError.c_str());
+                m_impl->computeSkinFailureLogged = true;
+            }
+            m_impl->computeSkinCpuRetry = true;
+            error.clear();
+            const bool cpuRetrySucceeded = Prewarm(backend, view, world, error);
+            m_impl->computeSkinCpuRetry = false;
+            return cpuRetrySucceeded;
+        }
+        for (const auto& stamp : m_impl->computeSkinJournal.Stamps())
+        {
+            if (stamp.epoch != m_impl->prewarm.epoch) continue;
+            const auto instance = m_impl->instances.find(stamp.key);
+            if (instance != m_impl->instances.end() &&
+                instance->second.skinnedVertices == stamp.output &&
+                instance->second.outputWriteSerial == stamp.writeSerial)
+                instance->second.prepared.PublishSkin(stamp.epoch);
+        }
+        m_impl->computeSkinOraclePendingInfluenceCounts.clear();
+        for (const R4ComputeSkinJob& job : jobs)
+        {
+            if (job.oracle && job.influenceCount >= 1u && job.influenceCount <= 4u)
+                m_impl->computeSkinOraclePendingInfluenceCounts.push_back(job.influenceCount);
+        }
+    }
+    // Publish the new immutable owner only after all Prewarm work succeeds.
     m_telemetry.cachedGeometry = m_impl->geometry.size();
     m_telemetry.rejectedGeometry = m_impl->rejected.size();
+    m_impl->pendingMotionFrame = true;
+    m_impl->prewarm.Complete();
     return true;
+}
+
+void MetalR4DynamicWorldAdapter::DiscardUnsubmittedFrame()
+{
+    if (!m_impl)
+        return;
+    m_impl->computeSkinJournal.Discard();
+    m_impl->computeSkinOraclePendingInfluenceCounts.clear();
+    m_impl->pendingObjectMotion.clear();
+    m_impl->pendingMotionFrame = false;
+    m_impl->pendingMotionReset = false;
+}
+
+void MetalR4DynamicWorldAdapter::CommitSubmittedSkin()
+{
+    if (!m_impl)
+        return;
+    m_impl->computeSkinJournal.Promote(m_impl->prewarm.ReadyEpoch(),
+        [this](const std::string& key) -> Impl::CachedInstance* {
+            const auto instance = m_impl->instances.find(key);
+            return instance == m_impl->instances.end() ? nullptr : &instance->second;
+        });
+    for (const std::uint32_t influenceCount : m_impl->computeSkinOraclePendingInfluenceCounts)
+    {
+        if (influenceCount >= 1u && influenceCount <= 4u &&
+            m_impl->computeSkinOracleSubmittedSamples[influenceCount] < 2u)
+            ++m_impl->computeSkinOracleSubmittedSamples[influenceCount];
+    }
+    m_impl->computeSkinOraclePendingInfluenceCounts.clear();
+}
+
+void MetalR4DynamicWorldAdapter::CommitSubmittedFrame()
+{
+    if (!m_impl)
+        return;
+    if (!m_impl->pendingMotionFrame)
+        return;
+
+    if (m_impl->pendingMotionReset)
+        m_impl->objectMotion.clear();
+    for (const auto& [identity, history] : m_impl->pendingObjectMotion)
+        m_impl->objectMotion[identity] = history;
+
+    if (m_impl->objectMotion.size() > 2048u)
+    {
+        for (auto it = m_impl->objectMotion.begin(); it != m_impl->objectMotion.end();)
+        {
+            if (m_impl->pendingMotionEngineFrame > it->second.lastEngineFrame &&
+                m_impl->pendingMotionEngineFrame - it->second.lastEngineFrame > 60u)
+                it = m_impl->objectMotion.erase(it);
+            else
+                ++it;
+        }
+    }
+    DiscardUnsubmittedFrame();
+}
+
+void MetalR4DynamicWorldAdapter::InvalidateHistory()
+{
+    if (!m_impl)
+        return;
+    m_impl->objectMotion.clear();
+    DiscardUnsubmittedFrame();
 }
 
 bool MetalR4DynamicWorldAdapter::Draw(IR4Backend& backend,
@@ -1693,6 +2991,20 @@ bool MetalR4DynamicWorldAdapter::Draw(IR4Backend& backend,
     m_telemetry.draws = 0;
     m_telemetry.skinnedDraws = 0;
 	m_telemetry.hotDraws = 0;
+    const bool splitDrawDiagnostics = dynamicDrawDiagnosticsEnabled();
+    if (!m_impl->e03CensusFinished && !m_impl->e03CensusFlagPath.empty())
+    {
+        FILE* flag = std::fopen(m_impl->e03CensusFlagPath.c_str(), "r");
+        char stage[64] = {};
+        const bool ready = flag && std::fgets(stage, sizeof(stage), flag) &&
+            std::strncmp(stage, "READY_FOR_NO_HUD", 16) == 0;
+        if (flag)
+            std::fclose(flag);
+        if (ready)
+            m_impl->e03CensusStarted = true;
+        else if (m_impl->e03CensusStarted)
+            m_impl->e03CensusFinished = true;
+    }
     for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
     {
         const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
@@ -1705,7 +3017,10 @@ bool MetalR4DynamicWorldAdapter::Draw(IR4Backend& backend,
                 ":slot:" + std::to_string(m_impl->instanceSlot);
             const auto geometry = m_impl->geometry.find(key);
             const auto instance = m_impl->instances.find(instanceKey);
-            if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end())
+            if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
+                !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), geometry->second.skinned))
+                continue;
+            if (geometry->second.lightplane)
                 continue;
             const bool skinned = geometry->second.skinned;
             const bool flat = geometry->second.flat;
@@ -1747,23 +3062,306 @@ bool MetalR4DynamicWorldAdapter::Draw(IR4Backend& backend,
             draw.indexBuffer = geometry->second.indices;
             draw.indexCount = renderable.asset->geometry[index].indexCount;
             draw.indexType = R4IndexType::UInt16;
+            if (splitDrawDiagnostics && instance->second.diagnosticEngineFrame == view.engineFrame)
+            {
+                const std::string diagnosticKey = key + ":object:" +
+                    std::to_string(renderable.objectId) + ":pose:" +
+                    std::to_string(instance->second.diagnosticPoseHash);
+                if (m_impl->reportedCpuDrawDiagnostics.emplace(diagnosticKey).second)
+                {
+                    const DynamicCpuVertexDiagnostic& diagnostic = instance->second.cpuVertexDiagnostic;
+                    std::fprintf(stderr,
+                        "METAL_DYNAMIC_CPU_VERTEX_DIAGNOSTIC frame=%u object=%u asset=\"%s\" geometry=%zu "
+                        "shader=\"%s\" route=%s available=%s vertices=%zu uv_nonfinite=%zu position_nonfinite=%zu "
+                        "clip_nonfinite=%zu clipw_nearzero=%zu clipw_min_abs=%.9g\n",
+                        view.engineFrame, renderable.objectId, renderable.assetName.c_str(), index,
+                        renderable.asset->geometry[index].shaderName.c_str(), flat ? "flat" : "bump",
+                        diagnostic.available ? "true" : "false", diagnostic.vertices,
+                        diagnostic.nonFiniteUv, diagnostic.nonFinitePosition, diagnostic.nonFiniteClip,
+                        diagnostic.nearZeroClipW, diagnostic.minAbsClipW);
+                }
+            }
+            if (splitDrawDiagnostics)
+            {
+                const std::string label = "dynamic frame=" + std::to_string(world->engineFrame) +
+                    " object=" + std::to_string(renderable.objectId) + " asset=" + renderable.assetName +
+                    " geometry=" + std::to_string(index) + " shader=" +
+                    renderable.asset->geometry[index].shaderName + " key=" + key;
+                if (!backend.SplitActivePassForDiagnostics(label, error))
+                    return false;
+            }
             if (!backend.BindGraphicsPipeline(pipeline, error) ||
                 !backend.BindMscResources(vs, error) || !backend.BindMscResources(ps, error) ||
                 !backend.BindVertexBuffer(6, vertices, 0, error) ||
                 !backend.DrawIndexed(draw, error))
                 return false;
+            if (m_impl->e07ProfileEnabled && renderableIndex < m_impl->e07ObjectSamples.size())
+                m_impl->e07ObjectSamples[renderableIndex].submittedToGbuffer = true;
+            if (m_impl->e03CensusStarted && !m_impl->e03CensusFinished)
+            {
+                const R4EngineWorldGeometry& source = renderable.asset->geometry[index];
+                const char* selectedShader = flat ? (skinned ? "deffer_model_flat" : "deffer_base_flat") :
+                    (skinned ? "deffer_model_bump" : "deffer_base_bump");
+                const std::size_t metalVertexStride = skinned ? sizeof(R4DynamicWorldSkinnedVertex) :
+                    sizeof(R4DynamicWorldBumpVertex);
+                const std::size_t metalVertexCount = metalVertexStride == 0 ? 0 :
+                    vertices->Size() / metalVertexStride;
+                const std::string drawKey = geometryKey(*renderable.asset, index);
+                std::fprintf(stderr,
+                    "METAL_E03_DYNAMIC_CENSUS ordinal=%zu frame=%u renderable=%zu asset=\"%s\" source=\"%s\" "
+                    "object_id=%u geometry_index=%zu geometry_key=%s source_shader=\"%s\" shader=%s "
+                    "base_texture=\"%s\" texture_mode=%s vertex_format=0x%08x source_stride=%u "
+                    "source_vertices=%u metal_stride=%zu metal_vertices=%zu index_count=%u "
+                    "local_bounds=(%.6f,%.6f,%.6f,%.6f) transform_translation=(%.6f,%.6f,%.6f)\n",
+                    m_impl->e03CensusNextOrdinal, world->engineFrame, renderableIndex,
+                    renderable.assetName.c_str(), renderable.asset->sourceName.c_str(),
+                    static_cast<unsigned int>(renderable.objectId), index, drawKey.c_str(),
+                    source.shaderName.c_str(), selectedShader, source.textureName.c_str(),
+                    flat ? "base_only_flat_fallback" : "base_plus_bump",
+                    source.vertexFormat, source.vertexStride, source.vertexCount,
+                    metalVertexStride, metalVertexCount, source.indexCount,
+                    renderable.bounds[0], renderable.bounds[1], renderable.bounds[2], renderable.bounds[3],
+                    renderable.transform[12], renderable.transform[13], renderable.transform[14]);
+                ++m_impl->e03CensusNextOrdinal;
+                if (m_impl->e03CensusNextOrdinal >= 16u)
+                    m_impl->e03CensusFinished = true;
+            }
             ++m_telemetry.draws;
 			if (hasPositiveHotness(renderable.hotness))
 				++m_telemetry.hotDraws;
             if (skinned)
             {
                 ++m_telemetry.skinnedDraws;
+                if (m_impl->e07ProfileEnabled)
+                    m_telemetry.e07SkinnedVerticesSubmitted += renderable.asset->geometry[index].vertexCount;
                 const SkinnedFormat skinFormat = classifySkinnedFormat(renderable.asset->geometry[index]);
                 countInfluenceClass(skinFormat, m_telemetry.skinned1WDraws,
                     m_telemetry.skinned2WDraws, m_telemetry.skinned3WDraws,
                     m_telemetry.skinned4WDraws);
             }
         }
+    }
+    return true;
+}
+
+bool MetalR4DynamicWorldAdapter::DrawEmissive(IR4Backend& backend,
+    const R4DynamicWorldViewState& view,
+    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+    const float pdaDisplayFactor, std::string& error)
+{
+    return DrawEmissiveTarget(backend, view, world, pdaDisplayFactor, false, error);
+}
+
+bool MetalR4DynamicWorldAdapter::DrawEmissiveAccumulator(IR4Backend& backend,
+    const R4DynamicWorldViewState& view,
+    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+    const float pdaDisplayFactor, std::string& error)
+{
+    return DrawEmissiveTarget(backend, view, world, pdaDisplayFactor, true, error);
+}
+
+bool MetalR4DynamicWorldAdapter::DrawEmissiveTarget(IR4Backend& backend,
+    const R4DynamicWorldViewState& view,
+    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+    const float pdaDisplayFactor, const bool accumulator, std::string& error)
+{
+    if (!m_enabled || !m_impl || !view.valid || !world)
+        return true;
+    if (backend.ActiveFrameContextIndex() != m_impl->instanceSlot)
+    {
+        error = "selflightl emissive draw does not match the prewarmed frame context";
+        return false;
+    }
+
+    std::array<std::uint8_t, kEmissiveFragmentGlobalsSize> fragmentGlobals{};
+    std::memcpy(fragmentGlobals.data() + kEmissivePdaParamsOffset,
+        &pdaDisplayFactor, sizeof(pdaDisplayFactor));
+    R4FrameBufferSlice pdaParameters;
+    bool uploadedParameters = false;
+    for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
+    {
+        const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
+        if (!renderable.asset)
+            continue;
+        for (std::size_t index = 0; index < renderable.asset->geometry.size(); ++index)
+        {
+            const R4EngineWorldGeometry& source = renderable.asset->geometry[index];
+            if (!isModelsSelflightFamily(source.shaderName))
+                continue;
+            if (accumulator) ++m_telemetry.emissiveAccumulatorCandidates;
+            else ++m_telemetry.emissiveCandidates;
+            if (!isModelsSelflightL(source.shaderName))
+            {
+                if (!m_impl->legacySelflightMismatchLogged)
+                {
+                    std::fprintf(stderr,
+                        "METAL_EMISSIVE_REJECT family=models_selflight reason=converted_vertex_stage_has_no_uv_output\n");
+                    m_impl->legacySelflightMismatchLogged = true;
+                }
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            if (!std::isfinite(pdaDisplayFactor))
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+
+            const std::string key = geometryKey(*renderable.asset, index);
+            const std::string instanceKey = instanceIdentityKey(key, renderable, renderableIndex) +
+                ":slot:" + std::to_string(m_impl->instanceSlot);
+            const auto geometry = m_impl->geometry.find(key);
+            const auto instance = m_impl->instances.find(instanceKey);
+            if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
+                !geometry->second.indices || !geometry->second.baseTexture ||
+                geometry->second.skinned != source.skinned ||
+                !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), geometry->second.skinned))
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            const bool skinned = geometry->second.skinned;
+            const std::shared_ptr<IR4Buffer>& vertices = skinned ?
+                instance->second.skinnedVertices : geometry->second.emissiveNoneVertices;
+            const auto& pipeline = accumulator ?
+                (skinned ? m_impl->emissiveAccumulatorSkinnedPipeline :
+                    m_impl->emissiveAccumulatorStaticPipeline) :
+                (skinned ? m_impl->emissiveSkinnedPipeline : m_impl->emissiveStaticPipeline);
+            if (!vertices || !pipeline)
+            {
+                if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                else ++m_telemetry.emissiveRejected;
+                continue;
+            }
+            if (!uploadedParameters)
+            {
+                if (!backend.UploadFrameData(fragmentGlobals.data(), fragmentGlobals.size(),
+                        256u, pdaParameters, error))
+                    return false;
+                uploadedParameters = true;
+            }
+            R4MscStageBindings vertex{R4ShaderStage::Vertex, 48u, {
+                {R4MscResourceType::ConstantBuffer, 0u, instance->second.vertexGlobals, 0u,
+                    kVertexGlobalsSize},
+                {R4MscResourceType::ConstantBuffer, 24u, instance->second.transforms, 0u,
+                    kTransformsSize},
+            }};
+            R4MscStageBindings fragment{R4ShaderStage::Fragment, 72u, {
+                {R4MscResourceType::Texture, 0u, {}, 0u, 0u, geometry->second.baseTexture},
+                {R4MscResourceType::ConstantBuffer, 24u, pdaParameters.buffer,
+                    pdaParameters.offset, kEmissiveFragmentGlobalsSize},
+                {R4MscResourceType::Sampler, 48u, {}, 0u, 0u, {}, m_impl->sampler},
+            }};
+            R4IndexedDrawDesc draw;
+            draw.indexBuffer = geometry->second.indices;
+            draw.indexCount = source.indexCount;
+            draw.indexType = R4IndexType::UInt16;
+            if (!backend.BindGraphicsPipeline(pipeline, error) ||
+                !backend.BindMscResources(vertex, error) ||
+                !backend.BindMscResources(fragment, error) ||
+                !backend.BindVertexBuffer(6u, vertices, 0u, error) ||
+                !backend.SetStencilReference(1u, error) || !backend.DrawIndexed(draw, error))
+                return false;
+            if (accumulator) ++m_telemetry.emissiveAccumulatorDraws;
+            else ++m_telemetry.emissiveDraws;
+        }
+    }
+    return true;
+}
+
+bool MetalR4DynamicWorldAdapter::HasForwardLightplanes() const
+{
+    return m_enabled && m_impl && m_impl->forwardLightplanesThisFrame != 0u;
+}
+
+bool MetalR4DynamicWorldAdapter::DrawForwardLightplanes(IR4Backend& backend,
+    const R4DynamicWorldViewState& view,
+    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+    std::string& error)
+{
+    if (!HasForwardLightplanes() || !view.valid || !world)
+        return true;
+    if (!m_impl->modelLightplanePipeline)
+    {
+        error = "models\\lightplanes forward pipeline is unavailable";
+        return false;
+    }
+
+    struct LightplaneDraw
+    {
+        std::size_t renderableIndex = 0;
+        std::size_t geometryIndex = 0;
+        float distanceSquared = 0.0f;
+    };
+    std::vector<LightplaneDraw> sorted;
+    sorted.reserve(m_impl->forwardLightplanesThisFrame);
+    for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
+    {
+        const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
+        if (!renderable.asset)
+            continue;
+        const Float3 center = transformPoint(renderable.transform,
+            {renderable.bounds[0], renderable.bounds[1], renderable.bounds[2]});
+        const float dx = center.x - view.eye[0];
+        const float dy = center.y - view.eye[1];
+        const float dz = center.z - view.eye[2];
+        const float distanceSquared = dx * dx + dy * dy + dz * dz;
+        for (std::size_t index = 0; index < renderable.asset->geometry.size(); ++index)
+        {
+            if (!isModelLightplane(renderable.asset->geometry[index]))
+                continue;
+            const std::string key = geometryKey(*renderable.asset, index);
+            const std::string instanceKey = instanceIdentityKey(key, renderable, renderableIndex) +
+                ":slot:" + std::to_string(m_impl->instanceSlot);
+            const auto instance = m_impl->instances.find(instanceKey);
+            if (m_impl->geometry.find(key) != m_impl->geometry.end() &&
+                instance != m_impl->instances.end() &&
+                instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), true))
+                sorted.push_back({renderableIndex, index, distanceSquared});
+        }
+    }
+    std::stable_sort(sorted.begin(), sorted.end(), [](const LightplaneDraw& left,
+        const LightplaneDraw& right) { return left.distanceSquared > right.distanceSquared; });
+
+    for (const LightplaneDraw& item : sorted)
+    {
+        const R4EngineWorldRenderable& renderable = world->renderables[item.renderableIndex];
+        const std::string key = geometryKey(*renderable.asset, item.geometryIndex);
+        const std::string instanceKey = instanceIdentityKey(key, renderable, item.renderableIndex) +
+            ":slot:" + std::to_string(m_impl->instanceSlot);
+        const auto geometry = m_impl->geometry.find(key);
+        const auto instance = m_impl->instances.find(instanceKey);
+        if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
+            !geometry->second.lightplane || !geometry->second.baseTexture ||
+            !geometry->second.indices || !instance->second.skinnedVertices ||
+            !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), true))
+        {
+            error = "prepared models\\lightplanes draw lost its geometry or frame resource";
+            return false;
+        }
+        R4MscStageBindings vs{R4ShaderStage::Vertex, 48u, {
+            {R4MscResourceType::ConstantBuffer, 0u, instance->second.vertexGlobals,
+                0u, kVertexGlobalsSize},
+            {R4MscResourceType::ConstantBuffer, 24u, instance->second.transforms,
+                0u, kTransformsSize},
+        }};
+        R4MscStageBindings ps{R4ShaderStage::Fragment, 48u, {
+            {R4MscResourceType::Texture, 0u, {}, 0u, 0u, geometry->second.baseTexture},
+            {R4MscResourceType::Sampler, 24u, {}, 0u, 0u, {}, m_impl->sampler},
+        }};
+        R4IndexedDrawDesc draw;
+        draw.indexBuffer = geometry->second.indices;
+        draw.indexCount = renderable.asset->geometry[item.geometryIndex].indexCount;
+        draw.indexType = R4IndexType::UInt16;
+        if (!backend.BindGraphicsPipeline(m_impl->modelLightplanePipeline, error) ||
+            !backend.BindMscResources(vs, error) || !backend.BindMscResources(ps, error) ||
+            !backend.BindVertexBuffer(6u, instance->second.skinnedVertices, 0u, error) ||
+            !backend.DrawIndexed(draw, error))
+            return false;
+        ++m_telemetry.forwardLightplaneDraws;
     }
     return true;
 }
@@ -1779,23 +3377,68 @@ bool MetalR4DynamicWorldAdapter::DrawLocalShadowTile(IR4Backend& backend,
 {
     if (!m_enabled || !world || !isFiniteMatrix(lightViewProjection))
         return true;
-    const std::size_t slot = m_impl->instanceSlot;
-    const std::shared_ptr<IR4Buffer>& shadowBuffer = (slot < m_impl->shadowTransforms.size()) ?
-        m_impl->shadowTransforms[slot] : nullptr;
-    if (!shadowBuffer || (!m_impl->skinnedShadowPipeline && !m_impl->staticShadowPipeline))
+    if (!m_impl->skinnedShadowPipeline && !m_impl->staticShadowPipeline)
     {
         rejected += world->renderables.size();
         return true;
     }
 
-    for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
+    E07ScopedTimer shadowTimer(m_telemetry.e07ShadowCpuMs, m_impl->e07ProfileEnabled);
+
+    const std::vector<std::size_t>* selected = nullptr;
+    if (m_impl->shadowIndexEnabled &&
+        m_impl->shadowFrameIndex.Matches(world, backend.ActiveFrameContextIndex()))
+        selected = &m_impl->shadowFrameIndex.index.Query(lightViewProjection.data());
+    if (m_impl->shadowIndexOracle)
     {
+        if (selected) ++m_impl->shadowIndexedViews;
+        else ++m_impl->shadowFallbackViews;
+        m_impl->shadowBroadCandidates += selected ? selected->size() : world->renderables.size();
+        if (selected)
+        {
+            std::vector<std::size_t> linearAdmitted, indexedAdmitted;
+            const auto admitted = [&world, &lightViewProjection](const std::size_t index) {
+                const auto& renderable = world->renderables[index];
+                return renderable.asset && renderable.castsShadow &&
+                    !isOutsideDynamicMetalFrustum(renderable.bounds, renderable.transform,
+                        lightViewProjection, true) &&
+                    isFiniteMatrix(multiplyMatrix(lightViewProjection, renderable.transform));
+            };
+            for (std::size_t index = 0; index < world->renderables.size(); ++index)
+                if (admitted(index)) linearAdmitted.push_back(index);
+            for (const std::size_t index : *selected)
+                if (admitted(index)) indexedAdmitted.push_back(index);
+            if (linearAdmitted != indexedAdmitted)
+            {
+                error = "dynamic shadow broad phase changed the exact ordered caster list";
+                return false;
+            }
+        }
+        const std::uint64_t views = m_impl->shadowIndexedViews + m_impl->shadowFallbackViews;
+        if (views % 1000u == 0u)
+            std::fprintf(stderr,
+                "METAL_DYNAMIC_SHADOW_INDEX_ORACLE frame=%u indexed_views=%llu fallback_views=%llu candidate_checks=%llu misses=0\n",
+                world->engineFrame, static_cast<unsigned long long>(m_impl->shadowIndexedViews),
+                static_cast<unsigned long long>(m_impl->shadowFallbackViews),
+                static_cast<unsigned long long>(m_impl->shadowBroadCandidates));
+    }
+    if (selected)
+    {
+        rejected += m_impl->shadowFrameIndex.missingAssets;
+        culled += m_impl->shadowFrameIndex.eligible - selected->size();
+    }
+    const std::size_t renderableCount = selected ? selected->size() : world->renderables.size();
+    for (std::size_t ordinal = 0; ordinal < renderableCount; ++ordinal)
+    {
+        const std::size_t renderableIndex = selected ? (*selected)[ordinal] : ordinal;
         const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
         if (!renderable.asset)
         {
             ++rejected;
             continue;
         }
+        if (!renderable.castsShadow)
+            continue;
         if (isOutsideDynamicMetalFrustum(renderable.bounds, renderable.transform, lightViewProjection, true))
         {
             ++culled;
@@ -1817,6 +3460,8 @@ bool MetalR4DynamicWorldAdapter::DrawLocalShadowTile(IR4Backend& backend,
                 ++rejected;
                 continue;
             }
+            if (geometry->second.lightplane)
+                continue;
             const bool skinned = geometry->second.skinned;
             std::shared_ptr<IR4Buffer> vertices;
             std::shared_ptr<IR4GraphicsPipeline> pipeline;
@@ -1825,7 +3470,8 @@ bool MetalR4DynamicWorldAdapter::DrawLocalShadowTile(IR4Backend& backend,
                 const std::string instanceKey = instanceIdentityKey(key, renderable, renderableIndex) +
                     ":slot:" + std::to_string(m_impl->instanceSlot);
                 const auto inst = m_impl->instances.find(instanceKey);
-                if (inst == m_impl->instances.end() || !inst->second.skinnedVertices)
+                if (inst == m_impl->instances.end() || !inst->second.skinnedVertices ||
+                    !inst->second.prepared.SkinReady(m_impl->prewarm.ReadyEpoch()))
                 {
                     ++rejected;
                     continue;
@@ -1845,23 +3491,19 @@ bool MetalR4DynamicWorldAdapter::DrawLocalShadowTile(IR4Backend& backend,
             }
 
             ++candidates;
-            if (m_impl->dynamicShadowOffset + 256u > Impl::kDynamicShadowBufferCapacity)
-            {
-                ++rejected;
-                continue;
-            }
-
-            const std::size_t currentOffset = m_impl->dynamicShadowOffset;
-            m_impl->dynamicShadowOffset += 256u;
-
-            if (!backend.Resources().UpdateBuffer(shadowBuffer, currentOffset, wvp.data(), sizeof(wvp), error))
+            std::array<std::uint8_t, 256u> transform{};
+            std::memcpy(transform.data(), wvp.data(), sizeof(wvp));
+            R4FrameBufferSlice shadowTransform;
+            if (!backend.UploadFrameData(transform.data(), transform.size(), 256u,
+                    shadowTransform, error))
                 return false;
 
             R4MscStageBindings vs;
             vs.stage = R4ShaderStage::Vertex;
             vs.tlabSize = 24u;
             vs.resources = {
-                {R4MscResourceType::ConstantBuffer, 0u, shadowBuffer, currentOffset, 256u, nullptr, nullptr}
+                {R4MscResourceType::ConstantBuffer, 0u, shadowTransform.buffer,
+                    shadowTransform.offset, shadowTransform.size, nullptr, nullptr}
             };
 
             R4IndexedDrawDesc draw;
@@ -1878,14 +3520,95 @@ bool MetalR4DynamicWorldAdapter::DrawLocalShadowTile(IR4Backend& backend,
             ++submitted;
             ++m_telemetry.shadowDraws;
             if (skinned)
+            {
                 ++m_telemetry.shadowSkinnedDraws;
+                if (m_impl->e07ProfileEnabled)
+                    m_telemetry.e07ShadowSkinnedVertices += renderable.asset->geometry[index].vertexCount;
+            }
         }
     }
     return true;
 }
 
+void MetalR4DynamicWorldAdapter::AddE07ShadowCpu(const double localShadowMs, const double sunShadowMs)
+{
+    if (!m_impl || !m_impl->e07ProfileEnabled)
+        return;
+    m_telemetry.e07LocalShadowCpuMs += std::max(0.0, localShadowMs);
+    m_telemetry.e07SunShadowCpuMs += std::max(0.0, sunShadowMs);
+}
+
+void MetalR4DynamicWorldAdapter::WriteE07Frame(IR4Backend& backend,
+    const R4DynamicWorldViewState& view,
+    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+    const bool rendered)
+{
+    (void)backend;
+    if (!m_impl)
+        return;
+    m_impl->initializeE07Profile();
+    if (!m_impl->e07ProfileEnabled)
+        return;
+
+    if (!m_impl->e07FramesHeaderWritten)
+    {
+        m_impl->e07Frames << "engine_frame,slot,rendered,skin_ms,bounds_ms,skin_upload_ms,shadow_cpu_ms,"
+            "local_shadow_cpu_ms,sun_shadow_cpu_ms,computed_vertices,uploaded_bytes,submitted_vertices,"
+            "shadow_vertices,pose_reused,cache_hit,cache_miss,skinned_draws,shadow_draws\n";
+        m_impl->e07FramesHeaderWritten = true;
+    }
+    if (!m_impl->e07ObjectsHeaderWritten)
+    {
+        m_impl->e07Objects << "object_id,frame,view_frustum_visible,bones,asset_geometry_count,submitted_to_gbuffer\n";
+        m_impl->e07ObjectsHeaderWritten = true;
+    }
+    const double localShadowMs = m_telemetry.e07LocalShadowCpuMs;
+    const double sunShadowMs = m_telemetry.e07SunShadowCpuMs;
+    const double dynamicShadowMs = m_telemetry.e07ShadowCpuMs;
+    m_impl->e07Frames << view.engineFrame << ',' << m_impl->instanceSlot << ','
+        << (rendered ? 1 : 0) << ',' << m_telemetry.e07SkinMs << ','
+        << m_telemetry.e07SkinBoundsMs << ',' << m_telemetry.e07SkinUploadMs << ','
+        << dynamicShadowMs << ',' << localShadowMs << ',' << sunShadowMs << ','
+        << m_telemetry.e07SkinnedVerticesComputed << ',' << m_telemetry.e07SkinnedBytesUploaded << ','
+        << m_telemetry.e07SkinnedVerticesSubmitted << ',' << m_telemetry.e07ShadowSkinnedVertices << ','
+        << m_telemetry.skinnedVerticesReused << ',' << m_telemetry.instanceCacheHits << ','
+        << m_telemetry.instanceCacheMisses << ',' << m_telemetry.skinnedDraws << ','
+        << m_telemetry.shadowDraws << '\n';
+    ++m_impl->e07FramesWritten;
+
+    if (world)
+    {
+        for (const E07ObjectSample& sample : m_impl->e07ObjectSamples)
+        {
+            m_impl->e07Objects << sample.objectId << ',' << sample.frame << ','
+                << (sample.viewFrustumVisible ? 1 : 0) << ',';
+            if (sample.bonesKnown)
+                m_impl->e07Objects << sample.bones;
+            m_impl->e07Objects << ',' << sample.assetGeometryCount << ','
+                << (sample.submittedToGbuffer ? 1 : 0) << '\n';
+        }
+    }
+    if ((m_impl->e07FramesWritten % 64u) == 0u)
+    {
+        m_impl->e07Frames.flush();
+        m_impl->e07Objects.flush();
+    }
+}
+
 bool RunR4DynamicWorldAdapterSelfTest(std::string& error)
 {
+	if (dynamicWorldPrewarmDisposition(false, true, false) !=
+			DynamicWorldPrewarmDisposition::ShadowGeometryOnly ||
+		dynamicWorldPrewarmDisposition(false, false, false) !=
+			DynamicWorldPrewarmDisposition::Skip ||
+		dynamicWorldPrewarmDisposition(false, true, true) !=
+			DynamicWorldPrewarmDisposition::ShadowSkinnedCaster ||
+		dynamicWorldPrewarmDisposition(true, false, false) !=
+			DynamicWorldPrewarmDisposition::MainViewAndShadow)
+	{
+		error = "off-camera cold caster must prepare shadow geometry without a static main-view instance";
+		return false;
+	}
 	const std::array<float, 4> hotness = {0.75f, 0.25f, 0.0f, 0.0f};
 	const std::array<std::uint8_t, kFragmentGlobalsSize> hotGlobals =
 		makeDynamicFragmentGlobals(hotness);
@@ -1916,6 +3639,100 @@ bool RunR4DynamicWorldAdapterSelfTest(std::string& error)
         isOutsideDynamicMetalFrustum(invalidSphere, rightOutside, identity, true))
     {
         error = "dynamic OGF local-sphere frustum culling is not conservative";
+        return false;
+    }
+    auto shadowWorld = std::make_shared<R4EngineWorldSnapshot>();
+    shadowWorld->engineFrame = 41u;
+    auto shadowAsset = std::make_shared<R4EngineWorldAsset>();
+    std::uint32_t seed = 0xD7A2026u;
+    const auto random = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<float>(seed & 65535u) / 65535.0f;
+    };
+    for (std::size_t index = 0; index < 512u; ++index)
+    {
+        R4EngineWorldRenderable renderable;
+        renderable.asset = index % 13u ? shadowAsset : nullptr;
+        renderable.castsShadow = index % 7u != 0u;
+        renderable.transform = identity;
+        for (std::size_t axis = 0; axis < 3u; ++axis)
+        {
+            for (std::size_t component = 0; component < 3u; ++component)
+                renderable.transform[component * 4u + axis] = random() * 4.0f - 2.0f;
+            renderable.transform[12u + axis] = random() * 2000.0f - 1000.0f;
+            renderable.bounds[axis] = random() * 20.0f - 10.0f;
+        }
+        renderable.bounds[3] = random() * 10.0f;
+        if (index == 1u) renderable.bounds[3] = std::numeric_limits<float>::quiet_NaN();
+        if (index == 2u) renderable.bounds[3] = -1.0f;
+        if (index == 3u) renderable.transform[3] = 0.5f;
+        if (index == 4u) renderable.transform[0] = std::numeric_limits<float>::quiet_NaN();
+        if (index == 5u) renderable.bounds[0] = std::numeric_limits<float>::quiet_NaN();
+        if (index == 6u) renderable.bounds[0] = renderable.bounds[3] =
+            std::numeric_limits<float>::max();
+        shadowWorld->renderables.push_back(std::move(renderable));
+    }
+    DynamicShadowFrameIndex frameIndex;
+    frameIndex.Prepare(shadowWorld, 1u);
+    auto differentOwner = std::make_shared<R4EngineWorldSnapshot>(*shadowWorld);
+    if (!frameIndex.Matches(shadowWorld, 1u) || frameIndex.Matches(shadowWorld, 2u) ||
+        frameIndex.Matches(differentOwner, 1u) || frameIndex.Matches({}, 1u))
+    {
+        error = "dynamic shadow prepared owner/frame slot can admit a stale snapshot";
+        return false;
+    }
+    bool reducedChecks = false;
+    for (std::size_t viewIndex = 0; viewIndex < 128u; ++viewIndex)
+    {
+        auto vp = identity;
+        for (float& value : vp) value = (random() * 2.0f - 1.0f) * 0.01f;
+        if (viewIndex == 0u) vp = identity;
+        if (viewIndex == 1u) vp[0] = std::numeric_limits<float>::quiet_NaN();
+        if (viewIndex == 2u) vp[0] = std::numeric_limits<float>::max();
+        const auto& selected = frameIndex.index.Query(vp.data());
+        reducedChecks |= selected.size() < frameIndex.eligible;
+        std::vector<std::size_t> linearAdmitted, indexedAdmitted;
+        std::size_t linearCulled = 0u, linearRejected = 0u;
+        std::size_t indexedCulled = frameIndex.eligible - selected.size();
+        std::size_t indexedRejected = frameIndex.missingAssets;
+        const auto visit = [&](const std::size_t index, std::vector<std::size_t>& admitted,
+            std::size_t& culledCount, std::size_t& rejectedCount) {
+            const auto& renderable = shadowWorld->renderables[index];
+            if (!renderable.asset) { ++rejectedCount; return; }
+            if (!renderable.castsShadow) return;
+            if (isOutsideDynamicMetalFrustum(renderable.bounds, renderable.transform, vp, true))
+            { ++culledCount; return; }
+            if (!isFiniteMatrix(multiplyMatrix(vp, renderable.transform)))
+            { ++rejectedCount; return; }
+            admitted.push_back(index);
+        };
+        for (std::size_t index = 0; index < shadowWorld->renderables.size(); ++index)
+            visit(index, linearAdmitted, linearCulled, linearRejected);
+        for (const std::size_t index : selected)
+            visit(index, indexedAdmitted, indexedCulled, indexedRejected);
+        if (linearAdmitted != indexedAdmitted || linearCulled != indexedCulled ||
+            linearRejected != indexedRejected)
+        {
+            error = "dynamic shadow index changed ordered admission or rejection accounting";
+            return false;
+        }
+    }
+    if (!reducedChecks)
+    {
+        error = "dynamic shadow broad phase did not reduce independent caster checks";
+        return false;
+    }
+    frameIndex.Invalidate();
+    if (frameIndex.Matches(shadowWorld, 1u))
+    {
+        error = "dynamic shadow early Prewarm invalidation retained its old owner";
+        return false;
+    }
+    frameIndex.Prepare(shadowWorld, 1u);
+    ++shadowWorld->engineFrame;
+    if (frameIndex.Matches(shadowWorld, 1u))
+    {
+        error = "dynamic shadow index ignored its captured engine-frame stamp";
         return false;
     }
     R4EngineWorldRenderable stableObject;
@@ -2031,6 +3848,20 @@ bool RunR4DynamicWorldAdapterSelfTest(std::string& error)
         error = "dynamic SKIN_0 repack admitted a 2W OGF payload";
         return false;
     }
+    skinned.vertexFormat = kOgfVertexFormat1L;
+    skinned.vertexStride = 60u;
+    auto nonFiniteUvBytes = std::make_shared<std::vector<std::uint8_t>>(*skinnedBytes);
+    const float nonFiniteUv = std::numeric_limits<float>::quiet_NaN();
+    std::memcpy(nonFiniteUvBytes->data() + 1u * skinned.vertexStride + 48u,
+        &nonFiniteUv, sizeof(nonFiniteUv));
+    skinned.vertexBytes = nonFiniteUvBytes;
+    if (RepackR4DynamicWorldSkinned1WVertices(skinned, bones, skinnedRepacked, error) ||
+        error.find("TEXCOORD0 is non-finite at vertex 1") == std::string::npos)
+    {
+        error = "dynamic SKIN_0 repack did not reject non-finite TEXCOORD0 with its vertex index";
+        return false;
+    }
+    skinned.vertexBytes = skinnedBytes;
     const auto makeMultiWeightPayload = [&](const std::uint32_t vertexFormat, const std::uint32_t stride,
                                             const std::array<std::uint16_t, 4>& boneIds,
                                             const std::array<float, 3>& explicitWeights,

@@ -14,9 +14,13 @@ struct R4DefObjectsLodViewState
 {
     std::array<float, 16> view{};
     std::array<float, 16> projection{};
+    std::array<float, 16> previousView{};
+    std::array<float, 16> previousProjection{};
     // The scene-owned b2 static_globals buffer is populated from the live R4
     // environment before G-buffer encoding. Steep parallax binds it directly.
     std::shared_ptr<IR4Buffer> staticGlobals;
+    bool previousValid = false;
+    bool cameraCut = false;
     bool valid = false;
 };
 
@@ -42,6 +46,8 @@ public:
         std::uint64_t uploadedBytes = 0;
         std::size_t submittedVisuals = 0;
         std::size_t culledVisuals = 0;
+        std::size_t shadowSubmittedVisuals = 0;
+        std::size_t shadowCulledVisuals = 0;
     };
 
     MetalR4DefObjectsLodAdapter();
@@ -54,7 +60,13 @@ public:
         const std::vector<std::shared_ptr<IR4Buffer>>& indexBuffers,
         const Options& options, std::string& status);
     bool Upload(IR4Backend& backend, std::string& error);
+    void CommitSubmittedFrame();
+    void DiscardUnsubmittedFrame();
     bool DrawIntoActiveGBuffer(IR4Backend& backend, const R4DefObjectsLodViewState& view,
+        std::string& error);
+    bool DrawShadowCasters(IR4Backend& backend,
+        const std::array<float, 16>& lightViewProjection,
+        const std::shared_ptr<IR4GraphicsPipeline>& opaquePipeline,
         std::string& error);
     bool IsReady() const { return m_ready; }
     const Telemetry& LastTelemetry() const { return m_telemetry; }

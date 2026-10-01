@@ -76,6 +76,11 @@ static_assert(sizeof(R4DetailGrassVertex) == 32u,
 struct R4DetailGrassInstance
 {
     std::array<float, 16> transform{};
+    // Exact CDetailManager Item.position (the decompressed slot visibility
+    // sphere center), not the random grounded blade transform translation.
+    std::array<float, 3> shadowFadePosition{};
+    float shadowDistanceSquared = 0.0f;
+    bool hasShadowFadePosition = false;
     std::array<float, 3> terrainNormal{};
     float sun = 0.0f;
     float hemi = 0.0f;
@@ -152,6 +157,20 @@ struct R4DetailGrassViewState
     bool previousValid = false;
 };
 
+struct R4DetailGrassShadowState
+{
+    std::array<float, 16> lightView{};
+    std::array<float, 16> lightProjection{};
+    std::array<float, 16> lightViewProjection{};
+    // Windows uses Instance.distance for sun fade and squared XZ distance to
+    // light_position for local-light fades. Its local shadow path also rejects
+    // each Item.position at full 3D distance >= lightRange.
+    float fadeDistance = 0.0f;
+    std::array<float, 3> lightPosition{};
+    float lightRange = 0.0f;
+    bool fadeFromLight = false;
+};
+
 constexpr std::size_t kR4DetailGrassBatchSize = 61u;
 
 // Repeats a source detail mesh for at most 61 matrices, mirroring the
@@ -170,6 +189,10 @@ public:
     {
         std::filesystem::path vertexMetallibPath;
         std::filesystem::path fragmentMetallibPath;
+        // Optional dedicated depth-output bundle. The vertex shader is the
+        // production deffer_grass permutation; its wrapper PS preserves the
+        // original alpha/dither discard behavior.
+        std::filesystem::path shadowShaderDirectory;
         xray::metal::R4DdsBytesProvider ddsBytesProvider;
         std::filesystem::path wavesTexturePath;
         // Resolves details\blend's s_base and exact level-local s_bump.
@@ -192,6 +215,9 @@ public:
         std::size_t stillInstances = 0;
         std::size_t activeBenders = 0;
         std::size_t motionCaptureFailures = 0;
+        std::size_t shadowDraws = 0;
+        std::size_t shadowCulledBatches = 0;
+        std::size_t shadowRejected = 0;
         float cacheFadeDistance = 0.0f;
     };
 
@@ -219,6 +245,15 @@ public:
     // Requires an already-open scene-owned G-buffer pass.
     bool DrawIntoActiveGBuffer(IR4Backend& backend,
         const R4DetailGrassViewState& view, std::string& error);
+
+    // Requires an already-open scene-owned sun/local shadow pass. The state
+    // carries only the Windows pass matrix/fade inputs; all wind, materials,
+    // placements, and lighting remain the same as the visible adapter draw.
+    bool DrawShadowCasters(IR4Backend& backend,
+        const R4DetailGrassViewState& view,
+        const R4DetailGrassShadowState& shadow, std::string& error);
+
+    bool HasShadowCasters() const;
 
     bool IsReady() const { return m_ready; }
     const R4DetailGrassSnapshot* Snapshot() const;

@@ -1,6 +1,7 @@
 #include "pch_script.h"
 
 #include "WeaponMagazined.h"
+#include "GamepadInput.h"
 #include "actor.h"
 #include "Scope.h"
 #include "Silencer.h"
@@ -892,6 +893,9 @@ void CWeaponMagazined::PlaySoundShot()
 
 void CWeaponMagazined::OnShot()
 {
+	if (ParentIsActor())
+		CGamepadInput::OnWeaponShot(GetCurrentFireMode() < 0 || GetCurrentFireMode() > 1);
+
 	// Shot Sound
 	PlaySoundShot();
 
@@ -931,6 +935,7 @@ void CWeaponMagazined::OnEmptyClick()
 {
 	if (ParentIsActor())
 	{
+		CGamepadInput::OnWeaponDryFire();
 		if (bMisfire)
 		{
 			if (m_sounds.FindSoundItem("sndClickMisfireActor", false))

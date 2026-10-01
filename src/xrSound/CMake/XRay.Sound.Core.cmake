@@ -9,3 +9,4 @@ add_module(XRay.Sound.Core
   SoundRender_Core.h
   SoundRender_CoreA.h
 )
+

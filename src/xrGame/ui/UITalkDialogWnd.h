@@ -15,6 +15,7 @@
 class CUIScrollView;
 class CUIXml;
 class CUITalkWnd;
+class CUIQuestionItem;
 
 class CUITalkDialogWnd : public CUIWindow, public CUIWndCallback
 {
@@ -56,6 +57,8 @@ public:
 	void AddIconedAnswer(LPCSTR caption, LPCSTR text, LPCSTR texture_name, LPCSTR templ_name);
 	void ClearAll();
 	void ClearQuestions();
+	bool MoveQuestionSelection(int delta);
+	bool ActivateSelectedQuestion();
 
 	void SetOsoznanieMode(bool b);
 	void SetTradeMode();
@@ -66,6 +69,7 @@ public:
 private:
 	CUIScrollView* UIQuestionsList;
 	CUIScrollView* UIAnswersList;
+	int m_selectedQuestionIndex;
 
 	// Шрифт и цвет текста с именем персонажа
 	CGameFont* m_pNameTextFont;
@@ -77,10 +81,11 @@ private:
 	void __stdcall OnUpgradeClicked(CUIWindow* w, void*);
 	void __stdcall OnQuestionClicked(CUIWindow* w, void*);
 	void __stdcall OnExitClicked(CUIWindow* w, void*);
+	void SelectQuestion(int index, bool scrollIntoView);
 };
 
 
-class CUIQuestionItem : public CUIWindow, public CUIWndCallback
+class CUIQuestionItem : public CUIWindow, public CUIWndCallback, public CUISelectable
 {
 	typedef CUIWindow inherited;
 	float m_min_height;
@@ -90,6 +95,8 @@ public:
 	shared_str m_s_value;
 	CUIQuestionItem(CUIXml* xml_doc, LPCSTR path);
 	void Init(LPCSTR val, LPCSTR text);
+	virtual void SetSelected(bool selected) override;
+	virtual void Update() override;
 
 	virtual void SendMessage(CUIWindow* pWnd, s16 msg, void* pData = NULL);
 	void __stdcall OnTextClicked(CUIWindow* w, void*);

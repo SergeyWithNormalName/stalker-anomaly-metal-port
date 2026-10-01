@@ -1,0 +1,175 @@
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -12,6 +12,7 @@
+ #include <fstream>
+ #include <iterator>
+ #include <limits>
++#include <sstream>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -33,6 +34,67 @@
+ constexpr std::size_t kTransformsSize = 256u;
+ constexpr std::size_t kTreeShadowGlobalsSize = 320u;
+ constexpr std::size_t kTreeShadowStaticGlobalsSize = 528u;
++// Diagnostic frame-700 camera only. These are the accepted view float32 bits
++// from the exact-ID observer; a moving/changed camera must never reuse its IDs.
++constexpr std::array<std::uint32_t, 16> kSsaRoiViewBits = {
++    0x3f800000,0x00000000,0x80000000,0x00000000,
++    0x80000000,0x3f800000,0x00000000,0x00000000,
++    0x00000000,0x00000000,0x3f800000,0x00000000,
++    0x435d1523,0x41924768,0x43282e9a,0x3f800000};
++constexpr std::array<std::uint32_t, 16> kSsaRoiProjectionBits = {
++    0x3f3eae39,0x00000000,0x00000000,0x00000000,
++    0x00000000,0x3f988b61,0x00000000,0x00000000,
++    0x00000000,0x00000000,0x3f800a1e,0x3f800000,
++    0x00000000,0x00000000,0xbe4cdcfd,0x00000000};
++constexpr std::array<std::uint32_t, 3> kSsaRoiEyeBits = {
++    0xc35d1523,0xc1924768,0xc3282e9a};
++
++bool exactSsaRoiView(const R4FloraViewState& view)
++{
++    return std::memcmp(view.view.data(), kSsaRoiViewBits.data(), sizeof(view.view)) == 0 &&
++        std::memcmp(view.projection.data(), kSsaRoiProjectionBits.data(), sizeof(view.projection)) == 0 &&
++        std::memcmp(view.eye.data(), kSsaRoiEyeBits.data(), sizeof(view.eye)) == 0;
++}
++
++bool parseSsaRoiIds(const std::string& contents,
++    std::vector<std::pair<std::uint32_t, bool>>& ids)
++{
++    std::istringstream input(contents);
++    std::string line;
++    const auto expect = [&](const char* expected) {
++        return bool(std::getline(input, line)) && line == expected;
++    };
++    if (!expect("schema,main-flora-ssa-upper-bound/v1") ||
++        !expect("source_level_sha256,1800a451d0bba9af1da69fae8683b36b6e6346709c0d6b9bf14385f4a48d19f7") ||
++        !expect("capture_sha256,dca66b5c94dffae895bc33ba77a4cdc57881cce7c5252b07ba823b2dd6bdcdbc") ||
++        !expect("frame,700") || !expect("count,1199") ||
++        !expect("visual_id,material"))
++        return false;
++    ids.clear();
++    ids.reserve(1199u);
++    std::uint32_t previous = 0;
++    for (std::size_t row = 0; row < 1199u; ++row)
++    {
++        if (!std::getline(input, line)) return false;
++        const std::size_t comma = line.find(',');
++        if (comma == std::string::npos || comma == 0u) return false;
++        std::uint64_t parsed = 0;
++        for (std::size_t i = 0; i < comma; ++i)
++        {
++            if (line[i] < '0' || line[i] > '9') return false;
++            const std::uint64_t digit = std::uint64_t(line[i] - '0');
++            if (parsed > (std::numeric_limits<std::uint32_t>::max() - digit) / 10u)
++                return false;
++            parsed = parsed * 10u + digit;
++        }
++        if (parsed <= previous ||
++            (line.substr(comma + 1u) != "leaf" && line.substr(comma + 1u) != "trunk"))
++            return false;
++        previous = static_cast<std::uint32_t>(parsed);
++        ids.emplace_back(previous, line.substr(comma + 1u) == "leaf");
++    }
++    return !std::getline(input, line) && input.eof();
++}
+ 
+ struct Matrix4 { float elements[16]{}; };
+ 
+@@ -439,6 +501,7 @@
+     struct Draw
+     {
+         std::uint32_t visualId = 0;
++        bool ssaRoiSkip = false;
+         std::size_t shadowGroup = 0;
+         Material material = Material::LeafBump;
+         bool alphaTested = false;
+@@ -483,6 +546,8 @@
+     bool shadowLinear = std::getenv("XRAY_METAL_E08_FLORA_LINEAR") != nullptr;
+     bool shadowOracle = std::getenv("XRAY_METAL_E08_FLORA_ORACLE") != nullptr;
+     std::size_t oracleViews = 0;
++    bool ssaRoiAdmitted = false;
++    std::size_t ssaRoiFrames = 0;
+ };
+ 
+ MetalR4FloraAdapter::MetalR4FloraAdapter() = default;
+@@ -867,6 +932,46 @@
+     }
+     for (std::size_t g = 0; g < groupSizes.size(); ++g)
+         m_impl->shadowGroups[g].models.reserve(groupSizes[g]);
++    const char* ssaRoiMode = std::getenv("XRAY_METAL_MAIN_FLORA_SSA_UPPER_BOUND");
++    if (ssaRoiMode && std::strcmp(ssaRoiMode, "1") == 0)
++    {
++        std::string rejection;
++        const bool admitted = [&] {
++            const char* source = std::getenv("XRAY_METAL_MAIN_FLORA_SSA_IDS_FILE");
++            if (!source || !*source || m_impl->draws.size() != 11663u)
++            { rejection = "missing-file-or-source-count"; return false; }
++            const std::filesystem::path path(source);
++            std::error_code fileError;
++            const std::uintmax_t size = std::filesystem::file_size(path, fileError);
++            if (fileError || size == 0u || size > 64u * 1024u)
++            { rejection = "unreadable-or-oversized-file"; return false; }
++            std::string contents;
++            if (!readText(path, contents) || contents.size() != size)
++            { rejection = "read-failed"; return false; }
++            std::vector<std::pair<std::uint32_t, bool>> ids;
++            if (!parseSsaRoiIds(contents, ids))
++            { rejection = "invalid-format"; return false; }
++            std::unordered_map<std::uint32_t, Impl::Draw*> draws;
++            draws.reserve(m_impl->draws.size());
++            for (auto& draw : m_impl->draws)
++                if (!draws.emplace(draw.visualId, &draw).second)
++                { rejection = "duplicate-source-id"; return false; }
++            for (const auto& entry : ids)
++            {
++                const auto found = draws.find(entry.first);
++                if (found == draws.end() ||
++                    (found->second->material == Impl::Material::LeafBump) != entry.second)
++                { rejection = "id-or-material-mismatch"; return false; }
++            }
++            for (const auto& entry : ids)
++                draws.at(entry.first)->ssaRoiSkip = true;
++            return true;
++        }();
++        m_impl->ssaRoiAdmitted = admitted;
++        std::fprintf(stderr, "METAL_MAIN_FLORA_SSA_ROI admitted=%u ids=%zu reason=%s\n",
++            admitted ? 1u : 0u, admitted ? 1199u : 0u,
++            admitted ? "fixed-camera-numerical-upper-bound" : rejection.c_str());
++    }
+     std::fprintf(stderr, "METAL_E08_FLORA_INSTANCING enabled=%d groups=%zu instances=%zu stride=64\n",
+         int(m_impl->shadowInstancing), m_impl->shadowGroups.size(), m_impl->draws.size());
+ 
+@@ -905,6 +1010,8 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    const bool ssaRoiView = m_impl->ssaRoiAdmitted && exactSsaRoiView(view);
++    std::size_t ssaRoiSkipped = 0;
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+@@ -912,6 +1019,11 @@
+         if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
+         {
+             ++m_telemetry.culledVisuals;
++            continue;
++        }
++        if (ssaRoiView && draw.ssaRoiSkip)
++        {
++            ++ssaRoiSkipped;
+             continue;
+         }
+         std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+@@ -1046,6 +1158,10 @@
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
+     }
++    if (m_impl->ssaRoiAdmitted && ++m_impl->ssaRoiFrames % 300u == 0u)
++        std::fprintf(stderr, "METAL_MAIN_FLORA_SSA_ROI sample=%zu view_match=%u skipped=%zu submitted=%zu clip_culled=%zu\n",
++            m_impl->ssaRoiFrames, ssaRoiView ? 1u : 0u, ssaRoiSkipped,
++            m_telemetry.submittedVisuals, m_telemetry.culledVisuals);
+     return true;
+ }
+ 

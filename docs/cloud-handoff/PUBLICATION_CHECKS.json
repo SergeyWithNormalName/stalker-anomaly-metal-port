@@ -1,0 +1,12 @@
+{
+  "checked_utc": "2026-10-01T07:01:32.410947+00:00",
+  "publication_files_scanned": 10376,
+  "publication_bytes_scanned": 95876347,
+  "existing_public_parent_commits_scanned": 2,
+  "existing_public_history_blobs_scanned": 8263,
+  "secret_findings": 0,
+  "private_path_findings": 0,
+  "binary_files_in_published_tree": 0,
+  "method": "High-confidence credential formats, quoted credential candidates, credential/key filenames, private local paths, NUL/binary content; current publication files and all reachable existing public parent blob/commit objects. Values are never printed.",
+  "runtime_validation": "not verified on Mac; no games, builds, tests, or benchmarks executed"
+}

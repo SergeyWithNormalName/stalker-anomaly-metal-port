@@ -21,7 +21,7 @@ private:
 	ref_geom hGeom_Rain;
 
 	// Visualization	(drops)
-	IRender_DetailModel* DM_Drop;
+	IRender_DetailModel* DM_Drop = nullptr;
 	ref_geom hGeom_Drops;
 	ref_shader SH_Splash;
 };

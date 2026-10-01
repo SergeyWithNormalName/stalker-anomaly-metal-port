@@ -4,6 +4,7 @@
 #include "../xrEngine/xr_input.h"
 #include "../xrEngine/xr_ioc_cmd.h"
 #include "xr_level_controller.h"
+#include "GamepadInput.h"
 #include "string_table.h"
 
 _binding g_key_bindings [bindings_count];
@@ -786,6 +787,13 @@ void ConsoleBindCmds::save(IWriter* F)
 void CCC_RegisterInput()
 {
 	initialize_bindings();
+
+	// The bindings exist from here on, so this is where the gamepad layer can
+	// start resolving actions to keys. It is registered after them so the very
+	// first gamepad frame already sees a complete binding table, including in
+	// the main menu, which runs before any level exists.
+	CGamepadInput::Register();
+
 	CMD2(CCC_Bind, "bind", 0);
 	CMD2(CCC_Bind, "bind_sec", 1);
 	CMD2(CCC_UnBind, "unbind", 0);

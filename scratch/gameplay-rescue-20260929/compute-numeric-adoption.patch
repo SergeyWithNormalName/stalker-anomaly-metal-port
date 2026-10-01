@@ -1,0 +1,115 @@
+--- a/src/Layers/xrRenderMetal/R4ComputeSkin.metal
++++ b/src/Layers/xrRenderMetal/R4ComputeSkin.metal
+@@ -1,5 +1,9 @@
+ #include <metal_stdlib>
+ using namespace metal;
++// Existing ARM64 CPU repack rounds weighted products before accumulation.
++// Keep those operations separate; the reference contracts transforms/dots only,
++// reproduced by explicit fma below. Safe math alone does not disable contraction.
++#pragma clang fp contract(off)
+ 
+ struct SkinInput
+ {
+@@ -18,12 +22,16 @@
+ static_assert(sizeof(SkinOutput)==36, "existing SKIN_0 output stride");
+ 
+ float3 load3(device const float* values) { return float3(values[0],values[1],values[2]); }
++float transformComponent(device const float* matrix, float3 value, uint axis, bool point)
++{
++    const float transformed=fma(value.z,matrix[axis+8],
++        fma(value.x,matrix[axis],value.y*matrix[axis+4]));
++    return point?transformed+matrix[axis+12]:transformed;
++}
+ float3 transform3(device const float* matrix, float3 value, bool point)
+ {
+-    return float3(
+-        value.x*matrix[0]+value.y*matrix[4]+value.z*matrix[8]+(point?matrix[12]:0.0f),
+-        value.x*matrix[1]+value.y*matrix[5]+value.z*matrix[9]+(point?matrix[13]:0.0f),
+-        value.x*matrix[2]+value.y*matrix[6]+value.z*matrix[10]+(point?matrix[14]:0.0f));
++    return float3(transformComponent(matrix,value,0,point),
++        transformComponent(matrix,value,1,point),transformComponent(matrix,value,2,point));
+ }
+ float3 normalizedBasis(float3 value)
+ {
+@@ -58,7 +66,7 @@
+     }
+ #if R4_SKIN_DIAGNOSTIC_TRACE
+     const float3 beforeNormal=n;
+-    const float normalLength2=n.x*n.x+n.y*n.y+n.z*n.z;
++    const float normalLength2=fma(n.z,n.z,fma(n.x,n.x,n.y*n.y));
+ #endif
+     n=normalizedBasis(n); t=normalizedBasis(t); b=normalizedBasis(b);
+ #if R4_SKIN_DIAGNOSTIC_TRACE
+--- a/src/Layers/xrRenderMetal/tests/R4ComputeSkinGpuProbe.mm
++++ b/src/Layers/xrRenderMetal/tests/R4ComputeSkinGpuProbe.mm
+@@ -1,4 +1,5 @@
+ #include "../R4ComputeSkinFoundation.h"
++#include "../R4ComputeSkinMetal.h"
+ #include "../MetalR4DynamicWorldAdapter.h"
+ 
+ #import <Foundation/Foundation.h>
+@@ -45,14 +46,7 @@
+         NSString* source=[NSString stringWithContentsOfFile:@R4_COMPUTE_SKIN_SOURCE_PATH
+             encoding:NSUTF8StringEncoding error:&failure];
+         if (!queue || !source) { error=nativeError(failure); return false; }
+-        MTLCompileOptions* options=[MTLCompileOptions new];
+-        options.preprocessorMacros=@{@"R4_SKIN_DIAGNOSTIC_TRACE":@(diagnostics)};
+-        if (@available(macOS 15.0,*))
+-        {
+-            options.mathMode=MTLMathModeSafe;
+-            options.mathFloatingPointFunctions=MTLMathFloatingPointFunctionsPrecise;
+-        }
+-        else options.fastMathEnabled=NO;
++        MTLCompileOptions* options=xray::metal::R4ComputeSkinCompileOptions(diagnostics);
+         id<MTLLibrary> library=[device newLibraryWithSource:source options:options error:&failure];
+         id<MTLFunction> function=library?[library newFunctionWithName:@"r4_compute_skin"]:nil;
+         if (!function) { error=nativeError(failure); return false; }
+--- a/src/Layers/xrRenderMetal/tests/R4ComputeSkinExtractFixtures.py
++++ b/src/Layers/xrRenderMetal/tests/R4ComputeSkinExtractFixtures.py
+@@ -83,6 +83,7 @@
+     args.output.mkdir(parents=True, exist_ok=True)
+     manifest = []
+     total_bytes = 0
++    leaf_count = 0
+     for model_index, model in enumerate(args.models):
+         row = {"source": str(model), "resolved_source": str(model.resolve()), "leaves": []}
+         try:
+@@ -91,11 +92,12 @@
+                 raise ValueError("model exceeds diagnostic 16 MiB limit")
+             row["source_sha256"] = hashlib.sha256(data).hexdigest()
+             for label, envelope, info in leaves(data):
+-                if len(manifest) >= 32 or total_bytes + len(envelope) > 32 * 1024 * 1024:
++                if leaf_count >= 32 or total_bytes + len(envelope) > 32 * 1024 * 1024:
+                     raise ValueError("fixture bundle exceeds diagnostic 32 MiB limit")
+                 target = args.output / f"model-{model_index:02d}-{label}.r4skin"
+                 target.write_bytes(envelope)
+                 total_bytes += len(envelope)
++                leaf_count += 1
+                 info.update(path=str(target.resolve()), sha256=hashlib.sha256(envelope).hexdigest())
+                 row["leaves"].append(info)
+         except (OSError, ValueError, struct.error) as error:
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4ComputeSkinMetal.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#import <Metal/Metal.h>
++
++namespace xray::metal
++{
++// Shared by the independent oracle and the production native pipeline. The
++// canonical MSL separately fixes transform/dot FMA and weighted-blend rounding.
++inline MTLCompileOptions* R4ComputeSkinCompileOptions(bool diagnosticTrace = false)
++{
++    MTLCompileOptions* options = [MTLCompileOptions new];
++    options.preprocessorMacros = @{@"R4_SKIN_DIAGNOSTIC_TRACE": @(diagnosticTrace)};
++    if (@available(macOS 15.0, *))
++    {
++        options.mathMode = MTLMathModeSafe;
++        options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
++    }
++    else
++        options.fastMathEnabled = NO;
++    return options;
++}
++} // namespace xray::metal

@@ -170,7 +170,18 @@ float get_weather_weight()
 
 void set_weather_weight(float weight)
 {
-    g_pGamePersistent->Environment().set_lerp(weight);
+    CEnvironment& environment = g_pGamePersistent->Environment();
+    const bool wasPaused = environment.m_paused;
+    environment.m_paused = false;
+    environment.set_lerp(weight);
+    float materializedWeight = 0.f;
+    environment.lerp(materializedWeight);
+    environment.m_paused = wasPaused;
+}
+
+bool is_loading_screen_active()
+{
+    return load_screen_renderer.IsActive();
 }
 
 void set_weather(LPCSTR weather_name, bool forced)
@@ -635,6 +646,40 @@ void show_indicators()
 void show_weapon(bool b)
 {
 	psHUD_Flags.set(HUD_WEAPON_RT2, b);
+}
+
+static u32 parity_capture_saved_hud_flags = 0;
+static bool parity_capture_hud_hidden = false;
+
+void parity_capture_hide_hud()
+{
+    if (!parity_capture_hud_hidden)
+    {
+        parity_capture_saved_hud_flags = psHUD_Flags.get();
+        parity_capture_hud_hidden = true;
+    }
+    psHUD_Flags.zero();
+    if (CurrentGameUI())
+    {
+        CurrentGameUI()->ShowGameIndicators(false);
+        CurrentGameUI()->ShowCrosshair(false);
+        CurrentGameUI()->HideMessagesWindow();
+    }
+}
+
+void parity_capture_restore_hud()
+{
+    if (parity_capture_hud_hidden)
+    {
+        psHUD_Flags.assign(parity_capture_saved_hud_flags);
+        parity_capture_hud_hidden = false;
+    }
+    if (CurrentGameUI())
+    {
+        CurrentGameUI()->ShowGameIndicators(true);
+        CurrentGameUI()->ShowCrosshair(true);
+        CurrentGameUI()->ShowMessagesWindow();
+    }
 }
 
 bool is_level_present()
@@ -2574,6 +2619,7 @@ void CLevel::script_register(lua_State* L)
 
             def("get_weather_weight", get_weather_weight),
             def("set_weather_weight", set_weather_weight),
+            def("is_loading_screen_active", is_loading_screen_active),
             def("set_weather_smooth", set_weather_smooth),
 
 			def("environment", environment),
@@ -2629,6 +2675,8 @@ void CLevel::script_register(lua_State* L)
 
 			def("show_indicators", show_indicators),
 			def("show_weapon", show_weapon),
+            def("parity_capture_hide_hud", parity_capture_hide_hud),
+            def("parity_capture_restore_hud", parity_capture_restore_hud),
 			def("add_call", ((void (*)(const ::luabind::functor<bool>&, const ::luabind::functor<void>&))&add_call)),
 			def("add_call", ((void (*)(const ::luabind::object&, const ::luabind::functor<bool>&,
 			                           const ::luabind::functor<void>&))&add_call)),

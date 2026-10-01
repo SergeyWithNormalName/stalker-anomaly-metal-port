@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>@MACOS_BUNDLE_EXECUTABLE@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@MACOS_BUNDLE_IDENTIFIER@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@MACOS_BUNDLE_NAME@</string>
+    <key>CFBundleDisplayName</key>
+    <string>@MACOS_BUNDLE_DISPLAY_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@MACOS_BUNDLE_SHORT_VERSION_STRING@</string>
+    <key>CFBundleVersion</key>
+    <string>@MACOS_BUNDLE_VERSION@</string>
+    <key>CFBundleIconFile</key>
+    <string>@MACOS_BUNDLE_ICON_FILE@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>@MACOS_BUNDLE_MINIMUM_SYSTEM_VERSION@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>GCSupportsControllerUserInteraction</key>
+    <true/>
+    <key>GCSupportedGameControllers</key>
+    <array>
+        <dict>
+            <key>ProfileName</key>
+            <string>ExtendedGamepad</string>
+        </dict>
+    </array>
+    <!-- Spatial Audio Preparation (Deferred until Phase E10/CoreMotion integration):
+         Uncomment and provide description when CMHeadphoneMotionManager is introduced:
+    <key>NSMotionUsageDescription</key>
+    <string>Used for spatial audio head tracking with supported headphones.</string>
+    -->
+</dict>
+</plist>

@@ -27,6 +27,7 @@ public:
 	virtual void Show(bool status);
 	virtual bool OnMouseAction(float x, float y, EUIMessages mouse_action);
 	virtual bool OnMouseDown(int mouse_btn);
+	virtual bool OnKeyboardAction(int dik, EUIMessages keyboard_action);
 
 	void InitCheckButton(Fvector2 pos, Fvector2 size, LPCSTR texture_name);
 

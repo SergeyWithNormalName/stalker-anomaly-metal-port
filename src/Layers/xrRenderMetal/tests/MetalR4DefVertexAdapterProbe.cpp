@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <string>
 
+void printLuaStack() {}
+
 int main(int argc, char** argv)
 {
     if (argc != 2 || std::string(argv[1]) != "--self-test")

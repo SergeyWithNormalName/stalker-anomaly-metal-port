@@ -6,11 +6,11 @@
 #include "..\editors\ECore\stdafx.h"
 #else
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) && defined(_WIN32)
 # ifndef INGAME_EDITOR
 # define INGAME_EDITOR
 # endif // #ifndef INGAME_EDITOR
-#endif // #ifndef NDEBUG
+#endif // #if !defined(NDEBUG) && defined(_WIN32)
 
 #ifdef INGAME_EDITOR
 # define _WIN32_WINNT 0x0550

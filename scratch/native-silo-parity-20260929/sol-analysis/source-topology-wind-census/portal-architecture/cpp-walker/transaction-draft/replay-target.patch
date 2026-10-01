@@ -1,0 +1,32 @@
+--- a/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
++++ b/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
+@@ -843,6 +843,29 @@
+     )
+     target_link_libraries(XRay.Render.R4 PRIVATE XRay.Metal.R4Backend)
+ 
++    # Scratch-only source-frustum replay target. The root transaction stages
++    # the matching parser/helper/test files before configuring this target.
++    add_executable(XRay.Render.R4.PortalGraphReplayProbe
++      ../xrRenderMetal/tests/R4PortalGraphReplayProbe.cpp
++      ../xrRenderMetal/R4PortalGraphObserver.cpp
++    )
++    target_include_directories(XRay.Render.R4.PortalGraphReplayProbe PRIVATE
++      ${CMAKE_CURRENT_SOURCE_DIR}/../xrRender
++      ${CMAKE_CURRENT_SOURCE_DIR}/../xrRenderMetal
++    )
++    target_compile_definitions(XRay.Render.R4.PortalGraphReplayProbe PRIVATE
++      RENDER=4 STATIC_RENDERER_R4 USE_DX11
++    )
++    target_compile_features(XRay.Render.R4.PortalGraphReplayProbe PRIVATE cxx_std_17)
++    target_link_libraries(XRay.Render.R4.PortalGraphReplayProbe PRIVATE
++      XRay.Render.R4
++      XRay.Render.R4.ForceIncludes
++      XRay.Engine
++      XRay.Core
++      XRay.Collision
++      XRay.Metal.R4Backend
++    )
++
+     # GAMMA has two PNG payloads intentionally named *.dds.  The R4 D3DX
+     # compatibility layer decodes these through the native ImageIO framework.
+     target_link_libraries(XRay.Render.R4 PRIVATE

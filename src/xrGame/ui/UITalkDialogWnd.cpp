@@ -18,7 +18,7 @@
 #define				TALK_XML				"talk.xml"
 
 CUITalkDialogWnd::CUITalkDialogWnd()
-	: m_pNameTextFont(NULL)
+	: m_selectedQuestionIndex(-1), m_pNameTextFont(NULL)
 {
 	m_ClickedQuestionID = "";
 	mechanic_mode = false;
@@ -173,6 +173,7 @@ void CUITalkDialogWnd::ClearAll()
 void CUITalkDialogWnd::ClearQuestions()
 {
 	UIQuestionsList->Clear();
+	m_selectedQuestionIndex = -1;
 }
 
 
@@ -197,6 +198,82 @@ void CUITalkDialogWnd::AddQuestion(LPCSTR str, LPCSTR value, int number, bool b_
 	itm->SetWindowName("question_item");
 	UIQuestionsList->AddWindow(itm, true);
 	Register(itm);
+	if (m_selectedQuestionIndex < 0)
+		SelectQuestion(0, false);
+}
+
+void CUITalkDialogWnd::SelectQuestion(int index, bool scrollIntoView)
+{
+	const u32 count = UIQuestionsList->GetSize();
+	if (index < 0 || u32(index) >= count)
+		return;
+
+	for (u32 i = 0; i < count; ++i)
+	{
+		CUIQuestionItem* item = smart_cast<CUIQuestionItem*>(UIQuestionsList->GetItem(i));
+		if (item)
+			item->SetSelected(int(i) == index);
+	}
+	m_selectedQuestionIndex = index;
+
+	if (scrollIntoView)
+	{
+		// GetPadSize forces a pending relayout before measuring the selected row.
+		UIQuestionsList->GetPadSize();
+		CUIWindow* item = UIQuestionsList->GetItem(u32(index));
+		if (!item)
+			return;
+
+		Frect viewRect;
+		Frect itemRect;
+		UIQuestionsList->GetAbsoluteRect(viewRect);
+		item->GetAbsoluteRect(itemRect);
+
+		int scrollPos = UIQuestionsList->GetCurrentScrollPos();
+		if (itemRect.y1 < viewRect.y1)
+			scrollPos -= int(viewRect.y1 - itemRect.y1 + 0.99f);
+		else if (itemRect.y2 > viewRect.y2)
+			scrollPos += int(itemRect.y2 - viewRect.y2 + 0.99f);
+		UIQuestionsList->SetScrollPos(scrollPos);
+	}
+}
+
+bool CUITalkDialogWnd::MoveQuestionSelection(int delta)
+{
+	const u32 count = UIQuestionsList->GetSize();
+	if (count == 0 || delta == 0)
+		return false;
+
+	int next = m_selectedQuestionIndex;
+	if (next < 0 || u32(next) >= count)
+		next = 0;
+	else
+	{
+		next = (next + delta) % int(count);
+		if (next < 0)
+			next += int(count);
+	}
+	SelectQuestion(next, true);
+	return true;
+}
+
+bool CUITalkDialogWnd::ActivateSelectedQuestion()
+{
+	const u32 count = UIQuestionsList->GetSize();
+	if (count == 0)
+		return false;
+
+	if (m_selectedQuestionIndex < 0 || u32(m_selectedQuestionIndex) >= count)
+		SelectQuestion(0, true);
+
+	CUIQuestionItem* item = smart_cast<CUIQuestionItem*>(UIQuestionsList->GetItem(u32(m_selectedQuestionIndex)));
+	if (!item)
+		return false;
+
+	// Reuse the registered question callback so the selected item's actual
+	// dialog identifier follows the same path as a mouse activation.
+	OnQuestionClicked(item, nullptr);
+	return true;
 }
 
 
@@ -307,6 +384,20 @@ void CUIQuestionItem::Init(LPCSTR val, LPCSTR text)
 	m_text->AdjustHeightToText();
 	float new_h = _max(m_min_height, m_text->GetWndPos().y + m_text->GetHeight());
 	SetHeight(new_h);
+}
+
+void CUIQuestionItem::SetSelected(bool selected)
+{
+	CUISelectable::SetSelected(selected);
+}
+
+void CUIQuestionItem::Update()
+{
+	inherited::Update();
+	// CUI3tButton restores its state color during Update, so apply the selected
+	// row highlight afterwards. Deselecting naturally restores the XML colors.
+	if (GetSelected() && m_text)
+		m_text->TextItemControl()->SetTextColor(0xFFFFD45A);
 }
 
 void CUIQuestionItem::OnTextClicked(CUIWindow* w, void*)

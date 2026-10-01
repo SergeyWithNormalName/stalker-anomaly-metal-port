@@ -34,7 +34,14 @@ public:
 	virtual bool NeedCenterCursor() const { return m_bNeedCenterCursor; }
 	virtual bool WorkInPause() const { return m_bWorkInPause; }
 	
-	virtual bool Dispatch(int cmd, int param) { return true; }
+	virtual bool Dispatch(int cmd, int param)
+	{
+		// Reserved for controller UI navigation commands. A dialog that does
+		// not implement a command must let the native navigator handle it.
+		if (cmd >= 0x4701 && cmd <= 0x4707)
+			return false;
+		return true;
+	}
 	void ShowDialog(bool bDoHideIndicators);
 	void HideDialog();
 

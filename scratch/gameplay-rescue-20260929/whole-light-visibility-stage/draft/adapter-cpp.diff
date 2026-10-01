@@ -1,0 +1,46 @@
+--- scratch/gameplay-rescue-20260929/whole-light-visibility-stage/prestate/scene/MetalR4LocalLightAdapter.cpp	2026-09-29 13:31:27
++++ scratch/gameplay-rescue-20260929/whole-light-visibility-stage/draft/adapter/MetalR4LocalLightAdapter.cpp	2026-09-29 13:45:11
+@@ -570,13 +570,37 @@
+         draw.indexCount = volumeKind == 0u ? 540u : (volumeKind == 1u ? 96u : DU_SPHERE_PART_NUMFACES * 3u);
+         draw.indexType = R4IndexType::UInt16;
+         const auto bindDraw = [&](const std::shared_ptr<IR4GraphicsPipeline>& pipeline,
+-            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference) {
+-            return backend.BindGraphicsPipeline(pipeline,error) && backend.SetStencilReference(reference,error) && backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) && backend.BindMscResources(vsBindings,error) && backend.BindMscResources(fragmentBindings,error) && backend.DrawIndexed(draw,error);
++            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference,
++            const R4WholeLightVisibilitySample* visibilitySample) {
++            if (!backend.BindGraphicsPipeline(pipeline,error) || !backend.SetStencilReference(reference,error) ||
++                !backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) ||
++                !backend.BindMscResources(vsBindings,error) || !backend.BindMscResources(fragmentBindings,error))
++                return false;
++            if (!visibilitySample) return backend.DrawIndexed(draw,error);
++            bool resultEncoded = false;
++            // The observer is only attached to this final accumulation draw;
++            // query unavailability does not alter the ordinary draw result.
++            return backend.DrawIndexedWithVisibility(draw,*visibilitySample,resultEncoded,error);
+         };
+-        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker) ||
+-            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u) ||
+-            !bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
+-                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker)) return false;
++        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker, nullptr) ||
++            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u, nullptr)) return false;
++        const R4WholeLightVisibilitySample* visibilitySample = nullptr;
++        if (shadowRecord && state.activeVisibilityBatch >= 0)
++        {
++            const auto found = std::find_if(state.visibilitySamples.begin(), state.visibilitySamples.end(),
++                [&](const auto& sample) {
++                    return sample.engineFrame == snapshot->engineFrame &&
++                        sample.batchId == state.activeVisibilityBatch &&
++                        sample.lightId == light.lightId && sample.parentLightId == light.parentLightId &&
++                        sample.face == (light.type == R4EngineLocalLightType::OmniFace ? light.omniFace : 0u) &&
++                        sample.expectedFaceCount == (light.type == R4EngineLocalLightType::OmniFace ? 6u : 1u) &&
++                        sample.groupKind == (light.type == R4EngineLocalLightType::OmniFace ?
++                            R4WholeLightVisibilityGroupKind::OmniParent : R4WholeLightVisibilityGroupKind::SingleRecord);
++                });
++            if (found != state.visibilitySamples.end()) visibilitySample = &*found;
++        }
++        if (!bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
++                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker, visibilitySample)) return false;
+         ++m_telemetry.admitted; ++m_telemetry.submitted;
+         lightMarker.Increment();
+         // Match non-MSAA Windows increment_light_marker/reset_light_marker.

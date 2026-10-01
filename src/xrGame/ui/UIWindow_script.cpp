@@ -12,6 +12,7 @@
 #include "UIHint.h"
 #include "../ScriptXMLInit.h"
 #include "../UICursor.h"
+#include "../GamepadInput.h"
 
 CFontManager& mngr()
 {
@@ -137,6 +138,11 @@ Fvector2 GetCursorPosition_script()
 	return GetUICursor().GetCursorPosition();
 }
 
+void GamepadUiTestInput_script(int control)
+{
+	CGamepadInput::DebugUiInput(control);
+}
+
 void SetCursorPosition_script(Fvector2& pos)
 {
 	GetUICursor().SetUICursorPosition(pos);
@@ -170,6 +176,7 @@ void CUIWindow::script_register(lua_State* L)
 		def("GetFontLetterica25", &GetFontLetterica25),
 		def("GetCursorPosition", &GetCursorPosition_script),
 		def("SetCursorPosition", &SetCursorPosition_script),
+		def("GamepadUiTestInput", &GamepadUiTestInput_script),
 		def("FitInRect", &fit_in_rect),
 
 		class_<CUIWindow>("CUIWindow")
@@ -181,6 +188,12 @@ void CUIWindow::script_register(lua_State* L)
 		.def("IsAutoDelete", &CUIWindow::IsAutoDelete)
 
 		.def("IsCursorOverWindow", &CUIWindow::CursorOverWindow)
+		.def("SetGamepadFocusable", &CUIWindow::SetGamepadFocusable)
+		.def("GetGamepadFocusable", &CUIWindow::GetGamepadFocusable)
+		.def("SetGamepadFocused", &CUIWindow::SetGamepadFocused)
+		.def("GetGamepadFocused", &CUIWindow::GetGamepadFocused)
+		.def("SetGamepadRole", &CUIWindow::SetGamepadRole)
+		.def("GetGamepadRole", &CUIWindow::GetGamepadRole)
 		.def("FocusReceiveTime", &CUIWindow::FocusReceiveTime)
 		.def("GetAbsoluteRect", &CUIWindow::GetAbsoluteRect)
 

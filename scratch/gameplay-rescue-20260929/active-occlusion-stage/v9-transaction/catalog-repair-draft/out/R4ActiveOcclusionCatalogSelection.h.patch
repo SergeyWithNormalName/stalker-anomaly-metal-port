@@ -1,0 +1,16 @@
+--- prestate/R4ActiveOcclusionCatalogSelection.h	2026-09-29 19:36:48
++++ draft/R4ActiveOcclusionCatalogSelection.h	2026-09-29 19:37:26
+@@ -27,6 +27,13 @@
+ static_assert(sizeof(SourceTriangle) == 60u,
+     "Keep the V7 full-catalog storage calculation tied to the source layout");
+ 
++// Mate links are optional hints used only for certified adjacent-triangle
++// unions. Keep only final reciprocal links; positions, source indices, and
++// triangle order are immutable. This is allocation-free and returns the
++// number of fields cleared.
++std::size_t NormalizeReciprocalMateHints(SourceTriangle* triangles,
++    std::size_t triangleCount);
++
+ struct VisualRange
+ {
+     std::uint32_t visualId = 0u;

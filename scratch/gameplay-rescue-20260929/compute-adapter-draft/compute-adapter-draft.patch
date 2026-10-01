@@ -1,0 +1,791 @@
+--- scratch/gameplay-rescue-20260929/compute-adapter-draft/prestate/MetalR4DynamicWorldAdapter.cpp	2026-09-29 12:03:16
++++ scratch/gameplay-rescue-20260929/compute-adapter-draft/MetalR4DynamicWorldAdapter.cpp	2026-09-29 12:23:16
+@@ -1,6 +1,8 @@
+ #include "MetalR4DynamicWorldAdapter.h"
+ #include "R4StaticShadowIndex.h"
+ #include "R4DynamicWorldPreparedState.h"
++#include "R4ComputeSkinFoundation.h"
++#include "R4ComputeSkinPoseJournal.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -1582,6 +1584,13 @@
+         bool skinned = false;
+         bool flat = false;
+         bool lightplane = false;
++        bool computeSkinAdmissionKnown = false;
++        xray::metal::R4ComputeSkinAdmission computeSkinAdmission =
++            xray::metal::R4ComputeSkinAdmission::Invalid;
++        std::uint32_t computeSkinInfluenceCount = 0u;
++        std::uint32_t maxReferencedBoneIndex = 0u;
++        std::vector<xray::metal::R4ComputeSkinVertex> computeSkinVertices;
++        std::shared_ptr<IR4Buffer> computeSkinInput;
+     };
+     struct CachedInstance
+     {
+@@ -1595,7 +1604,10 @@
+         std::uint64_t diagnosticPoseHash = 0u;
+         std::uint64_t lastUsedGeneration = 0;
+         std::uint64_t skinPoseHash = 0;
++        std::shared_ptr<IR4Buffer> skinPoseOutput;
++        std::uint64_t skinPoseWriteSerial = 0u;
+         bool hasSkinPose = false;
++        std::uint64_t outputWriteSerial = 0u;
+         xray::metal::R4DynamicWorldPreparedState prepared;
+     };
+     std::shared_ptr<IR4GraphicsPipeline> staticPipeline;
+@@ -1616,6 +1628,12 @@
+     std::unordered_map<std::string, std::string> rejected;
+     std::unordered_set<std::string> reportedSkinSkips;
+     std::unordered_set<std::string> reportedCpuDrawDiagnostics;
++    bool computeSkinOptIn = false;
++    bool computeSkinBackendDisabled = false;
++    bool computeSkinCpuRetry = false;
++    bool computeSkinFallbackLogged = false;
++    bool computeSkinFailureLogged = false;
++    xray::metal::R4ComputeSkinFrameJournal<IR4Buffer, R4ComputeSkinJob> computeSkinJournal;
+     DynamicShadowFrameIndex shadowFrameIndex;
+     bool shadowIndexEnabled = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX") != nullptr;
+     bool shadowIndexOracle = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX_ORACLE") != nullptr;
+@@ -1702,6 +1720,8 @@
+     m_status.clear();
+     m_impl = std::make_unique<Impl>();
+     m_impl->options = options;
++    if (const char* computeFlag = std::getenv("XRAY_METAL_COMPUTE_SKIN"))
++        m_impl->computeSkinOptIn = std::strcmp(computeFlag, "1") == 0;
+     if (const char* censusFlagPath = std::getenv("XRAY_METAL_E03_CENSUS_FLAG_PATH"))
+         m_impl->e03CensusFlagPath = censusFlagPath;
+     if (options.vertexMetallibPath.empty() && options.fragmentMetallibPath.empty())
+@@ -2068,13 +2088,14 @@
+     {
+         // Readiness belongs to this invocation, not an engine-frame number.
+         // Repeated simulation frames and drawable retries must invalidate it.
+-        if (m_impl->prewarm.Begin())
+-            for (auto& instance : m_impl->instances) instance.second.prepared = {};
+         // No stale prepared snapshot may survive an early or failed Prewarm.
+         m_impl->shadowFrameIndex.Invalidate();
+         m_impl->initializeE07Profile();
+         m_impl->e07ObjectSamples.clear();
+         DiscardUnsubmittedFrame();
++        if (m_impl->prewarm.Begin())
++            for (auto& instance : m_impl->instances) instance.second.prepared = {};
++        m_impl->computeSkinJournal.Begin(m_impl->prewarm.epoch);
+     }
+     if (!m_enabled || !view.valid || !world)
+         return true;
+@@ -2135,6 +2156,43 @@
+             ++m_telemetry.hotRenderables;
+         if (!renderable.asset || renderable.asset->hasUnresolvedGeometryLinks)
+             continue;
++        std::uint64_t renderablePoseHash = 0u;
++        bool renderablePoseHashReady = false;
++        bool computePoseValidationAttempted = false;
++        bool computePoseValid = false;
++        bool computeBoneSliceAttempted = false;
++        bool computeBoneSliceReady = false;
++        R4FrameBufferSlice computeBoneSlice;
++        const auto ensureComputePose = [&]() {
++            if (computePoseValidationAttempted) return computePoseValid;
++            computePoseValidationAttempted = true;
++            if (!renderable.boneTransforms || renderable.boneTransforms->empty() ||
++                renderable.boneTransforms->size() > UINT32_MAX ||
++                renderable.boneTransforms->size() > std::numeric_limits<std::size_t>::max() /
++                    sizeof(std::array<float, 16>))
++                return false;
++            computePoseValid = true;
++            for (const auto& bone : *renderable.boneTransforms)
++                for (const float value : bone)
++                    computePoseValid = computePoseValid && std::isfinite(value);
++            return computePoseValid;
++        };
++        const auto ensureComputeBoneSlice = [&]() {
++            if (computeBoneSliceAttempted) return computeBoneSliceReady;
++            computeBoneSliceAttempted = true;
++            if (!ensureComputePose()) return false;
++            const std::size_t bytes = renderable.boneTransforms->size() * sizeof(std::array<float, 16>);
++            std::string uploadError;
++            computeBoneSliceReady = backend.UploadFrameData(renderable.boneTransforms->data(),
++                bytes, 256u, computeBoneSlice, uploadError);
++            if (!computeBoneSliceReady && !uploadError.empty() && !m_impl->computeSkinFallbackLogged)
++            {
++                std::fprintf(stderr, "METAL_COMPUTE_SKIN_FALLBACK reason=bone-upload error=\"%s\"\n",
++                    uploadError.c_str());
++                m_impl->computeSkinFallbackLogged = true;
++            }
++            return computeBoneSliceReady;
++        };
+         for (std::size_t index = 0; index < renderable.asset->geometry.size(); ++index)
+         {
+             const R4EngineWorldGeometry& source = renderable.asset->geometry[index];
+@@ -2306,8 +2364,12 @@
+             const std::array<float, 16> vp = multiplyMatrix(view.projection, view.view);
+             const std::array<float, 16> wvp = multiplyMatrix(vp, renderable.transform);
+             const std::array<float, 16> wv = multiplyMatrix(view.view, renderable.transform);
+-            const std::uint64_t diagnosticPoseHash = skinned ?
+-                hashBonePose(renderable.boneTransforms) : 0u;
++            if (skinned && !renderablePoseHashReady)
++            {
++                renderablePoseHash = hashBonePose(renderable.boneTransforms);
++                renderablePoseHashReady = true;
++            }
++            const std::uint64_t diagnosticPoseHash = skinned ? renderablePoseHash : 0u;
+             DynamicCpuVertexDiagnostic cpuVertexDiagnostic;
+             const bool collectCpuVertexDiagnostic = dynamicDrawDiagnosticsEnabled();
+             bool cpuVertexDiagnosticAvailable = false;
+@@ -2406,6 +2468,7 @@
+                             key.c_str(), renderableIndex);
+                         continue;
+                     }
++                    m_impl->computeSkinJournal.Cancel(oldest->first);
+                     m_impl->instances.erase(oldest);
+                     ++m_telemetry.instanceCachePruned;
+                 }
+@@ -2418,10 +2481,131 @@
+                 std::string localError;
+                 const std::uint64_t poseHash = diagnosticPoseHash;
+                 const bool canReuseSkinnedVertices = existing != m_impl->instances.end() &&
+-                    existing->second.skinnedVertices && existing->second.hasSkinPose &&
+-                    existing->second.skinPoseHash == poseHash;
+-                if (!canReuseSkinnedVertices)
++                    xray::metal::R4ComputeSkinPoseMatches(existing->second.hasSkinPose,
++                        existing->second.skinPoseHash, existing->second.skinPoseOutput,
++                        existing->second.skinPoseWriteSerial, poseHash,
++                        existing->second.skinnedVertices, existing->second.outputWriteSerial);
++                bool queuedGpuSkin = false;
++                if (!canReuseSkinnedVertices &&
++                    xray::metal::R4ComputeSkinShouldDispatch(m_impl->computeSkinOptIn,
++                        m_impl->computeSkinBackendDisabled, m_impl->computeSkinCpuRetry))
+                 {
++                    std::string localComputeError;
++                    Impl::CachedGeometry& cached = geometry->second;
++                    if (!cached.computeSkinAdmissionKnown)
++                    {
++                        std::string admissionError;
++                        cached.computeSkinAdmission = xray::metal::PrepareR4ComputeSkinVertices(
++                            source, std::numeric_limits<std::size_t>::max(),
++                            cached.computeSkinVertices, cached.computeSkinInfluenceCount, admissionError);
++                        cached.computeSkinAdmissionKnown = true;
++                        if (cached.computeSkinAdmission == xray::metal::R4ComputeSkinAdmission::Ready)
++                        {
++                            for (const auto& vertex : cached.computeSkinVertices)
++                                for (std::uint32_t i = 0; i < cached.computeSkinInfluenceCount; ++i)
++                                    cached.maxReferencedBoneIndex = std::max(
++                                        cached.maxReferencedBoneIndex, vertex.bones[i]);
++                        }
++                        else
++                        {
++                            cached.computeSkinVertices.clear();
++                            if (!admissionError.empty() && !m_impl->computeSkinFallbackLogged)
++                            {
++                                std::fprintf(stderr,
++                                    "METAL_COMPUTE_SKIN_FALLBACK key=%s reason=\"%s\"\n",
++                                    key.c_str(), admissionError.c_str());
++                                m_impl->computeSkinFallbackLogged = true;
++                            }
++                        }
++                    }
++                    if (cached.computeSkinAdmission == xray::metal::R4ComputeSkinAdmission::Ready &&
++                        renderable.boneTransforms &&
++                        cached.maxReferencedBoneIndex < renderable.boneTransforms->size() &&
++                        renderable.boneTransforms->size() <= UINT32_MAX &&
++                        ensureComputePose())
++                    {
++                        const std::size_t canonicalBytes = cached.computeSkinVertices.size() *
++                            sizeof(xray::metal::R4ComputeSkinVertex);
++                        if (!cached.computeSkinInput && canonicalBytes != 0u)
++                        {
++                            R4BufferDesc inputDesc{canonicalBytes, R4ResourceStorage::Private,
++                                R4BufferUsage::Generic, "R4 immutable canonical compute-skin input"};
++                            cached.computeSkinInput = resources.CreateBuffer(inputDesc,
++                                cached.computeSkinVertices.data(), canonicalBytes, localComputeError);
++                        }
++                        xray::metal::R4ComputeSkinBounds bounds;
++                        const bool boundsReady = cached.computeSkinInput &&
++                            xray::metal::CheckR4ComputeSkinBounds(cached.computeSkinVertices,
++                                cached.computeSkinInfluenceCount, *renderable.boneTransforms,
++                                renderable.transform, renderable.bounds[3], bounds, localComputeError) ==
++                                    xray::metal::R4ComputeSkinAdmission::Ready;
++                        if (boundsReady && ensureComputeBoneSlice() &&
++                            cached.computeSkinVertices.size() <= UINT32_MAX &&
++                            cached.computeSkinVertices.size() <=
++                                std::numeric_limits<std::size_t>::max() / sizeof(R4DynamicWorldSkinnedVertex))
++                        {
++                            const std::size_t outputBytes = cached.computeSkinVertices.size() *
++                                sizeof(R4DynamicWorldSkinnedVertex);
++                            bool insertedForCompute = false;
++                            if (existing == m_impl->instances.end())
++                            {
++                                existing = m_impl->instances.emplace(instanceKey,
++                                    Impl::CachedInstance{}).first;
++                                insertedForCompute = true;
++                            }
++                            Impl::CachedInstance& instance = existing->second;
++                            if (!instance.skinnedVertices || instance.skinnedVertices->Size() != outputBytes)
++                            {
++                                m_impl->computeSkinJournal.Cancel(instanceKey);
++                                R4BufferDesc outputDesc{outputBytes, R4ResourceStorage::Private,
++                                    R4BufferUsage::Vertex, "R4 dynamic OGF GPU-skinned SKIN_0 vertices"};
++                                auto replacement = resources.CreateBuffer(outputDesc, nullptr, 0u, localComputeError);
++                                if (replacement)
++                                {
++                                    instance.skinnedVertices = std::move(replacement);
++                                    instance.hasSkinPose = false;
++                                    instance.skinPoseHash = 0u;
++                                    instance.skinPoseOutput.reset();
++                                    instance.skinPoseWriteSerial = 0u;
++                                    xray::metal::AdvanceR4ComputeSkinWriteSerial(instance.outputWriteSerial);
++                                }
++                            }
++                            if (instance.skinnedVertices && instance.skinnedVertices->Size() == outputBytes)
++                            {
++                                R4ComputeSkinJob job;
++                                job.canonicalInput = cached.computeSkinInput;
++                                job.inputOffset = 0u;
++                                job.inputSize = canonicalBytes;
++                                job.bones = computeBoneSlice;
++                                job.output = instance.skinnedVertices;
++                                job.outputOffset = 0u;
++                                job.outputSize = outputBytes;
++                                job.vertexCount = static_cast<std::uint32_t>(cached.computeSkinVertices.size());
++                                job.influenceCount = cached.computeSkinInfluenceCount;
++                                job.boneCount = static_cast<std::uint32_t>(renderable.boneTransforms->size());
++                                job.maxReferencedBoneIndex = cached.maxReferencedBoneIndex;
++                                queuedGpuSkin = m_impl->computeSkinJournal.Queue(instanceKey,
++                                    std::move(job), instance.skinnedVertices, m_impl->prewarm.epoch,
++                                    instance.outputWriteSerial, poseHash);
++                            }
++                            if (!queuedGpuSkin && insertedForCompute)
++                            {
++                                m_impl->instances.erase(existing);
++                                existing = m_impl->instances.end();
++                            }
++                        }
++                    }
++                    if (!queuedGpuSkin && !localComputeError.empty() && !m_impl->computeSkinFallbackLogged)
++                    {
++                        std::fprintf(stderr,
++                            "METAL_COMPUTE_SKIN_FALLBACK key=%s reason=\"%s\"\n",
++                            key.c_str(), localComputeError.c_str());
++                        m_impl->computeSkinFallbackLogged = true;
++                    }
++                }
++                if (!canReuseSkinnedVertices && !queuedGpuSkin)
++                {
++                    m_impl->computeSkinJournal.Cancel(instanceKey);
+                     std::vector<R4DynamicWorldSkinnedVertex> repacked;
+                     PositionBounds sourceBounds;
+                     PositionBounds skinnedBounds;
+@@ -2507,7 +2691,10 @@
+                         }
+                         if (m_impl->e07ProfileEnabled)
+                             m_telemetry.e07SkinnedBytesUploaded += vertexBytes;
++                        xray::metal::AdvanceR4ComputeSkinWriteSerial(instance.outputWriteSerial);
+                         instance.skinPoseHash = poseHash;
++                        instance.skinPoseOutput = instance.skinnedVertices;
++                        instance.skinPoseWriteSerial = instance.outputWriteSerial;
+                         instance.hasSkinPose = true;
+                         existing = m_impl->instances.emplace(instanceKey, std::move(instance)).first;
+                     }
+@@ -2527,15 +2714,27 @@
+                         }
+                         if (m_impl->e07ProfileEnabled)
+                             m_telemetry.e07SkinnedBytesUploaded += vertexBytes;
++                        xray::metal::AdvanceR4ComputeSkinWriteSerial(existing->second.outputWriteSerial);
+                         existing->second.skinPoseHash = poseHash;
++                        existing->second.skinPoseOutput = existing->second.skinnedVertices;
++                        existing->second.skinPoseWriteSerial = existing->second.outputWriteSerial;
+                         existing->second.hasSkinPose = true;
+                     }
+                 }
+                 else
+-                    ++m_telemetry.skinnedVerticesReused;
++                {
++                    if (canReuseSkinnedVertices)
++                    {
++                        // A later duplicate snapshot entry may match the last
++                        // committed pose after an earlier same-key entry queued
++                        // a different provisional GPU pose.
++                        m_impl->computeSkinJournal.Cancel(instanceKey);
++                        ++m_telemetry.skinnedVerticesReused;
++                    }
++                }
+                 // Both freshly repacked and current-pose cache-hit buffers
+                 // are valid shadow inputs for this unique Prewarm invocation.
+-                if (existing != m_impl->instances.end() && existing->second.skinnedVertices)
++                if (!queuedGpuSkin && existing != m_impl->instances.end() && existing->second.skinnedVertices)
+                     existing->second.prepared.PublishSkin(m_impl->prewarm.epoch);
+             }
+             if (existing != m_impl->instances.end() && existing->second.vertexGlobals &&
+@@ -2552,6 +2751,7 @@
+                     std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s instance=%zu reason=\"%s\"\n",
+                         key.c_str(), renderableIndex, localError.empty() ?
+                         "dynamic OGF instance uniform update failed" : localError.c_str());
++                    m_impl->computeSkinJournal.Cancel(instanceKey);
+                     m_impl->instances.erase(existing);
+                     existing = m_impl->instances.end();
+                 }
+@@ -2585,6 +2785,7 @@
+             {
+                 std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s reason=\"%s\"\n", key.c_str(),
+                     error.empty() ? "dynamic OGF uniform allocation failed" : error.c_str());
++                m_impl->computeSkinJournal.Cancel(instanceKey);
+                 m_impl->instances.erase(instanceKey);
+                 error.clear();
+                 continue;
+@@ -2600,9 +2801,45 @@
+             }
+         }
+     }
+-    // Publish the new immutable owner only after all Prewarm work succeeds.
++    // Complete CPU-only Prewarm products before dispatch so no later adapter
++    // preparation can fail after provisional GPU writes have been encoded.
+     if (m_impl->shadowIndexEnabled)
+         m_impl->shadowFrameIndex.Prepare(world, m_impl->instanceSlot);
++    if (xray::metal::R4ComputeSkinShouldDispatch(m_impl->computeSkinOptIn,
++            m_impl->computeSkinBackendDisabled, m_impl->computeSkinCpuRetry) &&
++        m_impl->computeSkinJournal.QueuedJobCount() != 0u)
++    {
++        const std::vector<R4ComputeSkinJob> jobs = m_impl->computeSkinJournal.TakeJobs();
++        std::string computeError;
++        if (!backend.EncodeComputeSkinJobs(jobs, computeError))
++        {
++            m_impl->computeSkinJournal.Discard();
++            m_impl->computeSkinBackendDisabled = true;
++            if (!m_impl->computeSkinFailureLogged)
++            {
++                std::fprintf(stderr,
++                    "METAL_COMPUTE_SKIN_DISABLED frame=%u reason=pre-dispatch-no-write error=\"%s\"\n",
++                    world->engineFrame, computeError.empty() ? "backend rejected job batch" :
++                        computeError.c_str());
++                m_impl->computeSkinFailureLogged = true;
++            }
++            m_impl->computeSkinCpuRetry = true;
++            error.clear();
++            const bool cpuRetrySucceeded = Prewarm(backend, view, world, error);
++            m_impl->computeSkinCpuRetry = false;
++            return cpuRetrySucceeded;
++        }
++        for (const auto& stamp : m_impl->computeSkinJournal.Stamps())
++        {
++            if (stamp.epoch != m_impl->prewarm.epoch) continue;
++            const auto instance = m_impl->instances.find(stamp.key);
++            if (instance != m_impl->instances.end() &&
++                instance->second.skinnedVertices == stamp.output &&
++                instance->second.outputWriteSerial == stamp.writeSerial)
++                instance->second.prepared.PublishSkin(stamp.epoch);
++        }
++    }
++    // Publish the new immutable owner only after all Prewarm work succeeds.
+     m_telemetry.cachedGeometry = m_impl->geometry.size();
+     m_telemetry.rejectedGeometry = m_impl->rejected.size();
+     m_impl->pendingMotionFrame = true;
+@@ -2614,15 +2851,29 @@
+ {
+     if (!m_impl)
+         return;
++    m_impl->computeSkinJournal.Discard();
+     m_impl->pendingObjectMotion.clear();
+     m_impl->pendingMotionFrame = false;
+     m_impl->pendingMotionReset = false;
++}
++
++void MetalR4DynamicWorldAdapter::CommitSubmittedSkin()
++{
++    if (!m_impl)
++        return;
++    m_impl->computeSkinJournal.Promote(m_impl->prewarm.ReadyEpoch(),
++        [this](const std::string& key) -> Impl::CachedInstance* {
++            const auto instance = m_impl->instances.find(key);
++            return instance == m_impl->instances.end() ? nullptr : &instance->second;
++        });
+ }
+ 
+ void MetalR4DynamicWorldAdapter::CommitSubmittedFrame()
+ {
+-    if (!m_impl || !m_impl->pendingMotionFrame)
++    if (!m_impl)
+         return;
++    if (!m_impl->pendingMotionFrame)
++        return;
+ 
+     if (m_impl->pendingMotionReset)
+         m_impl->objectMotion.clear();
+--- scratch/gameplay-rescue-20260929/compute-adapter-draft/prestate/MetalR4DynamicWorldAdapter.h	2026-09-29 12:21:17
++++ scratch/gameplay-rescue-20260929/compute-adapter-draft/MetalR4DynamicWorldAdapter.h	2026-09-29 12:22:17
+@@ -130,6 +130,8 @@
+ 
+     // Must run before the scene opens its G-buffer pass: private texture
+     // uploads are intentionally prohibited while a render encoder is active.
++    // The scene calls Prewarm once per acquired backend frame. A compute-batch
++    // rejection retries CPU preparation internally before the first draw.
+     bool Prewarm(IR4Backend& backend,
+         const R4DynamicWorldViewState& view,
+         const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+@@ -137,6 +139,9 @@
+ 
+     // Object transforms are staged during Prewarm and become history only
+     // when the owning scene frame is successfully submitted.
++    // GPU skin poses are committed on every successful scene submit, even
++    // when the scene did not stage temporal view history for that frame.
++    void CommitSubmittedSkin();
+     void DiscardUnsubmittedFrame();
+     void CommitSubmittedFrame();
+     void InvalidateHistory();
+--- scratch/gameplay-rescue-20260929/compute-adapter-draft/prestate/MetalR4EngineScene.mm	2026-09-29 12:21:17
++++ scratch/gameplay-rescue-20260929/compute-adapter-draft/MetalR4EngineScene.mm	2026-09-29 12:21:39
+@@ -7245,6 +7245,7 @@
+     commitTerrainSceneUploads(impl->terrain);
+     if (impl->defVertex) impl->defVertex->CommitSubmittedFrame();
+     if (impl->defObjectsLod) impl->defObjectsLod->CommitSubmittedFrame();
++    if (impl->dynamicWorld) impl->dynamicWorld->CommitSubmittedSkin();
+     if (!impl->viewHistory.HasPending()) return;
+     impl->viewHistory.Commit();
+     if (impl->dynamicWorld) impl->dynamicWorld->CommitSubmittedFrame();
+--- /dev/null	2026-09-29 12:26:21
++++ scratch/gameplay-rescue-20260929/compute-adapter-draft/R4ComputeSkinPoseJournal.h	2026-09-29 12:19:23
+@@ -0,0 +1,140 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace xray::metal
++{
++inline std::uint64_t AdvanceR4ComputeSkinWriteSerial(std::uint64_t& serial)
++{
++    if (++serial == 0u) serial = 1u;
++    return serial;
++}
++
++inline bool R4ComputeSkinShouldDispatch(const bool optedIn, const bool backendDisabled,
++    const bool currentAttemptIsCpuRetry)
++{
++    return optedIn && !backendDisabled && !currentAttemptIsCpuRetry;
++}
++
++template<class Buffer, class Job>
++class R4ComputeSkinFrameJournal
++{
++public:
++    struct Stamp
++    {
++        std::string key;
++        std::shared_ptr<Buffer> output;
++        std::uint64_t epoch = 0u;
++        std::uint64_t writeSerial = 0u;
++        std::uint64_t poseHash = 0u;
++    };
++
++    void Begin(const std::uint64_t epoch)
++    {
++        Discard();
++        epoch_ = epoch;
++    }
++
++    bool Queue(const std::string& key, Job job, std::shared_ptr<Buffer> output,
++        const std::uint64_t epoch, const std::uint64_t writeSerial,
++        const std::uint64_t poseHash)
++    {
++        if (key.empty() || !output || epoch == 0u || epoch != epoch_ || writeSerial == 0u)
++            return false;
++        const auto jobIt = std::find_if(jobs_.begin(), jobs_.end(),
++            [&key](const QueuedJob& entry) { return entry.key == key; });
++        if (jobIt == jobs_.end())
++            jobs_.push_back({key, std::move(job)});
++        else
++            jobIt->job = std::move(job);
++
++        const auto stampIt = std::find_if(stamps_.begin(), stamps_.end(),
++            [&key](const Stamp& stamp) { return stamp.key == key; });
++        Stamp stamp{key, std::move(output), epoch, writeSerial, poseHash};
++        if (stampIt == stamps_.end())
++            stamps_.push_back(std::move(stamp));
++        else
++            *stampIt = std::move(stamp);
++        return true;
++    }
++
++    // Same-key CPU fallback, output replacement or instance erasure cancels
++    // both the queued write and its provisional submit stamp.
++    void Cancel(const std::string& key)
++    {
++        jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(),
++            [&key](const QueuedJob& entry) { return entry.key == key; }), jobs_.end());
++        stamps_.erase(std::remove_if(stamps_.begin(), stamps_.end(),
++            [&key](const Stamp& stamp) { return stamp.key == key; }), stamps_.end());
++    }
++
++    std::vector<Job> TakeJobs()
++    {
++        std::vector<Job> result;
++        result.reserve(jobs_.size());
++        for (QueuedJob& entry : jobs_)
++            result.push_back(std::move(entry.job));
++        jobs_.clear();
++        return result;
++    }
++
++    template<class Resolver>
++    void Promote(const std::uint64_t submittedEpoch, Resolver&& resolve)
++    {
++        if (submittedEpoch != 0u && submittedEpoch == epoch_)
++        {
++            for (const Stamp& stamp : stamps_)
++            {
++                if (stamp.epoch != submittedEpoch) continue;
++                auto* state = resolve(stamp.key);
++                if (!state || state->skinnedVertices != stamp.output ||
++                    state->outputWriteSerial != stamp.writeSerial)
++                    continue;
++                state->skinPoseHash = stamp.poseHash;
++                state->skinPoseOutput = stamp.output;
++                state->skinPoseWriteSerial = stamp.writeSerial;
++                state->hasSkinPose = true;
++            }
++        }
++        Discard();
++    }
++
++    void Discard()
++    {
++        jobs_.clear();
++        stamps_.clear();
++        epoch_ = 0u;
++    }
++
++    std::uint64_t Epoch() const { return epoch_; }
++    std::size_t QueuedJobCount() const { return jobs_.size(); }
++    std::size_t PendingStampCount() const { return stamps_.size(); }
++    const std::vector<Stamp>& Stamps() const { return stamps_; }
++
++private:
++    struct QueuedJob
++    {
++        std::string key;
++        Job job;
++    };
++    std::uint64_t epoch_ = 0u;
++    std::vector<QueuedJob> jobs_;
++    std::vector<Stamp> stamps_;
++};
++
++template<class Buffer>
++bool R4ComputeSkinPoseMatches(const bool hasSkinPose, const std::uint64_t committedPoseHash,
++    const std::shared_ptr<Buffer>& committedOutput, const std::uint64_t committedWriteSerial,
++    const std::uint64_t currentPoseHash, const std::shared_ptr<Buffer>& currentOutput,
++    const std::uint64_t currentWriteSerial)
++{
++    return hasSkinPose && committedOutput && committedOutput == currentOutput &&
++        committedWriteSerial != 0u && committedWriteSerial == currentWriteSerial &&
++        committedPoseHash == currentPoseHash;
++}
++} // namespace xray::metal
+--- /dev/null	2026-09-29 12:26:21
++++ scratch/gameplay-rescue-20260929/compute-adapter-draft/R4ComputeSkinPoseJournalProbe.cpp	2026-09-29 12:23:55
+@@ -0,0 +1,202 @@
++#include "R4ComputeSkinPoseJournal.h"
++
++#include <cstdio>
++#include <limits>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace
++{
++struct Output { int id = 0; };
++struct Job { int id = 0; };
++struct Instance
++{
++    std::shared_ptr<Output> skinnedVertices;
++    std::shared_ptr<Output> skinPoseOutput;
++    std::uint64_t outputWriteSerial = 0u;
++    std::uint64_t skinPoseWriteSerial = 0u;
++    std::uint64_t skinPoseHash = 0u;
++    bool hasSkinPose = false;
++};
++using Journal = xray::metal::R4ComputeSkinFrameJournal<Output, Job>;
++
++bool require(const bool value, const char* label)
++{
++    if (!value) std::fprintf(stderr, "COMPUTE_SKIN_JOURNAL FAIL %s\n", label);
++    return value;
++}
++
++bool submittedPromotionAndSlotWrap()
++{
++    Journal journal;
++    std::unordered_map<std::string, Instance> slots;
++    for (int slot = 0; slot < 3; ++slot)
++    {
++        const std::string key = "geometry:object:7:slot:" + std::to_string(slot);
++        Instance& instance = slots[key];
++        instance.skinnedVertices = std::make_shared<Output>(Output{slot});
++        instance.outputWriteSerial = xray::metal::AdvanceR4ComputeSkinWriteSerial(instance.outputWriteSerial);
++        journal.Begin(std::uint64_t(slot + 1));
++        if (!require(journal.Queue(key, Job{slot}, instance.skinnedVertices,
++                std::uint64_t(slot + 1), instance.outputWriteSerial, 0xabcdu),
++                "stage slot output")) return false;
++        const std::vector<Job> jobs = journal.TakeJobs();
++        if (!require(jobs.size() == 1u && jobs[0].id == slot && journal.PendingStampCount() == 1u,
++                "batch extraction retains pending stamp")) return false;
++        journal.Promote(std::uint64_t(slot + 1), [&slots](const std::string& name) -> Instance* {
++            const auto it = slots.find(name);
++            return it == slots.end() ? nullptr : &it->second;
++        });
++        if (!require(instance.hasSkinPose && instance.skinPoseHash == 0xabcdu,
++                "successful submit promotes matching wrapper and serial")) return false;
++    }
++    const std::string wrapped = "geometry:object:7:slot:0";
++    const Instance& instance = slots.at(wrapped);
++    if (!require(xray::metal::R4ComputeSkinPoseMatches(instance.hasSkinPose, instance.skinPoseHash,
++            instance.skinPoseOutput, instance.skinPoseWriteSerial, 0xabcdu,
++            instance.skinnedVertices, instance.outputWriteSerial), "acquired slot wrap reuses committed pose"))
++        return false;
++    return true;
++}
++
++bool retryAndRepeatedEngineFrame()
++{
++    Journal journal;
++    std::unordered_map<std::string, Instance> states;
++    Instance& instance = states["repeat-frame"];
++    instance.skinnedVertices = std::make_shared<Output>(Output{4});
++    instance.outputWriteSerial = 1u;
++    instance.skinPoseWriteSerial = 1u;
++    instance.skinPoseHash = 10u;
++    instance.skinPoseOutput = instance.skinnedVertices;
++    instance.hasSkinPose = true;
++
++    const std::uint32_t engineFrame = 77u;
++    (void)engineFrame;
++    journal.Begin(8u);
++    if (!require(journal.Queue("repeat-frame", Job{1}, instance.skinnedVertices, 8u,
++            instance.outputWriteSerial, 11u), "stage retry pose")) return false;
++    const auto firstAttempt = journal.TakeJobs();
++    if (!require(firstAttempt.size() == 1u, "first same-frame attempt queued")) return false;
++    journal.Discard(); // late drawable retry: compute was not submitted
++    if (!require(instance.hasSkinPose && instance.skinPoseHash == 10u &&
++            !xray::metal::R4ComputeSkinPoseMatches(instance.hasSkinPose, instance.skinPoseHash,
++                instance.skinPoseOutput, instance.skinPoseWriteSerial, 11u,
++                instance.skinnedVertices, instance.outputWriteSerial),
++            "discard preserves only prior committed pose")) return false;
++
++    journal.Begin(9u); // same engine frame, fresh backend acquisition epoch
++    if (!require(journal.Queue("repeat-frame", Job{2}, instance.skinnedVertices, 9u,
++            instance.outputWriteSerial, 11u), "same frame retry requeues unchanged pose")) return false;
++    const auto retryJobs = journal.TakeJobs();
++    if (!require(retryJobs.size() == 1u && retryJobs[0].id == 2,
++            "retry has a new job")) return false;
++    journal.Promote(9u, [&states](const std::string& name) -> Instance* {
++        const auto it = states.find(name);
++        return it == states.end() ? nullptr : &it->second;
++    });
++    return require(instance.skinPoseHash == 11u && instance.hasSkinPose,
++        "retry submit commits current pose");
++}
++
++bool replacementAndCpuFallbackCancel()
++{
++    Journal journal;
++    std::unordered_map<std::string, Instance> states;
++    Instance& replaced = states["replaced"];
++    replaced.skinnedVertices = std::make_shared<Output>(Output{1});
++    replaced.outputWriteSerial = 1u;
++    replaced.skinPoseOutput = replaced.skinnedVertices;
++    replaced.skinPoseWriteSerial = 1u;
++    replaced.skinPoseHash = 41u;
++    replaced.hasSkinPose = true;
++    journal.Begin(12u);
++    if (!require(journal.Queue("replaced", Job{3}, replaced.skinnedVertices,
++            12u, replaced.outputWriteSerial, 42u), "stage replaceable output")) return false;
++    const auto jobs = journal.TakeJobs();
++    if (!require(jobs.size() == 1u, "replaceable job extracted")) return false;
++    replaced.skinnedVertices = std::make_shared<Output>(Output{2});
++    xray::metal::AdvanceR4ComputeSkinWriteSerial(replaced.outputWriteSerial);
++    journal.Promote(12u, [&states](const std::string& name) -> Instance* {
++        const auto it = states.find(name);
++        return it == states.end() ? nullptr : &it->second;
++    });
++    if (!require(replaced.hasSkinPose && replaced.skinPoseHash == 41u &&
++            !xray::metal::R4ComputeSkinPoseMatches(replaced.hasSkinPose, replaced.skinPoseHash,
++                replaced.skinPoseOutput, replaced.skinPoseWriteSerial, 42u,
++                replaced.skinnedVertices, replaced.outputWriteSerial),
++            "replacement and serial change reject stale promotion and reuse")) return false;
++
++    Instance& fallback = states["same-key-fallback"];
++    fallback.skinnedVertices = std::make_shared<Output>(Output{3});
++    fallback.outputWriteSerial = 1u;
++    journal.Begin(13u);
++    if (!require(journal.Queue("same-key-fallback", Job{4}, fallback.skinnedVertices,
++            13u, fallback.outputWriteSerial, 99u), "stage job before CPU fallback")) return false;
++    journal.Cancel("same-key-fallback"); // legacy CPU update owns the output now
++    if (!require(journal.QueuedJobCount() == 0u && journal.PendingStampCount() == 0u &&
++            journal.TakeJobs().empty(), "CPU fallback cancels write and promotion")) return false;
++    journal.Promote(13u, [&states](const std::string& name) -> Instance* {
++        const auto it = states.find(name);
++        return it == states.end() ? nullptr : &it->second;
++    });
++    if (!require(!fallback.hasSkinPose, "cancelled GPU pose cannot commit")) return false;
++
++    Instance& duplicate = states["duplicate-snapshot-key"];
++    duplicate.skinnedVertices = std::make_shared<Output>(Output{5});
++    duplicate.outputWriteSerial = 2u;
++    duplicate.skinPoseWriteSerial = 2u;
++    duplicate.skinPoseHash = 100u;
++    duplicate.skinPoseOutput = duplicate.skinnedVertices;
++    duplicate.hasSkinPose = true;
++    journal.Begin(14u);
++    if (!require(journal.Queue("duplicate-snapshot-key", Job{5}, duplicate.skinnedVertices,
++            14u, duplicate.outputWriteSerial, 200u),
++            "earlier duplicate queues changed provisional pose")) return false;
++    if (xray::metal::R4ComputeSkinPoseMatches(duplicate.hasSkinPose, duplicate.skinPoseHash,
++            duplicate.skinPoseOutput, duplicate.skinPoseWriteSerial, 100u,
++            duplicate.skinnedVertices, duplicate.outputWriteSerial))
++        journal.Cancel("duplicate-snapshot-key"); // later duplicate draws committed pose A
++    if (!require(journal.QueuedJobCount() == 0u && journal.PendingStampCount() == 0u,
++            "later committed-pose duplicate cancels earlier GPU pose B")) return false;
++    journal.Promote(14u, [&states](const std::string& name) -> Instance* {
++        const auto it = states.find(name);
++        return it == states.end() ? nullptr : &it->second;
++    });
++    if (!require(duplicate.skinPoseHash == 100u && duplicate.hasSkinPose,
++            "cancelled duplicate leaves committed pose A intact")) return false;
++
++    std::uint64_t serial = std::numeric_limits<std::uint64_t>::max();
++    return require(xray::metal::AdvanceR4ComputeSkinWriteSerial(serial) == 1u,
++        "logical write serial skips zero on rollover");
++}
++
++bool backendDisableLatch()
++{
++    bool optedIn = true;
++    bool backendDisabled = false;
++    bool cpuRetry = false;
++    if (!require(xray::metal::R4ComputeSkinShouldDispatch(optedIn, backendDisabled, cpuRetry),
++            "opt-in starts enabled")) return false;
++    cpuRetry = true;
++    if (!require(!xray::metal::R4ComputeSkinShouldDispatch(optedIn, backendDisabled, cpuRetry),
++            "same-frame CPU retry skips compute")) return false;
++    cpuRetry = false;
++    backendDisabled = true;
++    if (!require(!xray::metal::R4ComputeSkinShouldDispatch(optedIn, backendDisabled, cpuRetry),
++            "backend rejection disables later frames")) return false;
++    optedIn = false;
++    return require(!xray::metal::R4ComputeSkinShouldDispatch(optedIn, false, false),
++        "default opt-out remains CPU-only");
++}
++} // namespace
++
++int main()
++{
++    if (!submittedPromotionAndSlotWrap() || !retryAndRepeatedEngineFrame() ||
++        !replacementAndCpuFallbackCancel() || !backendDisableLatch()) return 1;
++    std::puts("COMPUTE_SKIN_JOURNAL PASS submit discard retry slot-wrap replacement CPU-cancel serial-wrap backend-latch");
++    return 0;
++}

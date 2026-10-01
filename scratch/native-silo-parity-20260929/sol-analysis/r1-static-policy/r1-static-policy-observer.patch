@@ -1,0 +1,67 @@
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -1196,6 +1196,28 @@
+         if (isolateFixtureLights && Device.dwFrame%5u==0u)
+             Msg("* METAL_SHADOW_FIXTURE_LIGHTS frame=%u engine_captured=%zu selected_real_records=%zu position=%.6f,%.6f,%.6f",
+                 Device.dwFrame,capturedLights.size(),lightingFrame.lights.size(),fixtureLightPosition.x,fixtureLightPosition.y,fixtureLightPosition.z);
++        static const bool r1PolicyObserve = [] {
++            const char* flag = std::getenv("XRAY_METAL_R1_STATIC_POLICY_OBSERVE");
++            return flag && std::strcmp(flag, "1") == 0;
++        }();
++        if (r1PolicyObserve && lightingFrame.engineFrame == 360u)
++        {
++            const bool allowR1 = ps_r2_ls_flags.test(R2FLAG_R1LIGHTS);
++            std::unordered_map<std::uint64_t, std::size_t> capturedRecords;
++            for (const auto& light : lightingFrame.lights) ++capturedRecords[light.parentLightId];
++            std::unordered_set<std::uint64_t> reported;
++            for (const auto& light : lightingFrame.lights)
++                if (reported.emplace(light.parentLightId).second)
++                    std::fprintf(stderr,
++                        "METAL_R1_STATIC_PARENT frame=%u parent=%llu source_static=%u allow_r1=%u "
++                        "policy_reject=%u captured_records=%zu type=%u shadowed=%u hud=%u volumetric=%u\n",
++                        lightingFrame.engineFrame, static_cast<unsigned long long>(light.parentLightId),
++                        unsigned(light.staticLight), unsigned(allowR1), unsigned(light.staticLight && !allowR1),
++                        capturedRecords.at(light.parentLightId), unsigned(light.type), unsigned(light.shadowed),
++                        unsigned(light.hudMode), unsigned(light.volumetricEnabled));
++            std::fprintf(stderr, "METAL_R1_STATIC_CAPTURE_DONE frame=%u parents=%zu records=%zu allow_r1=%u\n",
++                lightingFrame.engineFrame, capturedRecords.size(), lightingFrame.lights.size(), unsigned(allowR1));
++        }
+ 		if (!backend->SubmitEngineLightingFrame(lightingFrame, error))
+ 		{
+ 			ReportFailure("Submit engine local lights", error);
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -3238,6 +3238,10 @@
+     std::string& error)
+ {
+     E07ShadowCpuScope e07ShadowCpu(dynamicWorld, true);
++    static const bool r1PolicyObserve = [] {
++        const char* flag = std::getenv("XRAY_METAL_R1_STATIC_POLICY_OBSERVE");
++        return flag && std::strcmp(flag, "1") == 0;
++    }();
+     const auto homBatchStart=homDiagnostic?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+     shadows.records.clear();
+     if (!shadows.ready || !snapshot || indices.size()>LocalShadowTileCapacity)
+@@ -3556,6 +3560,22 @@
+             return false;
+         record.renderedDepth = true;
+         ++shadows.renderedLights;
++        if (r1PolicyObserve && view.engineFrame == 360u)
++        {
++            const auto& light = snapshot->lights[candidates[tile].lightIndex];
++            // Source-static light policy is distinct from static geometry caster work.
++            // Snapshot values and already-produced per-tile counters only; no clock/query/draw.
++            std::fprintf(stderr,
++                "METAL_R1_STATIC_SHADOW_FACE frame=%u batch=%u tile=%zu parent=%llu light=%llu "
++                "face=%u type=%u source_static=%u material_rows=%zu static_geometry_draws=%zu "
++                "dynamic_geometry_casters=%zu flora_shadow_draws=%zu transform_bytes=%zu\n",
++                view.engineFrame, batchId, tile, static_cast<unsigned long long>(light.parentLightId),
++                static_cast<unsigned long long>(record.lightIdentity), record.face, unsigned(light.type),
++                unsigned(light.staticLight), materialEntries[tile].size(),
++                shadows.mergedEncodedDraws - homStaticBefore, shadows.submittedDynamicCasters - homDynamicBefore,
++                flora && flora->IsReady() ? flora->LastTelemetry().shadowDraws : 0u,
++                materialEntries[tile].size() * 256u);
++        }
+         if (homDiagnostic)
+         {
+             const auto index=indices[tile]; const auto& light=snapshot->lights[index];

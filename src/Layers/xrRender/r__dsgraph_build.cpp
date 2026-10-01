@@ -6,7 +6,13 @@
 #include "../../xrEngine/fmesh.h"
 #include "../../xrEngine/irenderable.h"
 #include "../../xrEngine/xr_object.h"
+#include "../../xrEngine/igame_persistent.h"
+#include "../../xrEngine/environment.h"
 #include "../../Include/xrRender/R4BackendSelection.h"
+#include "ResourceManager.h"
+#include "dxRenderDeviceRender.h"
+#include "SH_Texture.h"
+#include "xrRender_console.h"
 
 #include "flod.h"
 #include "particlegroup.h"
@@ -15,6 +21,24 @@
 #include <cstddef>
 
 using namespace R_dsgraph;
+
+namespace
+{
+struct MetalWorldCaptureShadowScope
+{
+	bool& allowed;
+	bool previous;
+
+	MetalWorldCaptureShadowScope(bool& state, const bool captureActive, const bool noShadow)
+		: allowed(state), previous(state)
+	{
+		if (captureActive && noShadow)
+			allowed = false;
+	}
+
+	~MetalWorldCaptureShadowScope() { allowed = previous; }
+};
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Scene graph actual insertion and sorting ////////////////////////////////////////////////////////
@@ -27,6 +51,71 @@ float r_ssaHZBvsTEX;
 
 namespace
 {
+void resolveMetalLightingFallback(float& outHemi, float& outSun)
+{
+	float ambient = 0.15f;
+	float hemi = 0.2f;
+	float sun = 0.0f;
+	if (g_pGamePersistent && g_pGamePersistent->Environment().CurrentEnv)
+	{
+		const CEnvDescriptor& env = *g_pGamePersistent->Environment().CurrentEnv;
+		ambient = _max(ambient, (env.ambient.x + env.ambient.y + env.ambient.z) * (1.f / 3.f));
+		hemi = _max(hemi, (env.hemi_color.x + env.hemi_color.y + env.hemi_color.z) * (0.75f / 3.f));
+		sun = (env.sun_color.x + env.sun_color.y + env.sun_color.z) * (0.75f / 3.f);
+	}
+	outHemi = _max(ambient, hemi);
+	outSun = _max(0.0f, sun * 0.25f);
+}
+
+float resolveVisualMaterialId(dxRender_Visual* visual, const std::shared_ptr<const MetalCpuVisualAsset>& asset)
+{
+	float mtl = 1.0f;
+	bool resolved = false;
+
+	if (visual)
+	{
+		CTexture* T = visual->GetTexture();
+		if (T)
+		{
+			mtl = T->m_material;
+			resolved = true;
+		}
+	}
+
+	if (!resolved && Device.m_pRender && dxRenderDeviceRender::Instance().Resources)
+	{
+		CResourceManager* resources = dxRenderDeviceRender::Instance().Resources;
+		if (asset && !asset->geometry.empty())
+		{
+			for (const auto& geom : asset->geometry)
+			{
+				if (geom.textureName.size() > 0)
+				{
+					mtl = resources->m_textures_description.GetMaterial(geom.textureName);
+					resolved = true;
+					break;
+				}
+			}
+		}
+
+		if (!resolved && visual && visual->dbg_texture.size() > 0)
+		{
+			mtl = resources->m_textures_description.GetMaterial(visual->dbg_texture);
+			resolved = true;
+		}
+	}
+
+#ifdef DEBUG
+	if (ps_r2_ls_flags.test(R2FLAG_GLOBALMATERIAL))
+		mtl = ps_r2_gmaterial;
+#endif
+
+	if (!resolved)
+		return 0.25f;
+
+	return (mtl < 5.f) ? ((mtl + 0.5f) / 4.0f) : mtl;
+}
+
 bool captureMetalParticleEffect(dxRender_Visual* visual)
 {
     if (SelectedR4Backend() != R4BackendKind::Metal || !visual || visual->Type != MT_PARTICLE_EFFECT)
@@ -219,7 +308,9 @@ void appendMetalHudScopeLeaf(xr_vector<CDSGraphManager::MetalHudRenderable::Scop
 u32 captureMetalHudRenderable(xr_vector<CDSGraphManager::MetalHudRenderable>& output,
     dxRender_Visual* visual, const Fmatrix& transform, IRenderable* object,
 	IKinematics* kinematics, const xr_vector<u32>* eligibleGeometryIndices = nullptr,
-	const xr_vector<CDSGraphManager::MetalHudRenderable::ScopeLeaf>* scopeLeaves = nullptr)
+	const xr_vector<CDSGraphManager::MetalHudRenderable::ScopeLeaf>* scopeLeaves = nullptr,
+	const xr_vector<u32>* emissiveGeometryIndices = nullptr,
+	const xr_vector<CDSGraphManager::MetalHudRenderable::SelectedShaderFlags>* geometryShaderFlags = nullptr)
 {
     CDSGraphManager::MetalHudRenderable item;
     item.assetName = visual->dbg_name;
@@ -228,11 +319,17 @@ u32 captureMetalHudRenderable(xr_vector<CDSGraphManager::MetalHudRenderable>& ou
 	// only after it verifies the captured layout.  Until then an explicit
 	// current -> previous fallback is safer than leaking an unrelated matrix.
 	item.previousTransform.set(transform);
-	item.material.set(0.f, 0.f, 0.f, 0.25f);
+	const float xmaterial = resolveVisualMaterialId(visual, visual->GetMetalCpuAsset());
+	item.material.set(0.f, 0.f, 0.f, xmaterial);
 	item.hotness.set(object ? object->GetHotness() : 0.f,
 		object ? object->GetTransparency() : 0.f, 0.f, 0.f);
 	item.hemiCubePositive.set(0.f, 0.f, 0.f, 0.f);
 	item.hemiCubeNegative.set(0.f, 0.f, 0.f, 0.f);
+
+	float fallbackHemi = 0.2f;
+	float fallbackSun = 0.0f;
+	resolveMetalLightingFallback(fallbackHemi, fallbackSun);
+
 	if (object && object->renderable_ROS())
 	{
 		CROS_impl& lighting = *static_cast<CROS_impl*>(object->renderable_ROS());
@@ -256,9 +353,22 @@ u32 captureMetalHudRenderable(xr_vector<CDSGraphManager::MetalHudRenderable>& ou
 			// available. The production HUD VS replaced its historical
 			// L_material.x path with that cube, so retain the same scalar value
 			// on every face instead of emitting an unlit first-person model.
-			item.hemiCubePositive.set(item.material.x, item.material.x, item.material.x, 0.f);
-			item.hemiCubeNegative.set(item.material.x, item.material.x, item.material.x, 0.f);
+			const float safeHemi = (item.material.x > EPS_S) ? item.material.x : fallbackHemi;
+			item.material.x = safeHemi;
+			item.hemiCubePositive.set(safeHemi, safeHemi, safeHemi, 0.f);
+			item.hemiCubeNegative.set(safeHemi, safeHemi, safeHemi, 0.f);
 		}
+		else if (item.material.x <= EPS_S)
+		{
+			item.material.x = directionalHemi;
+		}
+	}
+	else
+	{
+		item.material.x = fallbackHemi;
+		item.material.y = fallbackSun;
+		item.hemiCubePositive.set(fallbackHemi, fallbackHemi, fallbackHemi, 0.f);
+		item.hemiCubeNegative.set(fallbackHemi, fallbackHemi, fallbackHemi, 0.f);
 	}
 	item.asset = visual->GetMetalCpuAsset();
 	if (kinematics)
@@ -302,9 +412,11 @@ u32 captureMetalHudRenderable(xr_vector<CDSGraphManager::MetalHudRenderable>& ou
 	}
 	if (scopeLeaves)
 		item.scopeLeaves = *scopeLeaves;
-	if (item.eligibleGeometryIndices.empty() && item.scopeLeaves.empty())
+	if (emissiveGeometryIndices) item.emissiveGeometryIndices = *emissiveGeometryIndices;
+	if (geometryShaderFlags) item.geometryShaderFlags = *geometryShaderFlags;
+	if (item.eligibleGeometryIndices.empty() && item.scopeLeaves.empty() && item.emissiveGeometryIndices.empty())
 		return 0u;
-	const u32 admitted = u32(item.eligibleGeometryIndices.size() + item.scopeLeaves.size());
+	const u32 admitted = u32(item.eligibleGeometryIndices.size() + item.scopeLeaves.size() + item.emissiveGeometryIndices.size());
     output.push_back(std::move(item));
 	return admitted;
 }
@@ -317,7 +429,8 @@ u32 captureMetalHudLeaf(dxRender_Visual* visual, const Fmatrix& transform, IRend
 	const std::shared_ptr<const MetalCpuVisualAsset>& asset = visual->GetMetalCpuAsset();
 	if (!asset)
 		return 0u;
-	xr_vector<u32> eligibleGeometryIndices;
+	xr_vector<u32> eligibleGeometryIndices, emissiveGeometryIndices;
+	xr_vector<CDSGraphManager::MetalHudRenderable::SelectedShaderFlags> geometryShaderFlags(asset->geometry.size());
 	xr_vector<CDSGraphManager::MetalHudRenderable::ScopeLeaf> scopeLeaves;
 	eligibleGeometryIndices.reserve(asset->geometry.size());
 	scopeLeaves.reserve(asset->geometry.size());
@@ -327,13 +440,17 @@ u32 captureMetalHudLeaf(dxRender_Visual* visual, const Fmatrix& transform, IRend
 		CDSGraphManager::MetalHudRenderable::ScopeRole role;
 		if (classifyMetalHudScopeGeometry(geometry, role))
 			appendMetalHudScopeLeaf(scopeLeaves, geometryIndex, role, selectedShader, stats);
-		else if (allowOpaque && isMetalHudOpaqueGeometry(geometry))
-			eligibleGeometryIndices.push_back(geometryIndex);
-		else
-			++stats.shaderRejected;
+        else
+        {
+            const bool emissive = selectedShader && selectedShader->flags.bEmissive;
+            geometryShaderFlags[geometryIndex] = copyMetalHudSelectedShaderFlags(selectedShader);
+            if (emissive) emissiveGeometryIndices.push_back(geometryIndex);
+            if (allowOpaque && isMetalHudOpaqueGeometry(geometry)) eligibleGeometryIndices.push_back(geometryIndex);
+            else if (!emissive) ++stats.shaderRejected;
+        }
 	}
 	return captureMetalHudRenderable(output, visual, transform, object, kinematics,
-		&eligibleGeometryIndices, &scopeLeaves);
+		&eligibleGeometryIndices, &scopeLeaves, &emissiveGeometryIndices, &geometryShaderFlags);
 }
 
 u32 captureMetalHudAggregate(dxRender_Visual* visual, const Fmatrix& transform, IRenderable* object,
@@ -344,6 +461,8 @@ u32 captureMetalHudAggregate(dxRender_Visual* visual, const Fmatrix& transform, 
 	if (!asset)
 		return 0u;
 	xr_vector<u32> eligibleGeometryIndices;
+	xr_vector<u32> emissiveGeometryIndices;
+	xr_vector<CDSGraphManager::MetalHudRenderable::SelectedShaderFlags> geometryShaderFlags(asset->geometry.size());
 	xr_vector<CDSGraphManager::MetalHudRenderable::ScopeLeaf> scopeCandidates;
 	u32 scopeRoleCounts[3] = {};
 	if (!kinematics)
@@ -368,6 +487,15 @@ u32 captureMetalHudAggregate(dxRender_Visual* visual, const Fmatrix& transform, 
 				scopeCandidates.push_back(leaf);
 				++scopeRoleCounts[u32(role)];
 			}
+            // CPU-only capture has no legacy ShaderElement. This exact named
+            // source script uses the admitted flat G-buffer pair and marks
+            // both normal/l_special emissive; no texture-name inference.
+            else if (geometry.shaderName == "models\\selflightl" || geometry.shaderName == "models/selflightl")
+            {
+                eligibleGeometryIndices.push_back(geometryIndex);
+                emissiveGeometryIndices.push_back(geometryIndex);
+                geometryShaderFlags[geometryIndex].emissive = true;
+            }
 			else if (isMetalHudOpaqueGeometry(geometry))
 				eligibleGeometryIndices.push_back(geometryIndex);
 			else
@@ -395,7 +523,7 @@ u32 captureMetalHudAggregate(dxRender_Visual* visual, const Fmatrix& transform, 
 		}
 	}
 	return captureMetalHudRenderable(output, visual, transform, object, kinematics,
-		&eligibleGeometryIndices, &scopeCandidates);
+		&eligibleGeometryIndices, &scopeCandidates, &emissiveGeometryIndices, &geometryShaderFlags);
 }
 }
 
@@ -510,7 +638,7 @@ void CDSGraphManager::r_dsgraph_insert_dynamic(dxRender_Visual *pVisual, Fmatrix
 		// Scope leaves are intentionally allowed through their selected forward
 		// route. They retain that route's flags in the immutable capture record;
 		// ordinary opaque geometry still needs the exact HQ HUD selection.
-		if (selectedOpaqueHud || selectedScopeForward)
+		if (selectedOpaqueHud || selectedScopeForward || sh->flags.bEmissive)
 		{
 			if (captureMetalHudLeaf(pVisual, *xform, val_pObject, metalHudCaptureKinematics,
 				sh, selectedOpaqueHud, metalHudCaptureStats, metalHudCaptureStaging) != 0u)
@@ -677,12 +805,22 @@ void CDSGraphManager::capture_metal_world_renderable(dxRender_Visual* visual,
 	item.transform.set(*transform);
 	item.bounds = visual->getVisData().sphere;
 	item.visualType = visual->getType();
+	item.castsShadow = metalWorldCaptureObjectCastsShadow &&
+		metalWorldCaptureShadowAllowed &&
+		!visual->flags.test(IRenderVisualFlags::eNoShadow);
 	item.hotness.set(0.f, 0.f, 0.f, 0.f);
-	item.material.set(0.f, 0.f, 0.f, 0.25f);
+	const float xmaterial = resolveVisualMaterialId(visual, asset);
+	item.material.set(0.f, 0.f, 0.f, xmaterial);
 	item.hemiCubePositive.set(0.f, 0.f, 0.f, 0.f);
 	item.hemiCubeNegative.set(0.f, 0.f, 0.f, 0.f);
+
+	float fallbackHemi = 0.2f;
+	float fallbackSun = 0.0f;
+	resolveMetalLightingFallback(fallbackHemi, fallbackSun);
+
 	if (val_pObject && visual->IsMetalHeatVisionHot())
 		item.hotness.set(val_pObject->GetHotness(), val_pObject->GetTransparency(), 0.f, 0.f);
+
 	if (val_pObject && val_pObject->renderable_ROS())
 	{
 		CROS_impl& lighting = *static_cast<CROS_impl*>(val_pObject->renderable_ROS());
@@ -701,9 +839,22 @@ void CDSGraphManager::capture_metal_world_renderable(dxRender_Visual* visual,
 				_abs(item.hemiCubeNegative.z)));
 		if (!_valid(directionalHemi) || directionalHemi <= EPS_S)
 		{
-			item.hemiCubePositive.set(item.material.x, item.material.x, item.material.x, 0.f);
-			item.hemiCubeNegative.set(item.material.x, item.material.x, item.material.x, 0.f);
+			const float safeHemi = (item.material.x > EPS_S) ? item.material.x : fallbackHemi;
+			item.material.x = safeHemi;
+			item.hemiCubePositive.set(safeHemi, safeHemi, safeHemi, 0.f);
+			item.hemiCubeNegative.set(safeHemi, safeHemi, safeHemi, 0.f);
 		}
+		else if (item.material.x <= EPS_S)
+		{
+			item.material.x = directionalHemi;
+		}
+	}
+	else
+	{
+		item.material.x = fallbackHemi;
+		item.material.y = fallbackSun;
+		item.hemiCubePositive.set(fallbackHemi, fallbackHemi, fallbackHemi, 0.f);
+		item.hemiCubeNegative.set(fallbackHemi, fallbackHemi, fallbackHemi, 0.f);
 	}
 	item.asset = asset;
 	if (kinematics)
@@ -893,12 +1044,14 @@ void CDSGraphManager::add_Dynamic(IRenderVisual* piVisual, Fmatrix* xform)
 	
 	dxRender_Visual* pVisual = (dxRender_Visual*)piVisual;
 	if (!pVisual) return;
+	Flags16& flags = piVisual->flags;
+	MetalWorldCaptureShadowScope shadowScope(metalWorldCaptureShadowAllowed,
+		metalWorldCaptureActive, flags.test(IRenderVisualFlags::eNoShadow));
 	if (metalHudCaptureActive)
 		++metalHudCaptureStats.roots;
 	if (captureMetalParticleEffect(pVisual)) return;
-	Flags16& flags = piVisual->flags;
 
-	if (!metalHudCaptureActive && !i_mask[CDSGraphManager::fl_normal] &&
+	if (!metalHudCaptureActive && !metalWorldCaptureActive && !i_mask[CDSGraphManager::fl_normal] &&
 		!!flags.test(IRenderVisualFlags::eNoShadow))
 		return;
 
@@ -1011,12 +1164,14 @@ void CDSGraphManager::add_Dynamic(IRenderVisual* piVisual, Fmatrix* xform)
 void CDSGraphManager::add_Dynamic(dxRender_Visual* pVisual, Fmatrix* xform)
 {
 	if (!pVisual) return;
+	Flags16& flags = pVisual->dcast_RenderVisual()->flags;
+	MetalWorldCaptureShadowScope shadowScope(metalWorldCaptureShadowAllowed,
+		metalWorldCaptureActive, flags.test(IRenderVisualFlags::eNoShadow));
 	if (metalHudCaptureActive)
 		++metalHudCaptureStats.roots;
 	if (captureMetalParticleEffect(pVisual)) return;
-	Flags16& flags = pVisual->dcast_RenderVisual()->flags;
 
-	if (!metalHudCaptureActive && !i_mask[CDSGraphManager::fl_normal] &&
+	if (!metalHudCaptureActive && !metalWorldCaptureActive && !i_mask[CDSGraphManager::fl_normal] &&
 		!!flags.test(IRenderVisualFlags::eNoShadow))
 		return;
 

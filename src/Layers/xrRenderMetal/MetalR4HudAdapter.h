@@ -16,6 +16,10 @@ public:
     struct Options
     {
         std::filesystem::path shaderDirectory;
+        // Optional exact models_selflightl/deffer_model_flat SKIN_0 bundle.
+        std::filesystem::path emissiveShaderDirectory;
+        // Exact SKIN_4 reflection sibling used by hardware-skinned HUD emitters.
+        std::filesystem::path emissiveSkin4ShaderDirectory;
         xray::metal::R4DdsBytesProvider ddsBytesProvider;
     };
 
@@ -46,16 +50,35 @@ public:
         std::size_t rejectSkin4PaletteCapacity = 0;
         std::size_t rejectSkin4BoneCapacity = 0;
         std::size_t rejectSkin4History = 0;
+        std::size_t emissiveCandidates = 0;
+        std::size_t emissiveDraws = 0;
+        std::size_t emissiveRejected = 0;
+        std::size_t emissiveAccumulatorCandidates = 0;
+        std::size_t emissiveAccumulatorDraws = 0;
+        std::size_t emissiveAccumulatorRejected = 0;
     };
 
     bool Configure(IR4Backend& backend, const Options& options, std::string& status);
     bool Prewarm(IR4Backend& backend, const std::shared_ptr<const R4EngineHudSnapshot>& snapshot, std::string& error);
     bool Draw(IR4Backend& backend, const std::shared_ptr<const R4EngineHudSnapshot>& snapshot, std::string& error);
+    // Called by the scene-owned emissive-target pass while its BGRA8/depth
+    // attachments are active; only captured emissive-eligible HUD geometry draws.
+    bool DrawEmissive(IR4Backend& backend,
+        const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+        float pdaDisplayFactor, std::string& error);
+    // Writes the source first-accumulator contribution to a caller-owned
+    // RGBA16Float/depth-stencil pass with depth read-only and stencil ref 1.
+    bool DrawEmissiveAccumulator(IR4Backend& backend,
+        const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+        float pdaDisplayFactor, std::string& error);
     bool IsReady() const { return m_ready; }
     const std::string& Status() const { return m_status; }
     const Telemetry& LastTelemetry() const { return m_telemetry; }
 
 private:
+    bool DrawEmissiveTarget(IR4Backend& backend,
+        const std::shared_ptr<const R4EngineHudSnapshot>& snapshot,
+        float pdaDisplayFactor, bool accumulator, std::string& error);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     bool m_ready = false;

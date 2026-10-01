@@ -1,21 +1,38 @@
 #include "MetalR4EngineScene.h"
 
 #include "IR4Backend.h"
+#include "R4WholeLightVisibilitySelection.h"
+#include "R4StaticConstantGroups.h"
 #include "MetalR4EngineFs.h"
+#include "MetalR4LightHomDiagnostic.h"
+#include "MetalR4FogScatteringAdapter.h"
+#include "MetalR4LensFlareAdapter.h"
 #include "R4LocalShadowAtlasFoundation.h"
+#include "R4LocalShadowBatchPlan.h"
+#include "R4LocalLightFaceVisibility.h"
+#include "R4StaticShadowIndex.h"
+#include "R4StaticShadowMerge.h"
+#include "MetalR4VolumetricCapture.h"
 #include "R4NightVisionFoundation.h"
+#include "R4SubmittedViewHistory.h"
+#include "R4ActiveOcclusionSceneBridge.h"
+#include "R4ActiveOcclusionCatalogSelection.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -30,6 +47,127 @@
 namespace
 {
 constexpr R4ClearColor EngineSceneClearColor{0.025, 0.055, 0.105, 1.0};
+
+bool qualifyActiveOcclusionLocalVolumeShader(const std::filesystem::path& directory,
+    const char*& reason)
+{
+    try
+    {
+        constexpr const char* expectedMetallib =
+            "8c570a04d307eea059a5000eb693ed2d1e6a31f7ba1a0cf212ad961c607afc93";
+        constexpr const char* expectedReflection =
+            "2717f0d1347d142df19048da76fd04852f9a67cbb415581cfa21e80ba6b07a1c";
+        const auto metallibPath = directory / "accum_volume.vs.metallib";
+        const auto reflectionPath = directory / "accum_volume.vs.json";
+        const auto receiptPath = directory / "local-lights-msc-receipt.txt";
+        std::error_code ec;
+        const std::uintmax_t metallibSize = std::filesystem::file_size(metallibPath, ec);
+        if (ec || metallibSize == 0u || metallibSize > 1024u * 1024u)
+        { reason = "local-volume-metallib-unreadable-or-oversized"; return false; }
+        ec.clear();
+        const std::uintmax_t reflectionSize = std::filesystem::file_size(reflectionPath, ec);
+        if (ec || reflectionSize == 0u || reflectionSize > 64u * 1024u)
+        { reason = "local-volume-reflection-unreadable-or-oversized"; return false; }
+        ec.clear();
+        const std::uintmax_t receiptSize = std::filesystem::file_size(receiptPath, ec);
+        if (ec || receiptSize == 0u || receiptSize > 64u * 1024u)
+        { reason = "local-volume-receipt-unreadable-or-oversized"; return false; }
+
+        std::string metallibHash, reflectionHash;
+        if (!fileSha256(metallibPath, metallibHash) || metallibHash != expectedMetallib ||
+            !fileSha256(reflectionPath, reflectionHash) || reflectionHash != expectedReflection)
+        { reason = "local-volume-artifact-identity-mismatch"; return false; }
+
+        std::string receipt;
+        if (!readActiveOcclusionTextFileBounded(receiptPath, 64u * 1024u, receipt))
+        { reason = "local-volume-receipt-unreadable-or-oversized"; return false; }
+        if (receipt.find("source_tree_sha256=bc502abe6276487148978a7423c102079d7120a12ed8359c87eff7f1047b8494") == std::string::npos ||
+            receipt.find("msc_version=metal-irconverter version: 4.0.1") == std::string::npos ||
+            receipt.find("entry_point=main") == std::string::npos ||
+            receipt.find("common_define_args=-D SMAP_size=2048 -D FP16_FILTER=1 -D FP16_BLEND=1 -D USE_HWSMAP=1 -D USE_HWSMAP_PCF=1 -D USE_BRANCHING=1 -D USE_VTF=1 -D SM_5=1 -D SSFX_INT_GRASS=8 -D SSFX_SSR_QUALITY=0 -D SSFX_WATER_QUALITY=1 -D SSFX_WATER_PARALLAX=2 -D SSFX_IL_QUALITY=16 -D SSFX_AO_QUALITY=2 -D SSFX_POM_REFINE=0 -D SSFX_TERRA_POM_REFINE=0 -D SSFX_SSS_DIR_QUALITY=6 -D SSFX_SSS_OMNI_QUALITY=2 -D SSFX_MODEXE=1") == std::string::npos ||
+            receipt.find("output=accum_volume.vs\tdxil_sha256=1a6b903e514652d9229d84c343bd08a2841f90e1400304244f3fb70bf6bd28b8\tmetallib_sha256=8c570a04d307eea059a5000eb693ed2d1e6a31f7ba1a0cf212ad961c607afc93\treflection_sha256=2717f0d1347d142df19048da76fd04852f9a67cbb415581cfa21e80ba6b07a1c") == std::string::npos)
+        { reason = "local-volume-source-or-receipt-identity-mismatch"; return false; }
+    }
+    catch (...)
+    {
+        reason = "local-volume-qualification-failed";
+        return false;
+    }
+    reason = nullptr;
+    return true;
+}
+
+// E07 CPU encoding attribution. These intervals include nested caster work;
+// they are not GPU durations and must not be added to scene_ms.
+struct E07ShadowCpuScope
+{
+    MetalR4DynamicWorldAdapter* adapter = nullptr;
+    bool local = false;
+    std::chrono::steady_clock::time_point start{};
+    E07ShadowCpuScope(MetalR4DynamicWorldAdapter* owner, bool localShadow)
+        : local(localShadow)
+    {
+        const char* path = std::getenv("XRAY_METAL_E07_FRAMES");
+        if (owner && path && *path)
+        {
+            adapter = owner;
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~E07ShadowCpuScope()
+    {
+        if (adapter)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            adapter->AddE07ShadowCpu(local ? ms : 0.0, local ? 0.0 : ms);
+        }
+    }
+};
+
+// E06 bundles must admit the artifact bytes as well as the reflected layout.
+// Input-tree and define hashes remain in the receipted cook evidence; runtime
+// checks the exact scope/compiler plus every artifact it will load.
+static bool validateE06Receipt(const std::filesystem::path& directory,
+    const char* receiptName, const char* scope,
+    std::initializer_list<const char*> shaders, std::string& error)
+{
+    const auto path = (directory / receiptName).string();
+    NSData* data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
+    id decoded = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nullptr] : nil;
+    if (![decoded isKindOfClass:[NSDictionary class]])
+    { error = "E06 shader receipt missing or invalid: " + path; return false; }
+    NSDictionary* receipt = decoded;
+    NSString* expectedScope = [NSString stringWithUTF8String:scope];
+    if (![receipt[@"scope"] isEqual:expectedScope] ||
+        ![receipt[@"msc_version"] isKindOfClass:[NSString class]] ||
+        ![receipt[@"msc_version"] hasPrefix:@"metal-irconverter version: 4.0.1"] ||
+        ![receipt[@"dxc_version"] isKindOfClass:[NSString class]] ||
+        ![receipt[@"dxc_version"] hasPrefix:@"libdxcompiler.dylib: 1.9"] ||
+        ![receipt[@"inputs"] isKindOfClass:[NSDictionary class]] ||
+        ![receipt[@"defines"] isKindOfClass:[NSArray class]] ||
+        ![receipt[@"outputs"] isKindOfClass:[NSDictionary class]])
+    { error = "E06 shader receipt scope/compiler contract mismatch: " + path; return false; }
+    for (id define in receipt[@"defines"])
+        if (![define isKindOfClass:[NSString class]] || [define hasPrefix:@"USE_MSAA"])
+        { error = "E06 bundle must preserve the active non-MSAA defines"; return false; }
+    for (const char* shader : shaders)
+    {
+        NSDictionary* artifacts = receipt[@"outputs"][[NSString stringWithUTF8String:shader]];
+        if (![artifacts isKindOfClass:[NSDictionary class]])
+        { error = std::string("E06 receipt omits shader: ") + shader; return false; }
+        for (const char* extension : {".dxil", ".metallib", ".reflection.json"})
+        {
+            NSString* expected = artifacts[[NSString stringWithUTF8String:extension]];
+            std::string actual;
+            if (![expected isKindOfClass:[NSString class]] ||
+                !fileSha256(directory / (std::string(shader) + extension), actual) ||
+                actual != [expected UTF8String])
+            { error = std::string("E06 artifact hash mismatch: ") + shader + extension; return false; }
+        }
+    }
+    return true;
+}
 
 static bool decodePngImage(const std::vector<std::uint8_t>& bytes,
     xray::metal::R4DdsTexture& result, std::string& error)
@@ -134,10 +272,43 @@ bool hasReadableGBufferHeatTarget(const std::vector<std::shared_ptr<IR4Texture>>
 
 struct LocalShadowScene
 {
+    struct FloraPixelOracle
+    {
+        std::array<std::shared_ptr<IR4Texture>, 2> maps;
+        std::shared_ptr<IR4Texture> depth;
+        std::size_t pairs = 0u;
+        std::size_t pairsThisFrame = 0u;
+        std::size_t viewsThisFrame = 0u;
+        std::size_t firstViewThisFrame = 0u;
+        std::uint32_t lastFrame = UINT32_MAX;
+        std::unordered_set<std::string> sampledViews;
+    } floraLocalOracle, floraSunOracle;
     std::shared_ptr<IR4Texture> atlas;
     std::shared_ptr<IR4Texture> depth;
-    std::shared_ptr<IR4Buffer> transforms;
     std::vector<xray::metal::R4LocalShadowAtlasRecord> records;
+    xray::metal::R4StaticShadowIndex staticIndex;
+    bool staticLinear = std::getenv("XRAY_METAL_E08_STATIC_LINEAR") != nullptr;
+    bool sunLinear = std::getenv("XRAY_METAL_E08_SUN_LINEAR") != nullptr;
+    bool sunOracle = std::getenv("XRAY_METAL_E08_SUN_ORACLE") != nullptr;
+    std::vector<std::size_t> sunCasters;
+    std::array<std::shared_ptr<IR4Texture>, 3> sunPixelMaps;
+    std::size_t sunPixelPairs = 0;
+    struct StaticMergeEntry
+    {
+        std::vector<std::size_t> materials;
+        xray::metal::R4StaticShadowMerge::Result plan;
+        std::shared_ptr<IR4Buffer> indices;
+    };
+    bool mergeStatic = std::getenv("XRAY_METAL_E08_MERGE_STATIC_SHADOWS_OFF") == nullptr;
+    std::vector<std::vector<std::uint16_t>> mergeSourceIndices;
+    std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<StaticMergeEntry>>> mergeCache;
+    std::size_t mergeCacheBytes = 0;
+    std::size_t mergedEncodedDraws = 0;
+    bool mergeCacheSaturated = false;
+    std::shared_ptr<IR4Texture> mergePixelMap;
+    std::size_t mergePixelPairs = 0;
+    bool staticOracle = std::getenv("XRAY_METAL_E08_STATIC_ORACLE") != nullptr;
+    std::size_t oracleViews = 0;
     std::size_t candidates = 0;
     std::size_t renderedLights = 0;
     std::size_t submittedCasters = 0;
@@ -147,6 +318,8 @@ struct LocalShadowScene
     std::size_t culledDynamicCasters = 0;
     std::size_t rejectedDynamicCasters = 0;
     std::size_t omittedDynamicCasters = 0;
+    std::size_t batches = 0;
+    std::size_t transformUploadBytes = 0;
     bool ready = false;
 };
 
@@ -261,6 +434,30 @@ bool parseUnsigned(const char* value, std::uint32_t& result)
         return false;
     result = static_cast<std::uint32_t>(parsed);
     return true;
+}
+
+bool wholeLightVisibilityEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint32_t wholeLightVisibilityFirstFrame()
+{
+    static const std::uint32_t firstFrame = [] {
+        std::uint32_t parsedFrame = 300u;
+        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY_START_FRAME");
+        if (value && *value && !parseUnsigned(value, parsedFrame))
+        {
+            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=disabled reason=invalid_start_frame\n");
+            return UINT32_MAX;
+        }
+        return parsedFrame;
+    }();
+    return firstFrame;
 }
 
 bool parseControlledMaterials(
@@ -518,6 +715,7 @@ struct TerrainScene
     bool requested = false;
     bool ready = false;
     bool uploaded = false;
+    bool pendingUploaded = false;
     bool disableLogged = false;
     bool liveFrustumReported = false;
     bool gameplayFrustumReported = false;
@@ -682,6 +880,9 @@ bool prepareSkyScene(
     std::string& error)
 {
     sky = {};
+    // SSR still needs the authored sky cubemaps for its gloss pass when the
+    // optional sky2 draw bundle itself is not configured.
+    sky.ddsBytesProvider = ddsBytesProvider;
     if (shaderDirectory.empty())
         return true;
     sky.configured = true;
@@ -1417,8 +1618,9 @@ bool updateTerrainConstants(
         const Matrix4 worldViewProjection = multiply(
             scene.uniformData.viewProjection, draw.modelTransform);
         const Matrix4 worldView = multiply(scene.view, draw.modelTransform);
-        std::memcpy(vertexGlobals.data(), &worldViewProjection, sizeof(Matrix4));
-        std::memcpy(vertexGlobals.data() + 64u, &scene.uniformData.viewProjection,
+        const Matrix4 previousWorldViewProjection = multiply(scene.previousViewProjection, draw.modelTransform);
+        std::memcpy(vertexGlobals.data(), &previousWorldViewProjection, sizeof(Matrix4));
+        std::memcpy(vertexGlobals.data() + 64u, &scene.previousViewProjection,
             sizeof(Matrix4));
         std::memcpy(vertexTransforms.data(), &worldViewProjection, sizeof(Matrix4));
         std::memcpy(vertexTransforms.data() + 64u, &worldView, sizeof(Matrix4));
@@ -1426,8 +1628,8 @@ bool updateTerrainConstants(
         const float materialClass[4] = {0.0f, 0.0f, 0.0f, 0.25f};
         std::memcpy(vertexTransforms.data() + 192u, materialClass, sizeof(materialClass));
 
-        std::memcpy(fragmentGlobals.data(), &worldViewProjection, sizeof(Matrix4));
-        std::memcpy(fragmentGlobals.data() + 64u, &scene.uniformData.viewProjection,
+        std::memcpy(fragmentGlobals.data(), &previousWorldViewProjection, sizeof(Matrix4));
+        std::memcpy(fragmentGlobals.data() + 64u, &scene.previousViewProjection,
             sizeof(Matrix4));
         putFloat4(fragmentGlobals, 160u, 12.0f, 20.0f, 0.04f, 1.0f);
         putFloat4(fragmentGlobals, 176u, -0.07f, -0.05f, -0.13f, 0.0f);
@@ -1443,8 +1645,14 @@ bool updateTerrainConstants(
         putFloat4(fragmentStaticGlobals, 352u, -0.35f, -0.80f, 0.48f, 0.0f);
         putFloat4(fragmentStaticGlobals, 368u, 0.45f, 0.50f, 0.58f, 0.0f);
         putFloat4(fragmentStaticGlobals, 384u, scene.eye.x, scene.eye.y, scene.eye.z, 0.0f);
-        const float verticalTan = -std::tan(55.0f * 3.14159265358979323846f / 360.0f);
-        const float horizontalTan = -verticalTan * (16.0f / 9.0f);
+        const float fallbackVerticalTan = -std::tan(55.0f * 3.14159265358979323846f / 360.0f);
+        const float fallbackHorizontalTan = -fallbackVerticalTan * (16.0f / 9.0f);
+        const float projectionX = scene.projection.elements[0];
+        const float projectionY = scene.projection.elements[5];
+        const float horizontalTan = std::isfinite(projectionX) && std::fabs(projectionX) > 1.0e-6f ?
+            1.0f / projectionX : fallbackHorizontalTan;
+        const float verticalTan = std::isfinite(projectionY) && std::fabs(projectionY) > 1.0e-6f ?
+            -1.0f / projectionY : fallbackVerticalTan;
         putFloat4(fragmentStaticGlobals, 400u, horizontalTan, verticalTan,
             (2.0f * horizontalTan) / static_cast<float>(width),
             (2.0f * verticalTan) / static_cast<float>(height));
@@ -1474,8 +1682,11 @@ bool updateTerrainConstants(
 
 bool uploadTerrainScene(IR4Backend& backend, TerrainScene& terrain, std::string& error)
 {
-    if (!terrain.ready || terrain.uploaded)
+    if (!terrain.ready || terrain.uploaded || terrain.pendingUploaded)
         return true;
+    terrain.uploadedBytes = 0u;
+    for (TerrainTextureAsset& asset : terrain.textures)
+        asset.uploadedBytes = 0u;
     IR4Resources& resources = backend.Resources();
     for (TerrainDraw& draw : terrain.draws)
     {
@@ -1497,6 +1708,21 @@ bool uploadTerrainScene(IR4Backend& backend, TerrainScene& terrain, std::string&
             asset.uploadedBytes += mip.bytesPerImage;
             terrain.uploadedBytes += mip.bytesPerImage;
         }
+    }
+    terrain.pendingUploaded = true;
+    std::fprintf(stderr, "METAL_TERRAIN_UPLOAD_READY draws=%zu textures=%zu bytes=%llu\n",
+        terrain.draws.size(), terrain.textures.size(),
+        static_cast<unsigned long long>(terrain.uploadedBytes));
+    return true;
+}
+
+void commitTerrainSceneUploads(TerrainScene& terrain)
+{
+    if (!terrain.pendingUploaded)
+        return;
+    terrain.uploaded = true;
+    for (TerrainTextureAsset& asset : terrain.textures)
+    {
         asset.dds.bytes.clear();
         asset.dds.bytes.shrink_to_fit();
     }
@@ -1507,16 +1733,20 @@ bool uploadTerrainScene(IR4Backend& backend, TerrainScene& terrain, std::string&
         draw.indices.clear();
         draw.indices.shrink_to_fit();
     }
-    terrain.uploaded = true;
-    std::fprintf(stderr, "METAL_TERRAIN_UPLOAD_READY draws=%zu textures=%zu bytes=%llu\n",
-        terrain.draws.size(), terrain.textures.size(),
-        static_cast<unsigned long long>(terrain.uploadedBytes));
-    return true;
+    terrain.pendingUploaded = false;
+}
+
+void discardTerrainSceneUploads(TerrainScene& terrain)
+{
+    terrain.pendingUploaded = false;
+    terrain.uploadedBytes = 0u;
+    for (TerrainTextureAsset& asset : terrain.textures)
+        asset.uploadedBytes = 0u;
 }
 
 bool drawTerrainScene(IR4Backend& backend, const LevelScene& scene, TerrainScene& terrain, std::string& error)
 {
-    if (!terrain.ready || !terrain.uploaded)
+    if (!terrain.ready || (!terrain.uploaded && !terrain.pendingUploaded))
         return true;
     R4MscStageBindings vertexBindings;
     vertexBindings.stage = R4ShaderStage::Vertex;
@@ -2117,33 +2347,123 @@ bool updateSceneView(
         scene.eye = {state.eye[0], state.eye[1], state.eye[2]};
         scene.uniformData.viewProjection = multiply(scene.projection, scene.view);
     }
+    scene.previousViewProjection = scene.uniformData.viewProjection;
+    if (state.previousValid && !state.cameraCut)
+    {
+        Matrix4 previousView, previousProjection;
+        std::memcpy(previousView.elements, state.previousView.data(), sizeof(previousView.elements));
+        std::memcpy(previousProjection.elements, state.previousProjection.data(), sizeof(previousProjection.elements));
+        scene.previousViewProjection = multiply(previousProjection, previousView);
+    }
 
     IR4Resources& resources = backend.Resources();
     if (!scene.productionMsc)
         return resources.UpdateBuffer(
             scene.uniforms, 0, &scene.uniformData, sizeof(scene.uniformData), error);
 
-    for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+    const bool captureActiveOcclusionConstants = scene.activeOcclusionEnabled &&
+        state.valid && activeOcclusionFrameInWindow(state.engineFrame) &&
+        scene.activeOcclusionObservation.scopeId != 0u &&
+        scene.activeOcclusionObservation.engineFrame == state.engineFrame &&
+        !scene.activeOcclusionObservation.complete &&
+        !scene.activeOcclusionObservation.failed;
+    if (!scene.staticConstantGroupsEnabled)
     {
-        std::array<std::uint8_t, 160> vertexGlobals{};
-        std::array<std::uint8_t, 256> transforms{};
-        const Matrix4 worldViewProjection = multiply(
-            scene.uniformData.viewProjection, material.modelTransform);
-        const Matrix4 worldView = multiply(scene.view, material.modelTransform);
-        std::memcpy(vertexGlobals.data(), &worldViewProjection, sizeof(Matrix4));
-        std::memcpy(vertexGlobals.data() + 64,
-            &scene.uniformData.viewProjection, sizeof(Matrix4));
-        std::memcpy(transforms.data(), &worldViewProjection, sizeof(Matrix4));
-        std::memcpy(transforms.data() + 64, &worldView, sizeof(Matrix4));
-        std::memcpy(transforms.data() + 128, &material.modelTransform, sizeof(Matrix4));
-        const float materialClass[4] = {0.0f, 0.0f, 0.0f, 0.25f};
-        std::memcpy(transforms.data() + 192, materialClass, sizeof(materialClass));
-        if (!resources.UpdateBuffer(material.mscVertexGlobals, 0,
-                vertexGlobals.data(), vertexGlobals.size(), error) ||
-            !resources.UpdateBuffer(material.mscVertexTransforms, 0,
-                transforms.data(), transforms.size(), error) ||
-            !resources.UpdateBuffer(material.mscFragmentTransforms, 0,
-                transforms.data(), transforms.size(), error))
+        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+        {
+            if (captureActiveOcclusionConstants && material.activeOcclusionTriangleCount != 0u)
+            {
+                material.activeOcclusionConstantsValid = false;
+                material.activeOcclusionConstantsScopeId = 0u;
+                material.activeOcclusionConstantsFrame = UINT32_MAX;
+            }
+            std::array<std::uint8_t, 160> vertexGlobals{};
+            std::array<std::uint8_t, 256> transforms{};
+            const Matrix4 worldViewProjection = multiply(
+                scene.uniformData.viewProjection, material.modelTransform);
+            const Matrix4 worldView = multiply(scene.view, material.modelTransform);
+            const Matrix4 previousWorldViewProjection = multiply(scene.previousViewProjection, material.modelTransform);
+            std::memcpy(vertexGlobals.data(), &previousWorldViewProjection, sizeof(Matrix4));
+            std::memcpy(vertexGlobals.data() + 64,
+                &scene.previousViewProjection, sizeof(Matrix4));
+            std::memcpy(transforms.data(), &worldViewProjection, sizeof(Matrix4));
+            std::memcpy(transforms.data() + 64, &worldView, sizeof(Matrix4));
+            std::memcpy(transforms.data() + 128, &material.modelTransform, sizeof(Matrix4));
+            const float materialClass[4] = {0.0f, 0.0f, 0.0f, 0.25f};
+            std::memcpy(transforms.data() + 192, materialClass, sizeof(materialClass));
+            if (!resources.UpdateBuffer(material.mscVertexGlobals, 0,
+                    vertexGlobals.data(), vertexGlobals.size(), error) ||
+                !resources.UpdateBuffer(material.mscVertexTransforms, 0,
+                    transforms.data(), transforms.size(), error) ||
+                !resources.UpdateBuffer(material.mscFragmentTransforms, 0,
+                    transforms.data(), transforms.size(), error))
+                return false;
+            if (captureActiveOcclusionConstants && material.activeOcclusionTriangleCount != 0u)
+            {
+                // Keep the exact bytes submitted to the two shader constant buffers.
+                std::memcpy(material.activeOcclusionUploadedWvp.data(), transforms.data(),
+                    sizeof(material.activeOcclusionUploadedWvp));
+                std::memcpy(material.activeOcclusionUploadedJitter.data(), vertexGlobals.data() + 128u,
+                    sizeof(material.activeOcclusionUploadedJitter));
+                material.activeOcclusionConstantsScopeId =
+                    scene.activeOcclusionObservation.scopeId;
+                material.activeOcclusionConstantsFrame = state.engineFrame;
+                material.activeOcclusionConstantsValid = true;
+            }
+        }
+    }
+    else
+    {
+        const auto invalidateActiveConstants = [&scene, captureActiveOcclusionConstants]() {
+            if (!captureActiveOcclusionConstants)
+                return;
+            for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+            {
+                if (material.activeOcclusionTriangleCount == 0u)
+                    continue;
+                xray::metal::InvalidateR4StaticConstantOcclusionStamp(
+                    material.activeOcclusionConstantsScopeId,
+                    material.activeOcclusionConstantsFrame,
+                    material.activeOcclusionConstantsValid);
+            }
+        };
+        const bool groupedUpdateSucceeded = xray::metal::ApplyR4StaticConstantGroupUpdates(
+            scene.staticConstantGroupPlan,
+            captureActiveOcclusionConstants,
+            [&scene](const std::size_t, const std::size_t representative,
+                xray::metal::R4StaticConstantPayload& payload) {
+                const LevelScene::TextureMaterial& material = scene.textureMaterials[representative];
+                payload = xray::metal::BuildR4StaticConstantFramePayload(
+                    material.modelTransform, scene.uniformData.viewProjection, scene.view,
+                    scene.previousViewProjection, multiply);
+                return true;
+            },
+            [&scene, &resources, &error](const std::size_t groupIndex,
+                const xray::metal::R4StaticConstantPayload& payload) {
+                const LevelScene::StaticConstantBufferGroup& group =
+                    scene.staticConstantBufferGroups[groupIndex];
+                return resources.UpdateBuffer(group.mscVertexGlobals, 0,
+                           payload.vertexGlobals.data(), payload.vertexGlobals.size(), error) &&
+                    resources.UpdateBuffer(group.mscVertexTransforms, 0,
+                           payload.vertexTransforms.data(), payload.vertexTransforms.size(), error) &&
+                    resources.UpdateBuffer(group.mscFragmentTransforms, 0,
+                           payload.fragmentTransforms.data(), payload.fragmentTransforms.size(), error);
+            },
+            [&scene, &state, captureActiveOcclusionConstants](const std::size_t materialIndex,
+                const std::size_t, const xray::metal::R4StaticConstantPayload& payload) {
+                LevelScene::TextureMaterial& material = scene.textureMaterials[materialIndex];
+                if (!captureActiveOcclusionConstants || material.activeOcclusionTriangleCount == 0u)
+                    return;
+                xray::metal::PublishR4StaticConstantOcclusionStamp(
+                    material.activeOcclusionUploadedWvp,
+                    material.activeOcclusionUploadedJitter,
+                    material.activeOcclusionConstantsScopeId,
+                    material.activeOcclusionConstantsFrame,
+                    material.activeOcclusionConstantsValid,
+                    payload, scene.activeOcclusionObservation.scopeId, state.engineFrame);
+            },
+            invalidateActiveConstants);
+        if (!groupedUpdateSucceeded)
             return false;
     }
     std::uint32_t width = 0;
@@ -2166,6 +2486,34 @@ bool prepareLocalShadowScene(IR4Backend& backend, const LevelScene& scene,
         error = "local shadow atlas requires the converted opaque caster pipeline";
         return false;
     }
+    // The index has exactly the level-scene lifetime; Prepare recreates both
+    // materials and this owner. Animation and camera visibility are not keys.
+    for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i)
+    {
+        const auto& m = scene.textureMaterials[i];
+        shadows.staticIndex.Add(m.localPositionBounds.available, m.localPositionBounds.minimum,
+            m.localPositionBounds.maximum, m.modelTransform.elements, i);
+    }
+    shadows.staticIndex.Finish();
+    if (shadows.mergeStatic || std::getenv("XRAY_METAL_E08_STATIC_MERGE_PIXEL_ORACLE_DIR"))
+    {
+        shadows.mergeSourceIndices.resize(scene.textureMaterials.size());
+        for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i)
+        {
+            const auto& m = scene.textureMaterials[i];
+            if (m.indexBufferId >= scene.geometry.indexBuffers.size())
+            { error = "E08 static merge source index buffer unavailable"; return false; }
+            const auto& source = scene.geometry.indexBuffers[m.indexBufferId];
+            const std::size_t offset = source.dataOffset + std::size_t(m.indexBase) * 2u;
+            const std::size_t bytes = std::size_t(m.indexCount) * 2u;
+            if (m.indexBase > source.indexCount || m.indexCount > source.indexCount - m.indexBase ||
+                offset > scene.geometryBytes.size() || bytes > scene.geometryBytes.size() - offset)
+            { error = "E08 static merge source index span exceeds geometry"; return false; }
+            auto& indices = shadows.mergeSourceIndices[i];
+            indices.resize(m.indexCount);
+            if (bytes) std::memcpy(indices.data(), scene.geometryBytes.data() + offset, bytes);
+        }
+    }
     R4Texture2DDesc atlasDesc;
     atlasDesc.width = LocalShadowAtlasExtent;
     atlasDesc.height = LocalShadowAtlasExtent;
@@ -2179,93 +2527,747 @@ bool prepareLocalShadowScene(IR4Backend& backend, const LevelScene& scene,
     depthDesc.usage = R4TextureUsage::RenderTarget;
     depthDesc.label = "R4 local-light shadow atlas depth";
     shadows.depth = backend.Resources().CreateTexture2D(depthDesc, error);
-    const std::size_t transformCount = LocalShadowTileCapacity * scene.textureMaterials.size();
-    if (transformCount > std::numeric_limits<std::size_t>::max() / 256u)
-    {
-        error = "local shadow transform arena size overflow";
-        return false;
-    }
-    R4BufferDesc transformDesc;
-    transformDesc.size = transformCount * 256u;
-    transformDesc.storage = R4ResourceStorage::Shared;
-    transformDesc.usage = R4BufferUsage::Uniform;
-    transformDesc.label = "R4 local-light shadow caster transforms";
-    shadows.transforms = backend.Resources().CreateBuffer(transformDesc, nullptr, 0u, error);
-    shadows.ready = shadows.atlas && shadows.depth && shadows.transforms;
+    shadows.ready = shadows.atlas && shadows.depth;
     if (!shadows.ready && error.empty())
         error = "local shadow atlas resource allocation failed";
     return shadows.ready;
 }
 
-bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
-    LocalShadowScene& shadows, const MetalR4EngineScene::ViewState& view,
+R4FloraViewState makeFloraView(const MetalR4EngineScene::ViewState& view,
+    const R4EnvironmentSnapshot& environment, const R4DetailGrassMotionSnapshot& motion,
+    const std::shared_ptr<IR4Buffer>& staticGlobals)
+{
+    R4FloraViewState result;
+    result.view=view.view; result.projection=view.projection;
+    result.previousView=view.previousView; result.previousProjection=view.previousProjection;
+    result.eye=view.eye; result.staticGlobals=staticGlobals;
+    result.timeSeconds=environment.globalTime; result.treeScaleBiasCorrection=environment.treeScaleBiasCorrection;
+    result.previousBenders=motion.previousBenders; result.currentBenders=motion.currentBenders;
+    result.bendersSetup=motion.bendersSetup; result.windParams=motion.windParams;
+    result.windSetupGrass=motion.windSetupGrass; result.windSetupTrees=motion.windSetupTrees;
+    result.windAnimation=motion.windAnimation; result.windAnimationPrevious=motion.windAnimationPrevious;
+    result.windValid=motion.valid; result.valid=view.valid; result.previousValid=view.previousValid;
+    return result;
+}
+R4DetailGrassViewState makeDetailView(const MetalR4EngineScene::ViewState& view,
+    const R4EnvironmentSnapshot& environment)
+{
+    R4DetailGrassViewState result;
+    result.view=view.view; result.projection=view.projection;
+    result.previousView=view.previousView; result.previousProjection=view.previousProjection;
+    result.eye=view.eye; result.timeSeconds=environment.globalTime;
+    result.ambient=environment.ambient; result.hemiColor=environment.hemiColor;
+    result.sunColor=environment.adaptedSunColor; result.sunDirection=environment.adaptedSunDirection;
+    result.fogColor=environment.fogColor; result.fogDensity=environment.fogDensity;
+    result.fogNear=environment.fogNear; result.fogFar=environment.fogFar;
+    result.valid=view.valid&&environment.valid; result.previousValid=view.previousValid;
+    return result;
+}
+bool sphereOutsideMainView(const std::array<float,3>& center, float radius, const Matrix4& vp)
+{
+    for (unsigned plane=0;plane<5;++plane)
+    {
+        const unsigned row=plane<4 ? plane/2 : 2;
+        const float sign=plane<4 && plane%2==0 ? 1.0f : -1.0f;
+        float normal[3];
+        for (unsigned i=0;i<3;++i) normal[i]=vp.elements[3+4*i]+sign*vp.elements[row+4*i];
+        const float d=vp.elements[15]+sign*vp.elements[row+12];
+        const float distance=normal[0]*center[0]+normal[1]*center[1]+normal[2]*center[2]+d;
+        if (distance < -radius*std::sqrt(normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2])) return true;
+    }
+    return false;
+}
+
+bool planLocalShadowBatches(const MetalR4EngineScene::ViewState& view,
     const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
-    MetalR4DynamicWorldAdapter* dynamicWorld,
+    const R4EnvironmentSnapshot& environment,
+    std::vector<std::vector<std::size_t>>& batches, std::vector<std::size_t>& unshadowed,
     std::string& error)
 {
-    shadows.records.clear();
-    shadows.candidates = shadows.renderedLights = shadows.submittedCasters =
-        shadows.culledCasters = shadows.omittedDynamicCasters = 0u;
-    shadows.dynamicCandidates = shadows.submittedDynamicCasters =
-        shadows.culledDynamicCasters = shadows.rejectedDynamicCasters = 0u;
-    if (!shadows.ready || !view.valid || !snapshot ||
-        snapshot->engineFrame == std::numeric_limits<std::uint32_t>::max())
-        return true;
-    struct Candidate { std::size_t lightIndex; float score; };
-    std::vector<Candidate> candidates;
-    Matrix4 cameraView{};
-    Matrix4 cameraProjection{};
+    batches.clear(); unshadowed.clear();
+    if (!view.valid || !snapshot || snapshot->engineFrame == UINT32_MAX) return true;
+    Matrix4 cameraView{}, cameraProjection{};
     std::memcpy(cameraView.elements, view.view.data(), sizeof(cameraView));
     std::memcpy(cameraProjection.elements, view.projection.data(), sizeof(cameraProjection));
-    const Matrix4 viewProjection = multiply(cameraProjection, cameraView);
-    xray::metal::R4PositionBounds spotBounds;
-    spotBounds.available = true;
-    spotBounds.minimum = {-0.5f, -0.5f, 0.0f};
-    spotBounds.maximum = {0.5f, 0.5f, 1.0f};
-	xray::metal::R4PositionBounds omniBounds;
-	omniBounds.available = true;
-	omniBounds.minimum = {-1.0f, -1.0f, -1.0f};
-	omniBounds.maximum = {1.0f, 1.0f, 1.0f};
-    for (std::size_t index = 0; index < snapshot->lights.size(); ++index)
+    const Matrix4 viewProjection=multiply(cameraProjection,cameraView);
+    std::vector<xray::metal::R4LocalShadowBatchCandidate> candidates;
+    std::unordered_set<std::uint64_t> visibleParents;
+    for (std::size_t index=0;index<snapshot->lights.size();++index)
     {
-        const R4EngineLocalLight& light = snapshot->lights[index];
-        const float directionLength2 = light.direction[0]*light.direction[0] +
-            light.direction[1]*light.direction[1] + light.direction[2]*light.direction[2];
-        if (!light.active || !light.shadowed || light.type == R4EngineLocalLightType::Point ||
-            !std::isfinite(light.range) || !std::isfinite(light.cone) ||
-            !std::isfinite(light.virtualSize) || light.range <= light.virtualSize ||
-            light.virtualSize <= 0.0f || light.cone <= 0.0f || light.cone >= 3.0805f ||
-            !std::isfinite(directionLength2) || directionLength2 <= 1.0e-8f)
-            continue;
-        const Matrix4 volume = makeSpotVolumeModel(light);
-		const xray::metal::R4PositionBounds& volumeBounds =
-			light.type == R4EngineLocalLightType::OmniFace ? omniBounds : spotBounds;
-        if (!finiteMatrix(volume) || conservativelyOutsideMetalFrustum(
-                volumeBounds, volume, viewProjection, true))
-            continue;
-        const float dx = light.position[0] - view.eye[0];
-        const float dy = light.position[1] - view.eye[1];
-        const float dz = light.position[2] - view.eye[2];
-        candidates.push_back({index, dx*dx + dy*dy + dz*dz});
+        const auto& light=snapshot->lights[index];
+        if (!light.shadowed) { unshadowed.push_back(index); continue; }
+        if (!light.active) continue;
+        const float length2=light.direction[0]*light.direction[0]+light.direction[1]*light.direction[1]+light.direction[2]*light.direction[2];
+        if (light.type==R4EngineLocalLightType::Point || !std::isfinite(light.range) ||
+            !std::isfinite(light.cone) || !std::isfinite(light.virtualSize) ||
+            light.range<=light.virtualSize || light.virtualSize<=0 || light.cone<=0 ||
+            light.cone>=3.0805f || !std::isfinite(length2) || length2<=1.e-8f)
+        {
+            std::fprintf(stderr, "METAL_E08_INVALID_SHADOW_LIGHT frame=%u id=%llu parent=%llu type=%u range=%.9g cone=%.9g virtual=%.9g dir=%.9g,%.9g,%.9g active=%d\n",
+                snapshot->engineFrame, (unsigned long long)light.lightId, (unsigned long long)light.parentLightId,
+                static_cast<unsigned>(light.type), light.range, light.cone, light.virtualSize,
+                light.direction[0], light.direction[1], light.direction[2], light.active);
+            error="invalid captured shadowed local light"; return false;
+        }
+        const bool omni=light.type==R4EngineLocalLightType::OmniFace;
+        candidates.push_back({index,light.lightId,light.parentLightId,light.omniFace,omni});
+        xray::metal::R4PositionBounds bounds;
+        bounds.available=true;
+        bounds.minimum=omni?std::array<float,3>{-1,-1,-1}:std::array<float,3>{-.5f,-.5f,0};
+        bounds.maximum=omni?std::array<float,3>{1,1,1}:std::array<float,3>{.5f,.5f,1};
+        const Matrix4 volume=makeSpotVolumeModel(light);
+        if (!finiteMatrix(volume)) { error="nonfinite local shadow volume"; return false; }
+        if (!conservativelyOutsideMetalFrustum(bounds,volume,viewProjection,true))
+            visibleParents.insert(omni?light.parentLightId:light.lightId);
     }
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
-        return left.score < right.score;
-    });
-    shadows.candidates = candidates.size();
-    if (candidates.size() > LocalShadowTileCapacity)
-        candidates.resize(LocalShadowTileCapacity);
-    if (candidates.empty())
+    // Validate the complete source snapshot before visibility filtering. A
+    // parent enters with all six faces when any of its volumes can contribute.
+    std::vector<std::vector<std::size_t>> validated;
+    if (!xray::metal::PlanR4LocalShadowBatches(candidates,validated,error)) return false;
+    candidates.erase(std::remove_if(candidates.begin(),candidates.end(),[&](const auto& c) {
+        return !visibleParents.count(c.omni?c.parentId:c.lightId);
+    }),candidates.end());
+    if (!xray::metal::PlanR4LocalShadowBatches(candidates,batches,error)) return false;
+    static const bool faceCull=[] {
+        const char* value=std::getenv("XRAY_METAL_LOCAL_LIGHT_FACE_CULL");
+        return value && !std::strcmp(value,"1");
+    }();
+    // Preserve the old complete-six-face witness contract when that diagnostic
+    // is requested. Pixel parity for face culling uses the color-phase capture.
+    const char* batchProbe=std::getenv("XRAY_METAL_LOCAL_SHADOW_BATCH_PROBE_DIR");
+    if (faceCull && batchProbe && *batchProbe)
+    {
+        static bool logged=false;
+        if (!logged) std::fprintf(stderr,"METAL_LOCAL_LIGHT_FACE_CULL status=bypassed reason=complete_face_batch_witness\n");
+        logged=true;
         return true;
+    }
+    if (!faceCull || !environment.valid ||
+        environment.engineFrame!=view.engineFrame || snapshot->engineFrame!=view.engineFrame ||
+        view.engineFrame==UINT32_MAX || !finiteMatrix(viewProjection) ||
+        !std::isfinite(snapshot->shadowDepthScale) || !std::isfinite(snapshot->shadowDepthBias)) return true;
+    std::unordered_set<std::uint64_t> exemptParents;
+    for (const auto& light:snapshot->lights)
+        if (light.type==R4EngineLocalLightType::OmniFace &&
+            !xray::metal::R4LocalLightFaceMayBeCulled(light,environment))
+            exemptParents.insert(light.parentLightId);
+    std::array<float,16> vp{};
+    std::memcpy(vp.data(),viewProjection.elements,sizeof(viewProjection));
+    const Matrix4 inverseView=inverseRigidTransform(cameraView);
+    if (!finiteMatrix(inverseView)) return true;
+    std::size_t before=0, eligible=0, exempt=0, unknown=0, removed=0;
+    for (auto& batch:batches)
+    {
+        before+=batch.size();
+        batch.erase(std::remove_if(batch.begin(),batch.end(),[&](std::size_t index) {
+            const auto& light=snapshot->lights[index];
+            if (light.type!=R4EngineLocalLightType::OmniFace) return false;
+            if (exemptParents.count(light.parentLightId)) { ++exempt; return false; }
+            ++eligible;
+            std::array<float,3> minimum{},maximum{};
+            if (!BuildMetalR4LocalLightVolumeBounds(light,minimum,maximum)) { ++unknown; return false; }
+            if (!xray::metal::R4LocalLightFaceBoundsOutsideView(minimum,maximum,vp)) return false;
+            // Culling must not hide a malformed shadow source. Check the same
+            // projection/derived-matrix admission used by its tile; uncertainty
+            // retains the record so the normal renderer reports the error.
+            const Matrix4 lightView=makeR4SpotLightView(light);
+            const Matrix4 lightProjection=makeR4SpotLightProjection(light);
+            if (!light.lightId || !finiteMatrix(lightView) || !finiteMatrix(lightProjection) ||
+                !finiteMatrix(multiply(lightProjection,lightView))) { ++unknown; return false; }
+            xray::metal::R4LocalShadowAtlasRecord proof;
+            proof.atlasSize=LocalShadowTileSize; proof.atlasExtent=LocalShadowAtlasExtent;
+            std::memcpy(proof.lightView.data(),lightView.elements,sizeof(lightView));
+            std::memcpy(proof.lightProjection.data(),lightProjection.elements,sizeof(lightProjection));
+            std::memcpy(proof.deviceInverseView.data(),inverseView.elements,sizeof(inverseView));
+            std::string proofError;
+            if (!xray::metal::DeriveR4LocalShadowMatrix(proof,snapshot->shadowDepthScale,
+                    snapshot->shadowDepthBias,proof.shadowMatrix,proofError) ||
+                !xray::metal::DeriveR4LocalLightMapMatrix(proof,snapshot->shadowDepthScale,
+                    snapshot->shadowDepthBias,proof.lightMapMatrix,proofError)) { ++unknown; return false; }
+            ++removed;
+            return true;
+        }),batch.end());
+    }
+    batches.erase(std::remove_if(batches.begin(),batches.end(),[](const auto& batch) {
+        return batch.empty();
+    }),batches.end());
+    // A removed record cannot produce accumulator fragments. Its complete
+    // shadow tile and all caster families are consequently unnecessary; caster
+    // admission for the remaining records still uses each light's own frustum.
+    if (view.engineFrame%120u==0u)
+        std::fprintf(stderr,"METAL_LOCAL_LIGHT_FACE_CULL frame=%u before=%zu eligible=%zu exempt=%zu unknown=%zu removed=%zu remaining=%zu batches=%zu\n",
+            view.engineFrame,before,eligible,exempt,unknown,removed,before-removed,batches.size());
+    return true;
+}
 
+struct ActiveOcclusionGridStats
+{
+    R4ActiveOcclusion::BuildStats build{};
+    std::uint64_t scopeId = 0u;
+    std::size_t drawsUsed = 0u;
+    std::size_t drawsSkipped = 0u;
+    std::size_t receiptsSeen = 0u;
+    std::size_t selectedDraws = 0u;
+    std::uint64_t receiptTriangles = 0u;
+    std::uint64_t selectedTriangles = 0u;
+    std::uint64_t omittedReceiptTriangles = 0u;
+    std::size_t selectorInvalidReceipts = 0u;
+    std::size_t selectorDuplicateReceipts = 0u;
+    std::size_t selectorUnknownProjection = 0u;
+    std::size_t selectorOutsideViewport = 0u;
+    std::size_t selectorBudgetOmissions = 0u;
+    std::uint32_t selectionBudget = 0u;
+    std::size_t sourcePairs = 0u;
+    bool ready = false;
+    bool sourceTriangleCap = false;
+    const char* reason = "not-attempted";
+    double buildMs = 0.0;
+    double queryMs = 0.0;
+    std::uint64_t queryCellTests = 0u;
+    std::size_t inputTriangles = 0u;
+    bool queryCellCap = false;
+    bool queryInvalid = false;
+};
+
+bool buildActiveOcclusionGrid(LevelScene& scene,
+    const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+    const std::vector<R4WholeLightVisibilitySample>& samples,
+    R4ActiveOcclusion::CoverageGrid& grid, ActiveOcclusionGridStats& result)
+{
+    const auto buildStart = std::chrono::steady_clock::now();
+    const auto& observation = scene.activeOcclusionObservation;
+    if (!snapshot || samples.empty() || !observation.scopeId || !observation.complete ||
+        observation.failed || observation.engineFrame != snapshot->engineFrame ||
+        observation.viewportWidth == 0u || observation.viewportHeight == 0u)
+    {
+        result.reason = "scope-or-selection-unavailable";
+        result.buildMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - buildStart).count();
+        return false;
+    }
+
+    result.scopeId = observation.scopeId;
+    try
+    {
+        using namespace xray::metal::active_occlusion_catalog;
+        SelectionResult selection;
+        if (!SelectCurrentView(scene.activeOcclusionSourceCatalog,
+                observation.admittedDraws.data(), observation.admittedDraws.size(),
+                observation.scopeId, observation.engineFrame,
+                observation.viewportWidth, observation.viewportHeight,
+                ViewportYDirection::ClipPositiveYMapsToLowerPixelY, selection,
+                kStartingTriangleBudget, kMaximumDrawReceipts))
+        {
+            result.reason = "catalog-current-view-selection-failed";
+            result.buildMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - buildStart).count();
+            return false;
+        }
+        result.receiptsSeen = observation.admittedDraws.size();
+        result.selectedDraws = selection.stats.receiptsSelected;
+        result.selectedTriangles = selection.stats.selectedTriangles;
+        result.selectionBudget = selection.stats.effectiveTriangleBudget;
+        result.selectorInvalidReceipts = selection.stats.invalidReceipt;
+        result.selectorDuplicateReceipts = selection.stats.duplicateReceipt;
+        result.selectorUnknownProjection = selection.stats.unknownProjection;
+        result.selectorOutsideViewport = selection.stats.outsideViewport;
+        result.selectorBudgetOmissions = selection.stats.omittedByTriangleBudget;
+        for (const auto& receipt : observation.admittedDraws)
+            result.receiptTriangles += receipt.triangleCount;
+
+        std::vector<R4ActiveOcclusionBridge::SourceTriangle> source;
+        source.reserve(static_cast<std::size_t>(selection.stats.selectedTriangles));
+        struct PreparedDraw
+        {
+            const DrawReceipt* receipt = nullptr;
+            std::size_t firstSourceTriangle = 0u;
+            std::uint32_t triangleCount = 0u;
+        };
+        std::vector<PreparedDraw> prepared;
+        prepared.reserve(selection.draws.size());
+        for (const SelectedDraw& chosen : selection.draws)
+        {
+            if (chosen.receiptIndex >= observation.admittedDraws.size())
+            {
+                ++result.drawsSkipped;
+                continue;
+            }
+            const DrawReceipt& receipt = observation.admittedDraws[chosen.receiptIndex];
+            const VisualRange* range = scene.activeOcclusionSourceCatalog.Find(chosen.visualId);
+            if (receipt.drawId != chosen.drawId || receipt.visualId != chosen.visualId ||
+                !range || range->firstTriangle != chosen.firstTriangle ||
+                range->triangleCount != chosen.triangleCount ||
+                source.size() > selection.stats.selectedTriangles ||
+                chosen.triangleCount > selection.stats.selectedTriangles - source.size())
+            {
+                ++result.drawsSkipped;
+                continue;
+            }
+            const std::size_t firstSourceTriangle = source.size();
+            const auto& catalogTriangles = scene.activeOcclusionSourceCatalog.Triangles();
+            for (std::uint32_t i = 0u; i != chosen.triangleCount; ++i)
+            {
+                const SourceTriangle& input = catalogTriangles[range->firstTriangle + i];
+                R4ActiveOcclusionBridge::SourceTriangle output;
+                output.sourceTriangleId = input.triangleId;
+                output.mateTriangleId = input.mateTriangleId;
+                for (unsigned corner = 0u; corner != 3u; ++corner)
+                {
+                    output.sourceVertexIds[corner] = input.sourceVertexIds[corner];
+                    for (unsigned axis = 0u; axis != 3u; ++axis)
+                        output.positions[corner][axis] = input.positions[corner][axis];
+                }
+                source.emplace_back(output);
+            }
+            prepared.push_back({&receipt, firstSourceTriangle, chosen.triangleCount});
+        }
+        std::vector<R4ActiveOcclusion::Triangle> triangles;
+        triangles.reserve(source.size());
+        for (const PreparedDraw& item : prepared)
+        {
+            const DrawReceipt& receipt = *item.receipt;
+            if (receipt.scopeId != observation.scopeId ||
+                receipt.engineFrame != observation.engineFrame ||
+                item.triangleCount == 0u ||
+                item.firstSourceTriangle > source.size() ||
+                item.triangleCount > source.size() - item.firstSourceTriangle)
+            { ++result.drawsSkipped; continue; }
+            R4ActiveOcclusionBridge::DrawTransform draw;
+            draw.drawId = receipt.drawId;
+            draw.scopeId = receipt.scopeId;
+            draw.engineFrame = receipt.engineFrame;
+            draw.viewportWidth = receipt.viewportWidth;
+            draw.viewportHeight = receipt.viewportHeight;
+            draw.clockwiseFrontFace = receipt.clockwiseFrontFace;
+            draw.backFaceCull = receipt.backFaceCull;
+            draw.depthLess = receipt.depthLess;
+            draw.opaque = receipt.opaque;
+            draw.writesDepth = receipt.writesDepth;
+            draw.stencilPassGuaranteed = receipt.stencilPassGuaranteed;
+            std::memcpy(draw.uploadedWvp, receipt.uploadedWvp.data(), sizeof(draw.uploadedWvp));
+            std::memcpy(draw.uploadedJitter, receipt.uploadedJitter.data(), sizeof(draw.uploadedJitter));
+            const char* drawReason = nullptr;
+            if (!R4ActiveOcclusionBridge::AppendDrawTriangles(
+                    source.data() + item.firstSourceTriangle, item.triangleCount, draw,
+                    observation.scopeId, observation.engineFrame, triangles, drawReason))
+            { ++result.drawsSkipped; continue; }
+            ++result.drawsUsed;
+        }
+        result.drawsSkipped += observation.admittedDraws.size() -
+            std::min(observation.admittedDraws.size(), result.drawsUsed + result.drawsSkipped);
+        result.omittedReceiptTriangles = result.receiptTriangles > triangles.size() ?
+            result.receiptTriangles - triangles.size() : 0u;
+        for (const auto& triangle : triangles)
+            if (triangle.optionalMateTriangle != R4ActiveOcclusion::kNoMate)
+                ++result.sourcePairs;
+        result.sourcePairs /= 2u;
+
+        R4ActiveOcclusion::BuildInput input;
+        input.observationScopeId = observation.scopeId;
+        input.triangles = triangles.data();
+        input.triangleCount = triangles.size();
+        input.viewportWidth = observation.viewportWidth;
+        input.viewportHeight = observation.viewportHeight;
+        input.viewportY = R4ActiveOcclusion::ViewportYDirection::ClipPositiveYMapsToLowerPixelY;
+        input.pixelAreaWinding = R4ActiveOcclusion::PixelAreaWinding::PositiveIsClockwise;
+        input.rasterEdgeGuardPixels = 1.0f;
+        result.inputTriangles = triangles.size();
+        if (!grid.Build(input, &result.build))
+        {
+            result.reason = "coverage-grid-build-invalid";
+            result.buildMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - buildStart).count();
+            return false;
+        }
+        result.ready = true;
+        result.reason = nullptr;
+    }
+    catch (...)
+    {
+        grid.Reset();
+        result.ready = false;
+        result.reason = "observer-grid-allocation-or-construction-failure";
+    }
+    result.buildMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - buildStart).count();
+    return result.ready;
+}
+
+void queryActiveOcclusionSamples(const LevelScene& scene,
+    const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+    const MetalR4LocalLightAdapter::ViewState& view,
+    const std::vector<std::vector<std::size_t>>& batches,
+    std::vector<R4WholeLightVisibilitySample>& samples,
+    R4ActiveOcclusion::CoverageGrid& grid, ActiveOcclusionGridStats& stats)
+{
+    if (!snapshot || samples.empty())
+        return;
+    const auto queryStart = std::chrono::steady_clock::now();
+    std::array<float, 16> cameraVp{};
+    BuildMetalR4LocalLightCameraViewProjection(view.view, view.projection, cameraVp);
+    const auto& observation = scene.activeOcclusionObservation;
+    for (auto& sample : samples)
+    {
+        sample.cpuObservationScopeId = stats.ready ? stats.scopeId : 0u;
+        const char* reason = nullptr;
+        const char* prediction = "unknown";
+        std::uint32_t queryCells = 0u;
+        if (!stats.ready)
+            reason = stats.reason ? stats.reason : "coverage-grid-unavailable";
+        else
+        {
+            auto found = snapshot->lights.end();
+            std::size_t foundIndex = 0u;
+            for (std::size_t index = 0; index != snapshot->lights.size(); ++index)
+                if (snapshot->lights[index].lightId == sample.lightId)
+                { found = snapshot->lights.begin() + static_cast<std::ptrdiff_t>(index); foundIndex = index; break; }
+            const bool batchMatches = sample.batchId >= 0 &&
+                static_cast<std::size_t>(sample.batchId) < batches.size() &&
+                std::find(batches[static_cast<std::size_t>(sample.batchId)].begin(),
+                    batches[static_cast<std::size_t>(sample.batchId)].end(), foundIndex) !=
+                    batches[static_cast<std::size_t>(sample.batchId)].end();
+            const bool identityMatches = found != snapshot->lights.end() && batchMatches &&
+                sample.engineFrame == snapshot->engineFrame &&
+                sample.cpuObservationScopeId == stats.scopeId &&
+                found->active && found->shadowed &&
+                ((found->type == R4EngineLocalLightType::OmniFace &&
+                    sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent &&
+                    sample.expectedFaceCount == 6u && sample.face < 6u &&
+                    found->parentLightId == sample.parentLightId && found->omniFace == sample.face) ||
+                 (found->type == R4EngineLocalLightType::Spot &&
+                    sample.groupKind == R4WholeLightVisibilityGroupKind::SingleRecord &&
+                    sample.expectedFaceCount == 1u && sample.face == 0u));
+            if (!identityMatches)
+                reason = "selected-face-snapshot-identity-mismatch";
+            else
+            {
+                std::array<float, 3> minimum{}, maximum{};
+                R4ActiveOcclusion::ClipVertex corners[8]{};
+                const char* boundsReason = nullptr;
+                std::array<float, 16> model{}, wvp{};
+                std::array<float, 4> localPositionAbsMax{};
+                std::array<float, 4> associationError{};
+                BuildMetalR4LocalLightModel(*found, model, &localPositionAbsMax);
+                BuildMetalR4LocalLightWorldViewProjection(cameraVp, model, wvp);
+                if (!BuildMetalR4LocalLightVolumeBounds(*found, minimum, maximum))
+                    reason = "local-light-volume-bounds-invalid";
+                else if (!R4ActiveOcclusionBridge::BuildLocalVolumeAssociationError(
+                    cameraVp.data(), model.data(), wvp.data(), localPositionAbsMax.data(),
+                    associationError.data(), boundsReason))
+                    reason = boundsReason ? boundsReason : "local-volume-association-error-unknown";
+                else if (!R4ActiveOcclusionBridge::BuildPaddedWorldAabbClipCorners(
+                    minimum.data(), maximum.data(), cameraVp.data(), associationError.data(),
+                    corners, boundsReason))
+                    reason = boundsReason ? boundsReason : "local-light-query-corners-invalid";
+                else
+                {
+                    R4ActiveOcclusion::QueryStats query{};
+                    const auto result = grid.QueryPaddedAabb(corners,
+                        observation.viewportWidth, observation.viewportHeight,
+                        R4ActiveOcclusion::ViewportYDirection::ClipPositiveYMapsToLowerPixelY,
+                        1.0f, stats.scopeId, &query);
+                    queryCells = query.cellsVisited;
+                    stats.queryCellTests += query.cellsVisited;
+                    if (query.invalidInput || query.cellTestCapReached)
+                    {
+                        stats.queryInvalid = stats.queryInvalid || query.invalidInput;
+                        stats.queryCellCap = stats.queryCellCap || query.cellTestCapReached;
+                        reason = query.cellTestCapReached ? "query-cell-cap" : "query-invalid-input";
+                    }
+                    else if (result == R4ActiveOcclusion::QueryResult::ConservativelyBehindCoverage)
+                    { prediction = "behind"; reason = "all-query-cells-behind-proven-coverage"; }
+                    else
+                    { prediction = "visible_or_unknown"; reason = "not-proven-behind-coverage"; }
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "METAL_ACTIVE_OCCLUSION_FACE cpu_observation_scope=%llu engine_frame=%u "
+            "batch_id=%d light_id=%llu parent_light_id=%llu face=%u group_kind=%s "
+            "expected_faces=%u prediction=%s query_cells=%u reason=%s\n",
+            static_cast<unsigned long long>(sample.cpuObservationScopeId), sample.engineFrame,
+            sample.batchId, static_cast<unsigned long long>(sample.lightId),
+            static_cast<unsigned long long>(sample.parentLightId), sample.face,
+            sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
+            sample.expectedFaceCount,
+            prediction, queryCells, reason ? reason : "none");
+    }
+    stats.queryMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - queryStart).count();
+}
+
+// Exact ordered source IDs are the key. Geometry/model/materials are immutable
+// for this scene owner; Prepare resets the cache. Light matrices are fresh CBs,
+// never cached. Only the index stream is reused, under a 64-MiB cache budget.
+std::shared_ptr<LocalShadowScene::StaticMergeEntry> getStaticShadowMerge(
+    IR4Backend& backend, const LevelScene& scene, LocalShadowScene& shadows,
+    const std::vector<std::pair<std::size_t, std::size_t>>& entries,
+    const std::vector<std::uint8_t>& transforms, std::string& error)
+{
+    if (entries.empty()) return {};
+    std::vector<std::size_t> ids;
+    ids.reserve(entries.size());
+    std::uint64_t hash = 1469598103934665603ull;
+    for (const auto& entry : entries)
+    { ids.push_back(entry.first); hash ^= entry.first; hash *= 1099511628211ull; }
+    const auto found = shadows.mergeCache.find(hash);
+    if (found != shadows.mergeCache.end())
+        for (const auto& cached : found->second)
+            if (cached->materials == ids) return cached;
+    if (shadows.mergeCacheSaturated) return {}; // Existing keys remain reusable.
+    auto cached = std::make_shared<LocalShadowScene::StaticMergeEntry>();
+    cached->materials = std::move(ids);
+    std::vector<xray::metal::R4StaticShadowMerge::Row> rows;
+    rows.reserve(entries.size());
+    for (const auto& entry : entries)
+    {
+        if (entry.first >= scene.textureMaterials.size() || entry.first >= shadows.mergeSourceIndices.size() ||
+            entry.second > transforms.size() || sizeof(Matrix4) > transforms.size() - entry.second)
+        { error = "E08 static merge immutable source unavailable"; return {}; }
+        const auto& m = scene.textureMaterials[entry.first];
+        if (m.vertexBufferId >= scene.geometry.vertexBuffers.size())
+        { error = "E08 static merge source vertex buffer unavailable"; return {}; }
+        const auto& indices = shadows.mergeSourceIndices[entry.first];
+        xray::metal::R4StaticShadowMerge::Row row;
+        row.vertexBufferId = m.vertexBufferId; row.indices = indices.data(); row.indexCount = indices.size();
+        row.vertexBase = m.vertexBase; row.vertexCount = m.vertexCount;
+        row.vertexBufferVertexCount = scene.geometry.vertexBuffers[m.vertexBufferId].vertexCount;
+        row.modelBytes = m.modelTransform.elements; row.modelByteCount = sizeof(Matrix4);
+        row.wvpBytes = transforms.data() + entry.second; row.wvpByteCount = sizeof(Matrix4);
+        row.opaque = m.shaderName != "def_shaders\\def_aref";
+        row.supported = m.indexCount % 3u == 0u;
+        rows.push_back(row);
+    }
+    const char* planError = nullptr;
+    if (!xray::metal::R4StaticShadowMerge::Build(rows.data(), rows.size(), cached->plan, planError))
+    { error = planError ? planError : "E08 static merge plan failed"; return {}; }
+    bool hasMerged = false;
+    for (const auto& run : cached->plan.runs)
+    {
+        if (run.indexCount > UINT32_MAX || run.baseVertex > INT32_MAX)
+            return {}; // Conservative legacy fallback for an oversized run.
+        hasMerged |= run.merged;
+    }
+    constexpr std::size_t CacheBudget = 64u * 1024u * 1024u;
+    const std::size_t indexBytes = cached->plan.indices.size() * sizeof(std::uint16_t);
+    const std::size_t payload = (hasMerged ? indexBytes : 0u) +
+        cached->materials.capacity() * sizeof(std::size_t) +
+        cached->plan.runs.capacity() * sizeof(xray::metal::R4StaticShadowMerge::Run) + 256u;
+    if (payload > CacheBudget || shadows.mergeCacheBytes > CacheBudget - payload ||
+        shadows.mergeCache.size() >= 2048u)
+    {
+        // Never reset accounting while current-frame plans/GPU work still pin
+        // old entries. Keep existing keys, and use original draws for new keys.
+        shadows.mergeCacheSaturated = true;
+        return {};
+    }
+    if (hasMerged && indexBytes)
+    {
+        R4BufferDesc desc;
+        desc.size = indexBytes; desc.storage = R4ResourceStorage::Private;
+        desc.usage = R4BufferUsage::Index; desc.label = "R4 E08 immutable merged static shadow indices";
+        cached->indices = backend.Resources().CreateBuffer(desc, cached->plan.indices.data(), indexBytes, error);
+        if (!cached->indices) return {};
+    }
+    // CreateBuffer owns its staging/recovery copy. Runs retain offsets/counts;
+    // keeping another CPU index stream in every cached plan adds no value.
+    std::vector<std::uint16_t>().swap(cached->plan.indices);
+    shadows.mergeCacheBytes += payload;
+    shadows.mergeCache[hash].push_back(cached);
+    return cached;
+}
+
+// Diagnostic pairs draw the same live Flora and wind twice in one acquired
+// frame. Independent attachments and completed readbacks preserve production.
+bool runFloraShadowPixelOracle(IR4Backend& backend, LevelScene& scene,
+    LocalShadowScene::FloraPixelOracle& oracle, MetalR4FloraAdapter* flora,
+    const R4FloraViewState& floraView, const MetalR4EngineScene::ViewState& view,
+    const std::array<float, 16>& lightViewProjection, std::uint32_t extent,
+    const std::string& family, std::size_t pairLimit, std::size_t framePairLimit,
+    std::string& error)
+{
+    const char* directory = std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR");
+    if (!directory || !*directory || !flora || !flora->IsReady() || !view.valid ||
+        oracle.pairs >= pairLimit)
+        return true;
+    const char* everyText = std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_EVERY");
+    const unsigned long every = everyText ?
+        std::max(1ul, std::strtoul(everyText, nullptr, 10)) : 240ul;
+    if (view.engineFrame % every != 0u)
+        return true;
+    if (oracle.lastFrame != view.engineFrame)
+    {
+        oracle.lastFrame = view.engineFrame;
+        oracle.pairsThisFrame = 0u;
+        oracle.viewsThisFrame = 0u;
+        oracle.firstViewThisFrame = family.rfind("gameplay-flora-local-", 0u) == 0u ?
+            oracle.pairs : 0u;
+        oracle.sampledViews.clear();
+    }
+    if (!oracle.sampledViews.emplace(family).second)
+        return true;
+    // Rotate local-light cases across sampled frames instead of consuming the
+    // cap on the first atlas batch/time. All three sun cascades sample together.
+    if (oracle.viewsThisFrame++ < oracle.firstViewThisFrame ||
+        oracle.pairsThisFrame >= framePairLimit)
+        return true;
+    if (!oracle.maps[0])
+    {
+        R4Texture2DDesc descriptor;
+        descriptor.width = descriptor.height = extent;
+        descriptor.format = R4PixelFormat::R32Float;
+        descriptor.storage = R4ResourceStorage::Private;
+        descriptor.usage = R4TextureUsage::RenderTarget | R4TextureUsage::ShaderRead;
+        descriptor.label = "R4 isolated live Flora legacy shadow oracle";
+        oracle.maps[0] = backend.Resources().CreateTexture2D(descriptor, error);
+        descriptor.label = "R4 isolated live Flora instanced shadow oracle";
+        oracle.maps[1] = backend.Resources().CreateTexture2D(descriptor, error);
+        descriptor.format = R4PixelFormat::Depth32Float;
+        descriptor.usage = R4TextureUsage::RenderTarget;
+        descriptor.label = "R4 isolated live Flora shadow oracle depth";
+        oracle.depth = backend.Resources().CreateTexture2D(descriptor, error);
+        if (!oracle.maps[0] || !oracle.maps[1] || !oracle.depth)
+            return false;
+    }
+    if (oracle.maps[0]->Descriptor().width != extent)
+    {
+        error = "Flora pixel oracle extent changed within its prepared scene";
+        return false;
+    }
+    std::array<MetalR4FloraAdapter::Telemetry, 2> sampled;
+    for (std::size_t mode = 0; mode < 2u; ++mode)
+    {
+        R4RenderPassDesc pass;
+        pass.label = "R4 isolated live Flora legacy/instanced shadow pair";
+        pass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = oracle.maps[mode];
+        color.clearColor = {1.0, 1.0, 1.0, 1.0};
+        pass.colorAttachments = {color};
+        pass.depthStencilAttachment.texture = oracle.depth;
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
+        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::DontCare;
+        pass.hasViewport = true;
+        pass.viewport = {0.0, 0.0, double(extent), double(extent), 0.0, 1.0};
+        pass.hasScissor = true;
+        pass.scissor = {0u, 0u, extent, extent};
+        if (!backend.BeginRenderPass(pass, error) ||
+            !flora->DrawShadowCastersForValidation(backend, lightViewProjection,
+                floraView, mode == 1u, sampled[mode], error) ||
+            !backend.EndRenderPass(error))
+            return false;
+        R4SunShadowValidationDesc snapshot;
+        snapshot.shadowR32 = oracle.maps[mode];
+        snapshot.positionRGBA16F = scene.gBufferTargets[0];
+        snapshot.sceneDepthStencil = scene.depthTarget;
+        snapshot.accumulationRGBA16F = scene.lightingAccumulator;
+        snapshot.positionDecompressionParams = scene.positionDecompressionParams;
+        const Matrix4 inverse = inverseRigidTransform(scene.view);
+        std::memcpy(snapshot.inverseView.data(), inverse.elements, sizeof(inverse));
+        std::memcpy(snapshot.currentViewProjection.data(),
+            scene.uniformData.viewProjection.elements, sizeof(Matrix4));
+        snapshot.stageVolumeViewProjection = lightViewProjection;
+        snapshot.family = family + (mode == 0u ? "-legacy" : "-instanced");
+        snapshot.outputDirectory = directory;
+        snapshot.engineFrame = view.engineFrame;
+        snapshot.phase = R4SunShadowValidationPhase::OffCameraCasters;
+        snapshot.requireShadowedReceivers = false;
+        snapshot.exportShadowMap = true;
+        if (!backend.ValidateSunShadowCascade(snapshot, error))
+            return false;
+    }
+    if (sampled[0].shadowSubmittedVisuals != sampled[1].shadowSubmittedVisuals ||
+        sampled[0].shadowCulledVisuals != sampled[1].shadowCulledVisuals)
+    {
+        error = "Flora pixel oracle implementations selected different live casters";
+        return false;
+    }
+    std::error_code filesystemError;
+    std::filesystem::create_directories(directory, filesystemError);
+    std::ofstream manifest(std::filesystem::path(directory) / "flora-pairs.jsonl", std::ios::app);
+    if (filesystemError || !manifest)
+    {
+        error = "Flora pixel oracle could not record pair provenance";
+        return false;
+    }
+    manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
+        << "{\"family\":\"" << family << "\",\"engine_frame\":" << view.engineFrame
+        << ",\"extent\":" << extent << ",\"time_seconds\":" << floraView.timeSeconds
+        << ",\"wind_valid\":" << (floraView.windValid ? "true" : "false")
+        << ",\"instances\":" << sampled[0].shadowSubmittedVisuals
+        << ",\"legacy_draws\":" << sampled[0].shadowDraws
+        << ",\"instanced_draws\":" << sampled[1].shadowDraws;
+    const auto writeValues = [&manifest](const char* key, const auto& values) {
+        manifest << ",\"" << key << "\":[";
+        for (std::size_t index = 0; index < values.size(); ++index)
+            manifest << (index ? "," : "") << values[index];
+        manifest << "]";
+    };
+    writeValues("light_view_projection", lightViewProjection);
+    writeValues("wind_params", floraView.windParams);
+    writeValues("wind_animation", floraView.windAnimation);
+    writeValues("wind_setup_trees", floraView.windSetupTrees);
+    manifest << "}\n";
+    manifest.close();
+    if (!manifest)
+    {
+        error = "Flora pixel oracle failed to persist pair provenance";
+        return false;
+    }
+    ++oracle.pairs;
+    ++oracle.pairsThisFrame;
+    std::fprintf(stderr,
+        "METAL_FLORA_PIXEL_PAIR frame=%u family=%s instances=%zu legacy_draws=%zu instanced_draws=%zu extent=%u time=%.9g\n",
+        view.engineFrame, family.c_str(), sampled[0].shadowSubmittedVisuals,
+        sampled[0].shadowDraws, sampled[1].shadowDraws, extent, floraView.timeSeconds);
+    return true;
+}
+
+bool renderLocalShadowBatch(IR4Backend& backend, LevelScene& scene,
+    LocalShadowScene& shadows, const MetalR4EngineScene::ViewState& view,
+    const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+    const std::vector<std::size_t>& indices, std::uint32_t batchId,
+    MetalR4DynamicWorldAdapter* dynamicWorld,
+    MetalR4DefVertexAdapter* defVertex,
+    MetalR4DefObjectsLodAdapter* defObjectsLod,
+    MetalR4FloraAdapter* flora, const R4FloraViewState& floraView,
+    MetalR4DetailGrassAdapter* detail, const R4DetailGrassViewState& detailView,
+    const R4EnvironmentSnapshot& environment,
+    const std::vector<R4WholeLightVisibilitySample>* visibilitySamples,
+    const R4LightHomDiagnosticFrame* homDiagnostic,
+    std::string& error)
+{
+    E07ShadowCpuScope e07ShadowCpu(dynamicWorld, true);
+    const auto homBatchStart=homDiagnostic?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    shadows.records.clear();
+    if (!shadows.ready || !snapshot || indices.size()>LocalShadowTileCapacity)
+    { error="local shadow batch has no atlas or exceeds its capacity"; return false; }
+    struct Candidate { std::size_t lightIndex; };
+    std::vector<Candidate> candidates;
+    for (const auto index:indices) candidates.push_back({index});
+    Matrix4 cameraView{};
+    std::memcpy(cameraView.elements,view.view.data(),sizeof(cameraView));
+    Matrix4 cameraProjection{};
+    std::memcpy(cameraProjection.elements,view.projection.data(),sizeof(cameraProjection));
+    const Matrix4 viewProjection=multiply(cameraProjection,cameraView);
     const Matrix4 inverseView = inverseRigidTransform(cameraView);
-    std::vector<std::uint8_t> transformBytes(
-        LocalShadowTileCapacity * scene.textureMaterials.size() * 256u, 0u);
+    // Allocate constants only for casters admitted by each light frustum.
+    // Dense level-sized tables for every batch can exhaust the frame arena.
+    std::vector<std::uint8_t> transformBytes;
+    using MaterialEntry = std::pair<std::size_t, std::size_t>; // source index, immutable CB offset
+    std::vector<std::vector<MaterialEntry>> materialEntries(candidates.size());
+    std::vector<double> homPrepMs(homDiagnostic ? candidates.size() : 0u,0.0);
+    std::vector<std::size_t> allMaterials;
+    if (shadows.staticLinear)
+        for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i) allMaterials.push_back(i);
     std::vector<Matrix4> lightViewProjections;
     lightViewProjections.reserve(candidates.size());
     shadows.records.reserve(candidates.size());
-    for (std::size_t tile = 0; tile < candidates.size(); ++tile)
+    for (std::size_t c = 0; c < candidates.size(); ++c)
     {
-        const R4EngineLocalLight& light = snapshot->lights[candidates[tile].lightIndex];
+        const auto homPrepStart=homDiagnostic?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const std::uint32_t tile = static_cast<std::uint32_t>(c);
+        const R4EngineLocalLight& light = snapshot->lights[candidates[c].lightIndex];
         const Matrix4 lightView = makeR4SpotLightView(light);
         const Matrix4 lightProjection = makeR4SpotLightProjection(light);
         const Matrix4 lightViewProjection = multiply(lightProjection, lightView);
@@ -2278,10 +3280,10 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
         xray::metal::R4LocalShadowAtlasRecord record;
 		record.lightIdentity = light.lightId;
         record.engineFrame = snapshot->engineFrame;
-        record.smapId = 0u;
+        record.smapId = batchId;
 		record.face = light.type == R4EngineLocalLightType::OmniFace ? light.omniFace : 0u;
-        record.atlasX = static_cast<std::uint32_t>(tile % 4u) * LocalShadowTileSize;
-        record.atlasY = static_cast<std::uint32_t>(tile / 4u) * LocalShadowTileSize;
+        record.atlasX = (tile % 4u) * LocalShadowTileSize;
+        record.atlasY = (tile / 4u) * LocalShadowTileSize;
         record.atlasSize = LocalShadowTileSize;
         record.atlasExtent = LocalShadowAtlasExtent;
         std::memcpy(record.lightView.data(), lightView.elements, sizeof(lightView));
@@ -2292,50 +3294,68 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
             !xray::metal::DeriveR4LocalLightMapMatrix(record, snapshot->shadowDepthScale,
                 snapshot->shadowDepthBias, record.lightMapMatrix, error))
             return false;
-        for (std::size_t materialIndex = 0; materialIndex < scene.textureMaterials.size(); ++materialIndex)
+        const auto& selectedMaterials = shadows.staticLinear ? allMaterials :
+            shadows.staticIndex.Query(lightViewProjection.elements);
+        if (shadows.staticOracle)
         {
-            const Matrix4 wvp = multiply(lightViewProjection,
-                scene.textureMaterials[materialIndex].modelTransform);
-            const std::size_t offset = (tile * scene.textureMaterials.size() + materialIndex) * 256u;
-            std::memcpy(transformBytes.data() + offset, wvp.elements, sizeof(wvp));
+            for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i)
+            {
+                const auto& m = scene.textureMaterials[i];
+                if (!conservativelyOutsideMetalFrustum(m.localPositionBounds, m.modelTransform,
+                        lightViewProjection, true) &&
+                    !std::binary_search(selectedMaterials.begin(), selectedMaterials.end(), i))
+                { error = "E08 static shadow index omitted an oracle caster"; return false; }
+            }
+            if (++shadows.oracleViews % 1000 == 0)
+                std::fprintf(stderr, "METAL_E08_STATIC_ORACLE views=%zu draws=%zu misses=0\n",
+                    shadows.oracleViews, scene.textureMaterials.size());
+        }
+        for (const std::size_t materialIndex : selectedMaterials)
+        {
+            const auto& material=scene.textureMaterials[materialIndex];
+            if (conservativelyOutsideMetalFrustum(material.localPositionBounds,
+                    material.modelTransform, lightViewProjection, true)) continue;
+            const Matrix4 wvp = multiply(lightViewProjection,material.modelTransform);
+            const std::size_t offset=transformBytes.size();
+            materialEntries[tile].emplace_back(materialIndex, offset);
+            transformBytes.resize(offset+256u,0u);
+            std::memcpy(transformBytes.data()+offset,wvp.elements,sizeof(wvp));
         }
         lightViewProjections.push_back(lightViewProjection);
         shadows.records.push_back(std::move(record));
+        if (homDiagnostic) homPrepMs[c]=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-homPrepStart).count();
     }
     if (shadows.records.empty())
         return true;
-    if (!backend.Resources().UpdateBuffer(shadows.transforms, 0u,
-            transformBytes.data(), transformBytes.size(), error))
+    R4FrameBufferSlice batchTransforms;
+    if (!transformBytes.empty() && !backend.UploadFrameData(transformBytes.data(), transformBytes.size(),
+            256u, batchTransforms, error))
         return false;
 
-    for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
-    {
-        xray::metal::R4LocalShadowAtlasRecord& record = shadows.records[tile];
-        R4RenderPassDesc pass;
-        pass.label = "R4 converted local-light static shadow atlas tile";
-        pass.useDrawable = false;
-        R4ColorAttachmentDesc color;
-        color.texture = shadows.atlas;
-        color.loadAction = tile == 0u ? R4LoadAction::Clear : R4LoadAction::Load;
-        color.storeAction = R4StoreAction::Store;
-        color.clearColor = {1.0, 1.0, 1.0, 1.0};
-        pass.colorAttachments = {color};
-        pass.depthStencilAttachment.texture = shadows.depth;
-        // Each tile reuses the same full-size depth attachment. Clearing it for
-        // every light is intentional: previous tile color stays in the R32 atlas,
-        // while stale depth must not reject this light's independent casters.
-        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
-        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
-        pass.hasViewport = true;
-        pass.viewport = {double(record.atlasX), double(record.atlasY),
-            double(record.atlasSize), double(record.atlasSize), 0.0, 1.0};
-        pass.hasScissor = true;
-        pass.scissor = {record.atlasX, record.atlasY, record.atlasSize, record.atlasSize};
-        if (!backend.BeginRenderPass(pass, error))
-            return false;
-        std::size_t lastVertexBuffer = std::numeric_limits<std::size_t>::max();
-        for (std::size_t materialIndex = 0; materialIndex < scene.textureMaterials.size(); ++materialIndex)
+    shadows.transformUploadBytes+=transformBytes.size();
+    const char* mergePixelDirectory = std::getenv("XRAY_METAL_E08_STATIC_MERGE_PIXEL_ORACLE_DIR");
+    std::vector<std::shared_ptr<LocalShadowScene::StaticMergeEntry>> mergePlans(candidates.size());
+    if (shadows.mergeStatic || (mergePixelDirectory && *mergePixelDirectory))
+        for (std::size_t tile = 0; tile < candidates.size(); ++tile)
         {
+            const auto homMergeStart=homDiagnostic?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            std::string mergeError;
+            mergePlans[tile] = getStaticShadowMerge(backend, scene, shadows, materialEntries[tile], transformBytes, mergeError);
+            if (!mergeError.empty()) { error = mergeError; return false; }
+            if (homDiagnostic) homPrepMs[tile]+=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-homMergeStart).count();
+        }
+    const bool separateTiles = std::getenv("XRAY_METAL_E08_SHADOW_SEPARATE_TILES") != nullptr;
+    const auto drawStaticTile = [&](std::size_t tile, bool useMerged, bool account) {
+        std::size_t lastVertexBuffer = std::numeric_limits<std::size_t>::max();
+        const auto& merge = useMerged ? mergePlans[tile] : nullptr;
+        const std::size_t drawCount = merge ? merge->plan.runs.size() : materialEntries[tile].size();
+        for (std::size_t call = 0; call < drawCount; ++call)
+        {
+            const auto* run = merge ? &merge->plan.runs[call] : nullptr;
+            const auto& entry = materialEntries[tile][run ? run->firstRow : call];
+            const std::size_t materialIndex = entry.first;
             const LevelScene::TextureMaterial& material = scene.textureMaterials[materialIndex];
             const bool alphaTested = material.shaderName == "def_shaders\\def_aref";
             const std::shared_ptr<IR4GraphicsPipeline>& pipeline = alphaTested ?
@@ -2345,15 +3365,12 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
                 error = "alpha-tested R4 local-shadow caster pipeline is unavailable";
                 return false;
             }
-            if (conservativelyOutsideMetalFrustum(material.localPositionBounds,
-                    material.modelTransform, lightViewProjections[tile], true))
-            { ++shadows.culledCasters; continue; }
-            const std::size_t offset = (tile * scene.textureMaterials.size() + materialIndex) * 256u;
+            const std::size_t offset = entry.second;
             R4MscStageBindings vertexBindings;
             vertexBindings.stage = R4ShaderStage::Vertex;
             vertexBindings.tlabSize = 24u;
             vertexBindings.resources = {{R4MscResourceType::ConstantBuffer, 0u,
-                shadows.transforms, offset, 256u, nullptr, nullptr}};
+                batchTransforms.buffer, batchTransforms.offset + offset, 256u, nullptr, nullptr}};
             if (!backend.BindGraphicsPipeline(pipeline, error) ||
                 !backend.BindMscResources(vertexBindings, error))
                 return false;
@@ -2391,10 +3408,102 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
             draw.indexCount = material.indexCount;
             draw.indexType = R4IndexType::UInt16;
             draw.baseVertex = static_cast<std::int32_t>(material.vertexBase);
+            if (run && run->merged)
+            {
+                draw.indexBuffer = merge->indices;
+                draw.indexBufferOffset = run->indexOffset * sizeof(std::uint16_t);
+                draw.indexCount = static_cast<std::uint32_t>(run->indexCount);
+                draw.baseVertex = static_cast<std::int32_t>(run->baseVertex);
+            }
             if (!backend.DrawIndexed(draw, error))
                 return false;
-            ++shadows.submittedCasters;
+            if (account)
+            { shadows.submittedCasters += run ? run->rowCount : 1u; ++shadows.mergedEncodedDraws; }
         }
+        return true;
+    };
+    // Bounded completed-GPU oracle of real source materials. These isolated
+    // atlases contain static casters only; production clears/restores its own
+    // atlas/depth afterwards. No receiver/off-camera PASS is inferred.
+    if (mergePixelDirectory && *mergePixelDirectory && view.engineFrame % 120u == 0u &&
+        shadows.mergePixelPairs < 6u)
+    {
+        if (!shadows.mergePixelMap)
+        {
+            auto desc = shadows.atlas->Descriptor(); desc.label = "R4 E08 static merge pixel oracle";
+            shadows.mergePixelMap = backend.Resources().CreateTexture2D(desc, error);
+            if (!shadows.mergePixelMap) return false;
+        }
+        for (const bool merged : {false, true})
+        {
+            R4RenderPassDesc pass;
+            pass.label = "R4 E08 isolated static shadow index oracle"; pass.useDrawable = false;
+            R4ColorAttachmentDesc color;
+            color.texture = shadows.mergePixelMap; color.clearColor = {1,1,1,1};
+            pass.colorAttachments = {color};
+            pass.depthStencilAttachment.texture = shadows.depth;
+            pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
+            pass.depthStencilAttachment.depthStoreAction = R4StoreAction::DontCare;
+            if (!backend.BeginRenderPass(pass, error)) return false;
+            for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
+            {
+                const auto& r = shadows.records[tile];
+                R4Viewport viewport{double(r.atlasX), double(r.atlasY), double(r.atlasSize), double(r.atlasSize), 0, 1};
+                R4ScissorRect scissor{r.atlasX, r.atlasY, r.atlasSize, r.atlasSize};
+                if (!backend.SetActiveRenderRegion(viewport, scissor, error) ||
+                    !drawStaticTile(tile, merged, false)) return false;
+            }
+            if (!backend.EndRenderPass(error)) return false;
+            R4SunShadowValidationDesc snapshot;
+            snapshot.shadowR32 = shadows.mergePixelMap; snapshot.positionRGBA16F = scene.gBufferTargets[0];
+            snapshot.sceneDepthStencil = scene.depthTarget; snapshot.accumulationRGBA16F = scene.lightingAccumulator;
+            snapshot.positionDecompressionParams = scene.positionDecompressionParams;
+            const auto inverse = inverseRigidTransform(scene.view);
+            std::memcpy(snapshot.inverseView.data(), &inverse, sizeof(inverse));
+            std::memcpy(snapshot.currentViewProjection.data(), &scene.uniformData.viewProjection, sizeof(Matrix4));
+            std::memcpy(snapshot.stageVolumeViewProjection.data(), &lightViewProjections.front(), sizeof(Matrix4));
+            snapshot.family = "e08-static-merge-b" + std::to_string(batchId) + (merged ? "-merged" : "-legacy");
+            snapshot.outputDirectory = mergePixelDirectory; snapshot.engineFrame = view.engineFrame;
+            snapshot.phase = R4SunShadowValidationPhase::OffCameraCasters;
+            snapshot.requireShadowedReceivers = false; snapshot.exportShadowMap = true;
+            if (!backend.ValidateSunShadowCascade(snapshot, error)) return false;
+        }
+        ++shadows.mergePixelPairs;
+    }
+    for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
+    {
+        const auto homTileStart=homDiagnostic?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        const std::size_t homStaticBefore=shadows.mergedEncodedDraws, homDynamicBefore=shadows.submittedDynamicCasters;
+        xray::metal::R4LocalShadowAtlasRecord& record = shadows.records[tile];
+        R4RenderPassDesc pass;
+        pass.label = "R4 converted local-light static shadow atlas tile";
+        pass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = shadows.atlas;
+        color.loadAction = tile == 0u ? R4LoadAction::Clear : R4LoadAction::Load;
+        color.storeAction = R4StoreAction::Store;
+        color.clearColor = {1.0, 1.0, 1.0, 1.0};
+        pass.colorAttachments = {color};
+        pass.depthStencilAttachment.texture = shadows.depth;
+        // Tiles have disjoint scissor rectangles. Clear depth once at batch
+        // start; no pixel in another tile can reject this light's casters.
+        // One encoder retains the atlas on chip across all tiles in the batch.
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
+        pass.depthStencilAttachment.depthStoreAction = separateTiles ? R4StoreAction::Store : R4StoreAction::DontCare;
+        pass.hasViewport = true;
+        pass.viewport = {double(record.atlasX), double(record.atlasY),
+            double(record.atlasSize), double(record.atlasSize), 0.0, 1.0};
+        pass.hasScissor = true;
+        pass.scissor = {record.atlasX, record.atlasY, record.atlasSize, record.atlasSize};
+        if (tile == 0u || separateTiles)
+        {
+            pass.label = separateTiles ? "R4 local shadow separate tile" : "R4 local shadow atlas batch";
+            if (!backend.BeginRenderPass(pass, error)) return false;
+        }
+        else if (!backend.SetActiveRenderRegion(pass.viewport, pass.scissor, error))
+            return false;
+        shadows.culledCasters += scene.textureMaterials.size() - materialEntries[tile].size();
+        if (!drawStaticTile(tile, shadows.mergeStatic, true)) return false;
         if (dynamicWorld && dynamicWorld->IsEnabled())
         {
             std::array<float, 16> tileLvp{};
@@ -2408,11 +3517,88 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
                     error))
                 return false;
         }
-        if (!backend.EndRenderPass(error))
+        if (defVertex && defVertex->IsReady())
+        {
+            std::array<float, 16> tileLvp{};
+            std::memcpy(tileLvp.data(), lightViewProjections[tile].elements, sizeof(tileLvp));
+            if (!defVertex->DrawShadowCasters(backend, tileLvp,
+                    scene.sunShadowPipeline, scene.sunShadowArefPipeline,
+                    scene.lightingLinearSampler ? scene.lightingLinearSampler : scene.sunShadowSampler,
+                    error))
+                return false;
+        }
+        if (defObjectsLod && defObjectsLod->IsReady())
+        {
+            std::array<float, 16> tileLvp{};
+            std::memcpy(tileLvp.data(), lightViewProjections[tile].elements, sizeof(tileLvp));
+            if (!defObjectsLod->DrawShadowCasters(backend, tileLvp,
+                    scene.sunShadowPipeline, error))
+                return false;
+        }
+        std::array<float,16> tileMatrix{};
+        std::memcpy(tileMatrix.data(),lightViewProjections[tile].elements,sizeof(Matrix4));
+        if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,tileMatrix,floraView,error))
+            return false;
+        const auto sourceLight=std::find_if(snapshot->lights.begin(),snapshot->lights.end(),
+            [&](const auto& light) { return light.lightId==record.lightIdentity; });
+        if (detail && detail->IsReady() && environment.grassShadows &&
+            environment.ssfxGrassShadows[0]>=3 && sourceLight!=snapshot->lights.end() &&
+            !sourceLight->decorative && sourceLight->cameraDistance<=environment.ssfxGrassShadows[2] &&
+            !sphereOutsideMainView(sourceLight->position,sourceLight->range*0.6f,viewProjection))
+        {
+            R4DetailGrassShadowState shadow;
+            shadow.lightView=record.lightView; shadow.lightProjection=record.lightProjection;
+            shadow.lightViewProjection=tileMatrix; shadow.lightPosition=sourceLight->position;
+            shadow.fadeFromLight=true; shadow.fadeDistance=-1; shadow.lightRange=sourceLight->range;
+            if (!detail->DrawShadowCasters(backend,detailView,shadow,error)) return false;
+        }
+        if ((separateTiles || tile + 1 == shadows.records.size()) && !backend.EndRenderPass(error))
             return false;
         record.renderedDepth = true;
         ++shadows.renderedLights;
+        if (homDiagnostic)
+        {
+            const auto index=indices[tile]; const auto& light=snapshot->lights[index];
+            const bool hidden=index<homDiagnostic->hidden.size() && homDiagnostic->hidden[index];
+            const bool eligible=index<homDiagnostic->eligible.size() && homDiagnostic->eligible[index];
+            const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-homTileStart).count();
+            std::fprintf(stderr,"METAL_LIGHT_HOM_TILE frame=%u sample=%llu batch=%u tile=%zu parent=%llu hidden=%u eligible=%u prep_cpu_ms=%.6f shadow_cpu_ms=%.6f static_rows=%zu static_draws=%zu dynamic_draws=%zu transform_bytes=%zu\n",
+                view.engineFrame,(unsigned long long)homDiagnostic->sample,batchId,tile,
+                (unsigned long long)(light.parentLightId?light.parentLightId:light.lightId),unsigned(hidden),unsigned(eligible),
+                homPrepMs[tile],ms,materialEntries[tile].size(),shadows.mergedEncodedDraws-homStaticBefore,
+                shadows.submittedDynamicCasters-homDynamicBefore,materialEntries[tile].size()*256u);
+        }
+        if (visibilitySamples && indices[tile] < snapshot->lights.size())
+        {
+            const auto& visibilityLight = snapshot->lights[indices[tile]];
+            const auto selected = std::find_if(visibilitySamples->begin(), visibilitySamples->end(),
+                [&](const auto& sample) {
+                    return sample.engineFrame == view.engineFrame && sample.batchId == static_cast<std::int32_t>(batchId) &&
+                        sample.lightId == visibilityLight.lightId && sample.parentLightId == visibilityLight.parentLightId &&
+                        sample.face == (visibilityLight.type == R4EngineLocalLightType::OmniFace ? visibilityLight.omniFace : 0u);
+                });
+            if (selected != visibilitySamples->end())
+                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_TILE frame=%u batch=%u light=%llu parent=%llu face=%u kind=%u static_rows=%zu static_encoded_draws=%zu dynamic_submitted_draws=%zu static_transform_bytes=%zu\n",
+                    view.engineFrame, batchId, (unsigned long long)visibilityLight.lightId,
+                    (unsigned long long)visibilityLight.parentLightId, selected->face,
+                    static_cast<unsigned>(selected->groupKind), materialEntries[tile].size(),
+                    shadows.mergedEncodedDraws - homStaticBefore,
+                    shadows.submittedDynamicCasters - homDynamicBefore,
+                    materialEntries[tile].size() * 256u);
+        }
     }
+    if (std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR"))
+        for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
+        {
+            std::array<float, 16> matrix{};
+            std::memcpy(matrix.data(), lightViewProjections[tile].elements, sizeof(Matrix4));
+            const auto& record = shadows.records[tile];
+            const std::string family = "gameplay-flora-local-b" + std::to_string(batchId) +
+                "-t" + std::to_string(tile) + "-light" + std::to_string(record.lightIdentity);
+            if (!runFloraShadowPixelOracle(backend, scene, shadows.floraLocalOracle,
+                    flora, floraView, view, matrix, record.atlasSize, family, 12u, 4u, error))
+                return false;
+        }
     if (const std::shared_ptr<const R4EngineWorldSnapshot> world = backend.EngineWorldSnapshot())
     {
         if (dynamicWorld && dynamicWorld->IsEnabled())
@@ -2420,6 +3606,11 @@ bool renderLocalShadowAtlas(IR4Backend& backend, LevelScene& scene,
         else
             shadows.omittedDynamicCasters = world->renderables.size();
     }
+    if (homDiagnostic)
+        std::fprintf(stderr,"METAL_LIGHT_HOM_BATCH frame=%u sample=%llu batch=%u records=%zu hidden_records=%zu eligible_hidden_records=%zu total_cpu_ms=%.6f\n",
+            view.engineFrame,(unsigned long long)homDiagnostic->sample,batchId,indices.size(),
+            homDiagnostic->CountHidden(indices,false),homDiagnostic->CountHidden(indices,true),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-homBatchStart).count());
     return true;
 }
 
@@ -2833,6 +4024,325 @@ bool drawNightVision(IR4Backend& backend, LevelScene& scene,
     return true;
 }
 
+struct StaticMotionProbeTargets
+{
+    std::array<std::shared_ptr<IR4Texture>, 4> gBuffer;
+    std::shared_ptr<IR4Texture> depth;
+    std::uint32_t lastProbeFrame = UINT32_MAX;
+    bool previousSampleWasReset = false;
+};
+
+bool sameTextureDescriptor(const R4Texture2DDesc& left, const R4Texture2DDesc& right)
+{
+    return left.width == right.width && left.height == right.height &&
+        left.mipLevels == right.mipLevels && left.arrayLength == right.arrayLength &&
+        left.type == right.type && left.format == right.format &&
+        left.storage == right.storage && left.usage == right.usage;
+}
+
+bool ensureStaticMotionProbeTargets(IR4Backend& backend, LevelScene& scene,
+    StaticMotionProbeTargets& targets, std::string& error)
+{
+    if (scene.gBufferTargets.size() != targets.gBuffer.size() || !scene.depthTarget)
+    {
+        error = "static motion probe requires the production four-target G-buffer and depth target";
+        return false;
+    }
+    for (const auto& target : scene.gBufferTargets)
+    {
+        if (!target)
+        {
+            error = "static motion probe found a missing production G-buffer attachment";
+            return false;
+        }
+    }
+
+    bool reusable = static_cast<bool>(targets.depth);
+    for (std::size_t index = 0; reusable && index < targets.gBuffer.size(); ++index)
+        reusable = targets.gBuffer[index] && sameTextureDescriptor(
+            targets.gBuffer[index]->Descriptor(), scene.gBufferTargets[index]->Descriptor());
+    reusable = reusable && sameTextureDescriptor(
+        targets.depth->Descriptor(), scene.depthTarget->Descriptor());
+    if (reusable)
+        return true;
+
+    StaticMotionProbeTargets replacement;
+    const std::array<const char*, 4> labels = {
+        "R4 isolated motion probe G-buffer 0",
+        "R4 isolated motion probe G-buffer 1",
+        "R4 isolated motion probe G-buffer 2",
+        "R4 isolated motion probe G-buffer 3 motion",
+    };
+    for (std::size_t index = 0; index < replacement.gBuffer.size(); ++index)
+    {
+        R4Texture2DDesc descriptor = scene.gBufferTargets[index]->Descriptor();
+        descriptor.label = labels[index];
+        replacement.gBuffer[index] = backend.Resources().CreateTexture2D(descriptor, error);
+        if (!replacement.gBuffer[index])
+            return false;
+    }
+    R4Texture2DDesc depthDescriptor = scene.depthTarget->Descriptor();
+    depthDescriptor.label = "R4 isolated motion probe depth";
+    replacement.depth = backend.Resources().CreateTexture2D(depthDescriptor, error);
+    if (!replacement.depth)
+        return false;
+    replacement.lastProbeFrame = targets.lastProbeFrame;
+    replacement.previousSampleWasReset = targets.previousSampleWasReset;
+    targets = std::move(replacement);
+    return true;
+}
+
+std::size_t countLmhProbeDraws(const LevelScene& scene)
+{
+    std::size_t count = 0;
+    for (const xray::metal::R4StaticVisual& visual : scene.geometry.visuals)
+    {
+        if (!visual.valid || !visual.referencedPositionBounds.available ||
+            visual.vertexBufferId >= scene.pipelines.size() ||
+            !scene.pipelines[visual.vertexBufferId])
+            continue;
+        if (!scene.textureMaterials.empty() &&
+            scene.textureMaterialByVisual.find(visual.visualId) ==
+                scene.textureMaterialByVisual.end())
+            continue;
+        if (scene.automaticLmhFrustumCulling && !scene.textureMaterials.empty())
+        {
+            const auto material = scene.textureMaterialByVisual.find(visual.visualId);
+            const LevelScene::TextureMaterial& binding =
+                scene.textureMaterials[material->second];
+            if (conservativelyOutsideMetalFrustum(binding.localPositionBounds,
+                    binding.modelTransform, scene.uniformData.viewProjection,
+                    scene.liveViewProjectionValid))
+                continue;
+        }
+        ++count;
+    }
+    return count;
+}
+
+struct ColorProbeFrameState
+{
+    std::array<float,4> ao{}, il{};
+    bool aoAvailable=false, ilAvailable=false, initialized=false;
+    std::uint32_t lastFrame=UINT32_MAX, forcedFrame=UINT32_MAX;
+};
+std::unordered_map<IR4Backend*, ColorProbeFrameState>& colorProbeFrames()
+{
+    static std::unordered_map<IR4Backend*, ColorProbeFrameState> states;
+    return states;
+}
+void selectColorProbeFrame(IR4Backend& backend, const MetalR4EngineScene::ViewState& view,
+    const R4EnvironmentSnapshot& environment)
+{
+    if (!view.valid || !environment.valid) return;
+    auto& state=colorProbeFrames()[&backend];
+    if (!state.initialized || state.lastFrame > view.engineFrame ||
+        (view.previousValid && state.lastFrame != view.previousFrame) ||
+        state.ao != environment.ssfxAo || state.il != environment.ssfxIl ||
+        state.aoAvailable != environment.ssfxAoAvailable || state.ilAvailable != environment.ssfxIlAvailable)
+        state.forcedFrame=view.engineFrame;
+    state.ao=environment.ssfxAo; state.il=environment.ssfxIl;
+    state.aoAvailable=environment.ssfxAoAvailable; state.ilAvailable=environment.ssfxIlAvailable;
+    state.lastFrame=view.engineFrame; state.initialized=true;
+}
+bool shouldCaptureColorFrame(IR4Backend& backend, const MetalR4EngineScene::ViewState& view)
+{
+    const char* directory=std::getenv("XRAY_METAL_COLOR_PROBE_DIR");
+    if (!directory || !*directory || !view.valid) return false;
+    const char* intervalText=std::getenv("XRAY_METAL_COLOR_PROBE_EVERY");
+    const auto interval=intervalText ? std::max(1ul,std::strtoul(intervalText,nullptr,10)) : 20ul;
+    return view.cameraCut || view.engineFrame % interval == 0u ||
+        colorProbeFrames()[&backend].forcedFrame == view.engineFrame;
+}
+
+// Readbacks are sampled only when requested, and preserve the production graph.
+bool captureColorPhase(IR4Backend& backend, const MetalR4EngineScene::ViewState& view,
+    const std::string& phase, const std::vector<std::shared_ptr<IR4Texture>>& textures,
+    const std::vector<std::string>& labels, std::string& error,
+    bool rgbZero = false, bool alphaOne = false, bool equalPair = false)
+{
+    if (!shouldCaptureColorFrame(backend, view)) return true;
+    const char* directory = std::getenv("XRAY_METAL_COLOR_PROBE_DIR");
+    R4TemporalTextureValidationDesc descriptor;
+    descriptor.textures = textures; descriptor.labels = labels;
+    descriptor.engineFrame = view.engineFrame; descriptor.previousFrame = view.previousFrame;
+    descriptor.phase = phase; descriptor.outputDirectory = directory;
+    descriptor.expectFinite = true; descriptor.writeImages = true; descriptor.expectRgbZero = rgbZero;
+    descriptor.expectAlphaOne = alphaOne; descriptor.expectEqualPair = equalPair;
+    descriptor.expectDifferentPair = phase.rfind("il_stale_positive_control_", 0) == 0;
+    return backend.ValidateTemporalTextures(descriptor, error);
+}
+
+bool runStaticMotionProbe(IR4Backend& backend, LevelScene& scene,
+    TerrainScene& terrain, MetalR4DefVertexAdapter* defVertex,
+    MetalR4DefObjectsLodAdapter* defObjectsLod,
+    const MetalR4EngineScene::ViewState& view,
+    const R4RenderPassDesc& productionGBufferPass, std::string& error)
+{
+    const char* outputDirectory = std::getenv("XRAY_METAL_MOTION_PROBE_DIR");
+    if (!outputDirectory || !*outputDirectory)
+        return true;
+    if (!view.valid || !scene.gameplayViewValid)
+        return true;
+
+    static std::mutex targetsMutex;
+    static std::unordered_map<IR4Backend*, StaticMotionProbeTargets> targetsByBackend;
+    std::lock_guard<std::mutex> lock(targetsMutex);
+    StaticMotionProbeTargets& targets = targetsByBackend[&backend];
+    const bool reset = view.cameraCut || !view.previousValid;
+    const bool gap = view.previousValid && view.engineFrame > view.previousFrame &&
+        view.engineFrame - view.previousFrame > 1u;
+    const bool firstSample = targets.lastProbeFrame == UINT32_MAX;
+    const bool intervalSample = view.engineFrame % 20u == 0u;
+    const bool resetTransition = reset && !targets.previousSampleWasReset;
+    const bool frameRewound = targets.lastProbeFrame != UINT32_MAX &&
+        view.engineFrame < targets.lastProbeFrame;
+    targets.previousSampleWasReset = reset;
+    if (!firstSample && !intervalSample && !resetTransition && !gap && !frameRewound)
+        return true;
+    if (!ensureStaticMotionProbeTargets(backend, scene, targets, error))
+        return false;
+
+    Matrix4 currentView, currentProjection;
+    std::memcpy(currentView.elements, view.view.data(), sizeof(currentView.elements));
+    std::memcpy(currentProjection.elements, view.projection.data(), sizeof(currentProjection.elements));
+    const Matrix4 currentViewProjection = multiply(currentProjection, currentView);
+
+    const auto validateFamily = [&](const char* family, const std::function<bool(std::string&)>& draw,
+                                    const std::function<std::size_t()>& submittedCount,
+                                    const std::size_t candidates) {
+        R4RenderPassDesc pass = productionGBufferPass;
+        pass.label = family;
+        for (std::size_t index = 0; index < pass.colorAttachments.size(); ++index)
+        {
+            pass.colorAttachments[index].texture = targets.gBuffer[index];
+            pass.colorAttachments[index].loadAction = R4LoadAction::Clear;
+            pass.colorAttachments[index].storeAction = R4StoreAction::Store;
+            pass.colorAttachments[index].clearColor = {0.0, 0.0, 0.0, 0.0};
+        }
+        pass.depthStencilAttachment.texture = targets.depth;
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
+        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        pass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Clear;
+        pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        if (!backend.BeginRenderPass(pass, error) ||
+            !backend.SetStencilReference(1u, error) || !draw(error) ||
+            !backend.EndRenderPass(error))
+            return false;
+
+        R4StaticMotionValidationDesc descriptor;
+        descriptor.depth = targets.depth;
+        descriptor.motion = targets.gBuffer[3];
+        std::memcpy(descriptor.currentViewProjection.data(), currentViewProjection.elements,
+            sizeof(currentViewProjection.elements));
+        std::memcpy(descriptor.previousViewProjection.data(), scene.previousViewProjection.elements,
+            sizeof(scene.previousViewProjection.elements));
+        descriptor.family = family;
+        descriptor.outputDirectory = outputDirectory;
+        descriptor.engineFrame = view.engineFrame;
+        descriptor.previousFrame = view.previousFrame;
+        descriptor.reset = reset;
+        if (!backend.ValidateStaticMotionVectors(descriptor, error))
+            return false;
+        const std::size_t submitted = submittedCount();
+        std::fprintf(stderr,
+            "METAL_STATIC_MOTION_PROBE frame=%u previous_frame=%u family=%s reset=%d candidates=%zu submitted=%zu output=%s\n",
+            view.engineFrame, view.previousFrame, family, reset ? 1 : 0,
+            candidates, submitted, outputDirectory);
+        return true;
+    };
+
+    const std::size_t lmhDraws = countLmhProbeDraws(scene);
+    const std::uint64_t lmhFrames = scene.automaticLmhFrustumFrames;
+    const std::uint64_t lmhSubmitted = scene.automaticLmhFrustumSubmitted;
+    const std::uint64_t lmhCulled = scene.automaticLmhFrustumCulled;
+    const bool lmhLiveReported = scene.automaticLmhLiveFrustumReported;
+    const bool lmhGameplayReported = scene.automaticLmhGameplayFrustumReported;
+    std::size_t lmhSubmittedForProbe = 0u;
+    if (!validateFamily("LMH", [&scene, &backend, &lmhSubmittedForProbe](std::string& drawError) {
+            const bool drawn = drawLevelScene(backend, scene, drawError);
+            lmhSubmittedForProbe = scene.automaticLmhFrustumCulling ?
+                static_cast<std::size_t>(scene.automaticLmhFrustumSubmitted) :
+                countLmhProbeDraws(scene);
+            return drawn;
+        }, [&lmhSubmittedForProbe]() { return lmhSubmittedForProbe; }, lmhDraws))
+        return false;
+    scene.automaticLmhFrustumFrames = lmhFrames;
+    scene.automaticLmhFrustumSubmitted = lmhSubmitted;
+    scene.automaticLmhFrustumCulled = lmhCulled;
+    scene.automaticLmhLiveFrustumReported = lmhLiveReported;
+    scene.automaticLmhGameplayFrustumReported = lmhGameplayReported;
+
+    const std::uint64_t terrainFrames = terrain.renderCount;
+    const std::size_t terrainSubmitted = terrain.lastSubmitted;
+    const std::size_t terrainCulled = terrain.lastCulled;
+    const bool terrainLiveReported = terrain.liveFrustumReported;
+    const bool terrainGameplayReported = terrain.gameplayFrustumReported;
+    const std::size_t terrainCandidates = terrain.ready &&
+        (terrain.uploaded || terrain.pendingUploaded) ? terrain.draws.size() : 0u;
+    std::size_t terrainSubmittedForProbe = 0u;
+    if (!validateFamily("terrain", [&backend, &scene, &terrain, &terrainSubmittedForProbe](std::string& drawError) {
+            const bool drawn = drawTerrainScene(backend, scene, terrain, drawError);
+            terrainSubmittedForProbe = terrain.ready &&
+                (terrain.uploaded || terrain.pendingUploaded) ? terrain.lastSubmitted : 0u;
+            return drawn;
+        }, [&terrainSubmittedForProbe]() { return terrainSubmittedForProbe; }, terrainCandidates))
+        return false;
+    terrain.renderCount = terrainFrames;
+    terrain.lastSubmitted = terrainSubmitted;
+    terrain.lastCulled = terrainCulled;
+    terrain.liveFrustumReported = terrainLiveReported;
+    terrain.gameplayFrustumReported = terrainGameplayReported;
+
+    const std::size_t defVertexCandidates = defVertex && defVertex->IsReady() ?
+        defVertex->LastTelemetry().admittedVisuals : 0u;
+    std::size_t defVertexSubmittedForProbe = 0u;
+    if (!validateFamily("DefVertex", [&, defVertex](std::string& drawError) {
+            if (!defVertex)
+                return true;
+            R4DefVertexViewState familyView;
+            familyView.view = view.view;
+            familyView.projection = view.projection;
+            familyView.previousView = view.previousView;
+            familyView.previousProjection = view.previousProjection;
+            familyView.previousValid = view.previousValid;
+            familyView.cameraCut = view.cameraCut;
+            familyView.valid = view.valid;
+            const bool drawn = defVertex->DrawIntoActiveGBuffer(backend, familyView, drawError);
+            defVertexSubmittedForProbe = defVertex->IsReady() ?
+                defVertex->LastTelemetry().submittedVisuals : 0u;
+            return drawn;
+        }, [&defVertexSubmittedForProbe]() { return defVertexSubmittedForProbe; },
+        defVertexCandidates))
+        return false;
+
+    const std::size_t defObjectsCandidates = defObjectsLod && defObjectsLod->IsReady() ?
+        defObjectsLod->LastTelemetry().requestedVisuals : 0u;
+    std::size_t defObjectsSubmittedForProbe = 0u;
+    if (!validateFamily("DefObjectsLod", [&, defObjectsLod](std::string& drawError) {
+            if (!defObjectsLod)
+                return true;
+            R4DefObjectsLodViewState familyView;
+            familyView.view = view.view;
+            familyView.projection = view.projection;
+            familyView.previousView = view.previousView;
+            familyView.previousProjection = view.previousProjection;
+            familyView.previousValid = view.previousValid;
+            familyView.cameraCut = view.cameraCut;
+            familyView.staticGlobals = scene.baseLightingStaticGlobals;
+            familyView.valid = view.valid;
+            const bool drawn = defObjectsLod->DrawIntoActiveGBuffer(backend, familyView, drawError);
+            defObjectsSubmittedForProbe = defObjectsLod->IsReady() ?
+                defObjectsLod->LastTelemetry().submittedVisuals : 0u;
+            return drawn;
+        }, [&defObjectsSubmittedForProbe]() { return defObjectsSubmittedForProbe; },
+        defObjectsCandidates))
+        return false;
+
+    targets.lastProbeFrame = view.engineFrame;
+    return true;
+}
+
 bool renderProductionScene(
     IR4Backend& backend,
     LevelScene& scene,
@@ -2843,28 +4353,45 @@ bool renderProductionScene(
     MetalR4StaticForwardAdapter* staticForward,
     MetalR4SsfxAoAdapter* ssfxAo,
     std::uint64_t& ssfxAoTelemetryFrame,
+    MetalR4SsrAdapter* ssfxSsr,
+    std::shared_ptr<IR4Texture>& ssrSceneColorSnapshot,
+    MetalR4VolumetricAdapter* volumetric,
     MetalR4RainAdapter* rain,
     std::uint64_t& rainTelemetryFrame,
     MetalR4WaterAdapter* water,
+    MetalR4LensFlareAdapter* lensFlare,
+    MetalR4LensFlareAdapter* lensOverlay,
+    std::uint64_t& lensFlareTelemetryFrame,
     MetalR4LocalLightAdapter* localLights,
     LocalShadowScene* localShadows,
     MetalR4DynamicWorldAdapter* dynamicWorld,
+    const MetalR4DynamicWorldAdapter::Options& dynamicProbeOptions,
+    MetalR4FloraAdapter* flora, const R4FloraViewState& floraView,
+    MetalR4DetailGrassAdapter* detail, const R4DetailGrassViewState& detailView,
     MetalR4HudAdapter* hud,
     MetalR4ScopeAdapter* scope,
     MetalR4ParticleAdapter* particles,
+    MetalR4BloomAdapter* bloom,
+    std::shared_ptr<IR4Texture>& emissiveTarget,
+    float pdaDisplayFactor,
     NightVisionScene* nightVision,
     const MetalR4EngineScene::ViewState& view,
     const R4EnvironmentSnapshot& environment,
     const R4GameplayVisionSnapshot& vision,
     const std::shared_ptr<const MetalR4EngineScene::GBufferWorldDrawCallback>& worldDraw,
+    MetalR4FogScatteringAdapter* fogScattering,
     std::string& error)
 {
+    selectColorProbeFrame(backend, view, environment);
     if (!ensureLevelDepthTarget(backend, scene, error) ||
         !uploadLevelScene(backend, scene, error) ||
         (defVertex && !defVertex->Upload(backend, error)) ||
         (defObjectsLod && !defObjectsLod->Upload(backend, error)) ||
         (staticForward && !staticForward->Upload(backend, error)))
         return false;
+    const char* probeIntervalText=std::getenv("XRAY_METAL_SHADOW_PROBE_EVERY");
+    const unsigned requestedProbeInterval=probeIntervalText?static_cast<unsigned>(std::strtoul(probeIntervalText,nullptr,10)):20u;
+    const unsigned shadowProbeInterval=requestedProbeInterval>=1u && requestedProbeInterval<=3000u?requestedProbeInterval:20u;
     if (scene.productionLuminance)
     {
         const R4Texture2DDesc& source = scene.lightingTargets[1]->Descriptor();
@@ -2881,6 +4408,7 @@ bool renderProductionScene(
 
     if (scene.productionSun)
     {
+        E07ShadowCpuScope e07ShadowCpu(dynamicWorld, false);
         const auto drawDynamicSunCasters = [&backend, dynamicWorld](const Matrix4& lightViewProjection,
             std::string& drawError) {
             if (!dynamicWorld || !dynamicWorld->IsEnabled())
@@ -2891,28 +4419,153 @@ bool renderProductionScene(
             return dynamicWorld->DrawLocalShadowTile(backend, matrix,
                 backend.EngineWorldSnapshot(), candidates, submitted, culled, rejected, drawError);
         };
-        R4RenderPassDesc shadowPass;
-        shadowPass.label = "R4 engine converted direct-sun near shadow map";
-        shadowPass.useDrawable = false;
-        R4ColorAttachmentDesc shadowColor;
-        shadowColor.texture = scene.sunNearShadowTexture;
-        shadowColor.clearColor = {1.0, 1.0, 1.0, 1.0};
-        shadowPass.colorAttachments = {shadowColor};
-        shadowPass.depthStencilAttachment.texture = scene.sunShadowDepthTarget;
-        shadowPass.depthStencilAttachment.depthStoreAction = R4StoreAction::DontCare;
-        if (!backend.BeginRenderPass(shadowPass, error) ||
-            !drawSunShadowMap(backend, scene, true, error) ||
-            !drawDynamicSunCasters(scene.sunNearShadowViewProjection, error) ||
-            !backend.EndRenderPass(error))
-            return false;
-
-        shadowPass.label = "R4 engine converted direct-sun far shadow map";
-        shadowPass.colorAttachments.front().texture = scene.sunShadowTexture;
-        if (!backend.BeginRenderPass(shadowPass, error) ||
-            !drawSunShadowMap(backend, scene, false, error) ||
-            !drawDynamicSunCasters(scene.sunShadowViewProjection, error) ||
-            !backend.EndRenderPass(error))
-            return false;
+        const auto drawDefVertexSunCasters = [&backend, defVertex, &scene](
+            const Matrix4& lightViewProjection, std::string& drawError) {
+            if (!defVertex || !defVertex->IsReady())
+                return true;
+            std::array<float, 16> matrix{};
+            std::memcpy(matrix.data(), lightViewProjection.elements, sizeof(matrix));
+            return defVertex->DrawShadowCasters(backend, matrix,
+                scene.sunShadowPipeline, scene.sunShadowArefPipeline,
+                scene.sunShadowSampler, drawError);
+        };
+        const auto drawDefObjectsLodSunCasters = [&backend, defObjectsLod, &scene](
+            const Matrix4& lightViewProjection, std::string& drawError) {
+            if (!defObjectsLod || !defObjectsLod->IsReady())
+                return true;
+            std::array<float, 16> matrix{};
+            std::memcpy(matrix.data(), lightViewProjection.elements, sizeof(matrix));
+            return defObjectsLod->DrawShadowCasters(backend, matrix,
+                scene.sunShadowPipeline, drawError);
+        };
+        if (scene.sunCascadesValid)
+        for (unsigned cascade=0;cascade<3;++cascade)
+        {
+            R4RenderPassDesc shadowPass;
+            const std::string shadowLabel="R4 engine converted direct-sun shadow cascade " + std::to_string(cascade);
+            shadowPass.label = shadowLabel.c_str();
+            shadowPass.useDrawable=false;
+            R4ColorAttachmentDesc shadowColor;
+            shadowColor.texture=scene.sunCascades[cascade].shadow;
+            shadowColor.clearColor={1,1,1,1};
+            shadowPass.colorAttachments={shadowColor};
+            shadowPass.depthStencilAttachment.texture=scene.sunShadowDepthTarget;
+            shadowPass.depthStencilAttachment.depthStoreAction=R4StoreAction::DontCare;
+            const Matrix4& matrix=scene.sunCascades[cascade].lightViewProjection;
+            std::vector<std::size_t> fallbackCasters;
+            auto& sunCasters = localShadows ? localShadows->sunCasters : fallbackCasters;
+            const bool sunLinear = localShadows ? localShadows->sunLinear :
+                std::getenv("XRAY_METAL_E08_SUN_LINEAR") != nullptr;
+            const bool sunOracle = localShadows ? localShadows->sunOracle :
+                std::getenv("XRAY_METAL_E08_SUN_ORACLE") != nullptr;
+            sunCasters.clear();
+            std::size_t sunCandidates = scene.textureMaterials.size();
+            if (!sunLinear)
+            {
+                const auto select = [&](const std::size_t i) {
+                    const auto& m = scene.textureMaterials[i];
+                    if (!conservativelyOutsideMetalFrustum(m.localPositionBounds,
+                            m.modelTransform, matrix, true)) sunCasters.push_back(i);
+                };
+                if (localShadows && localShadows->ready)
+                {
+                    const auto& broad = localShadows->staticIndex.Query(matrix.elements);
+                    sunCandidates = broad.size();
+                    for (const auto i : broad) select(i);
+                }
+                else
+                    for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i) select(i);
+                if (sunOracle)
+                    for (std::size_t i = 0; i < scene.textureMaterials.size(); ++i)
+                    {
+                        const auto& m = scene.textureMaterials[i];
+                        if (!conservativelyOutsideMetalFrustum(m.localPositionBounds, m.modelTransform,
+                                matrix, true) && !std::binary_search(sunCasters.begin(), sunCasters.end(), i))
+                        { error = "E08 static sun broad phase omitted an oracle caster"; return false; }
+                    }
+            }
+            // Bounded, opt-in pixel oracle: real static materials/shaders,
+            // complete legacy list vs selected list in isolated GPU maps.
+            // The existing validator is used solely to export completed R32
+            // snapshots; no off-camera receiver claim is made (count remains 0).
+            const char* pixelDirectory = std::getenv("XRAY_METAL_E08_SUN_PIXEL_ORACLE_DIR");
+            if (pixelDirectory && *pixelDirectory && localShadows && !sunLinear &&
+                view.engineFrame % 240u == 0 && localShadows->sunPixelPairs < 6)
+            {
+                auto& map = localShadows->sunPixelMaps[cascade];
+                if (!map)
+                {
+                    auto desc = scene.sunCascades[cascade].shadow->Descriptor();
+                    desc.label = "R4 E08 static sun GPU oracle";
+                    map = backend.Resources().CreateTexture2D(desc, error);
+                    if (!map) return false;
+                }
+                for (const bool culled : {false, true})
+                {
+                    auto pass = shadowPass;
+                    pass.label = "R4 E08 static sun GPU oracle";
+                    pass.colorAttachments[0].texture = map;
+                    if (!backend.BeginRenderPass(pass, error) ||
+                        !drawSunShadowMap(backend, scene, cascade, error, false, false,
+                            nullptr, nullptr, culled ? &sunCasters : nullptr) ||
+                        !backend.EndRenderPass(error)) return false;
+                    R4SunShadowValidationDesc snapshot;
+                    snapshot.shadowR32 = map; snapshot.positionRGBA16F = scene.gBufferTargets[0];
+                    snapshot.sceneDepthStencil = scene.depthTarget;
+                    snapshot.accumulationRGBA16F = scene.lightingAccumulator;
+                    snapshot.positionDecompressionParams = scene.positionDecompressionParams;
+                    const auto inverse = inverseRigidTransform(scene.view);
+                    std::memcpy(snapshot.inverseView.data(), &inverse, sizeof(inverse));
+                    std::memcpy(snapshot.currentViewProjection.data(), &scene.uniformData.viewProjection, sizeof(Matrix4));
+                    std::memcpy(snapshot.stageVolumeViewProjection.data(), &matrix, sizeof(matrix));
+                    snapshot.family = "e08-static-sun-c" + std::to_string(cascade) + (culled ? "-culled" : "-full");
+                    snapshot.outputDirectory = pixelDirectory; snapshot.engineFrame = view.engineFrame;
+                    snapshot.phase = R4SunShadowValidationPhase::OffCameraCasters;
+                    snapshot.requireShadowedReceivers = false; snapshot.exportShadowMap = true;
+                    if (!backend.ValidateSunShadowCascade(snapshot, error)) return false;
+                }
+                ++localShadows->sunPixelPairs;
+            }
+            std::size_t staticSunDraws = 0;
+            if (!backend.BeginRenderPass(shadowPass,error) ||
+                !drawSunShadowMap(backend,scene,cascade,error, false, false, &staticSunDraws,
+                    nullptr, sunLinear ? nullptr : &sunCasters) ||
+                !drawDynamicSunCasters(matrix,error) || !drawDefVertexSunCasters(matrix,error) ||
+                !drawDefObjectsLodSunCasters(matrix,error)) return false;
+            std::array<float,16> lightVP{};
+            std::memcpy(lightVP.data(),matrix.elements,sizeof(Matrix4));
+            if (flora && flora->IsReady() && !flora->DrawShadowCasters(backend,lightVP,floraView,error))
+                return false;
+            if (detail && detail->IsReady() && environment.grassShadows &&
+                cascade<=environment.ssfxGrassShadows[0])
+            {
+                R4DetailGrassShadowState shadow;
+                shadow.lightView={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+                shadow.lightProjection=lightVP; shadow.lightViewProjection=lightVP;
+                shadow.fadeDistance=environment.detailFadeDistance*environment.detailFadeDistance*environment.ssfxGrassShadows[1];
+                if (!detail->DrawShadowCasters(backend,detailView,shadow,error)) return false;
+            }
+            if (!backend.EndRenderPass(error))
+                return false;
+            if (localShadows && std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR") &&
+                !runFloraShadowPixelOracle(backend, scene, localShadows->floraSunOracle,
+                    flora, floraView, view, lightVP,
+                    scene.sunCascades[cascade].shadow->Descriptor().width,
+                    "gameplay-flora-sun-c" + std::to_string(cascade), 6u, 3u, error))
+                return false;
+            if (view.engineFrame % 120u == 0u)
+                std::fprintf(stderr, "METAL_E08_STATIC_SUN frame=%u cascade=%u total=%zu candidates=%zu draws=%zu oracle=%u\n",
+                    view.engineFrame, cascade, scene.textureMaterials.size(), sunCandidates,
+                    staticSunDraws, unsigned(sunOracle));
+            if (view.engineFrame%20u==0u)
+                std::fprintf(stderr,"METAL_SUN_CASCADE_FRAME frame=%u cascade=%u size=%.3f bias=%.8f reset=%u flora_draws=%zu grass_enabled=%u grass_draws=%zu planes=%zu\n",
+                    view.engineFrame,cascade,scene.sunCascadeContract.cascades[cascade].size,
+                    scene.sunCascadeContract.cascades[cascade].bias,
+                    scene.sunCascadeContract.cascades[cascade].resetChain,
+                    flora?flora->LastTelemetry().shadowDraws:0u,environment.grassShadows,
+                    detail && environment.grassShadows && cascade<=environment.ssfxGrassShadows[0]?detail->LastTelemetry().shadowDraws:0u,
+                    scene.sunCascadeContract.cascades[cascade].casterPlanes.size());
+        }
     }
 
     R4RenderPassDesc gBufferPass;
@@ -2927,15 +4580,22 @@ bool renderProductionScene(
         attachment.clearColor = {0.0, 0.0, 0.0, 0.0};
         gBufferPass.colorAttachments.emplace_back(std::move(attachment));
     }
+    LevelScene::ActiveOcclusionObservation* activeOcclusionObservation = nullptr;
+    if (scene.activeOcclusionEnabled && activeOcclusionFrameInWindow(view.engineFrame))
+        activeOcclusionObservation = currentActiveOcclusionObservation(scene, view.engineFrame);
     if (!backend.BeginRenderPass(gBufferPass, error) ||
         !backend.SetStencilReference(1, error) ||
-        !drawLevelScene(backend, scene, error))
+        !drawLevelScene(backend, scene, error, activeOcclusionObservation))
         return false;
     if (defVertex)
     {
         R4DefVertexViewState defVertexView;
         defVertexView.view = view.view;
         defVertexView.projection = view.projection;
+        defVertexView.previousView = view.previousView;
+        defVertexView.previousProjection = view.previousProjection;
+        defVertexView.previousValid = view.previousValid;
+        defVertexView.cameraCut = view.cameraCut;
         defVertexView.valid = view.valid;
         if (!defVertex->DrawIntoActiveGBuffer(backend, defVertexView, error))
             return false;
@@ -2945,6 +4605,10 @@ bool renderProductionScene(
         R4DefObjectsLodViewState defObjectsLodView;
         defObjectsLodView.view = view.view;
         defObjectsLodView.projection = view.projection;
+        defObjectsLodView.previousView = view.previousView;
+        defObjectsLodView.previousProjection = view.previousProjection;
+        defObjectsLodView.previousValid = view.previousValid;
+        defObjectsLodView.cameraCut = view.cameraCut;
         defObjectsLodView.staticGlobals = scene.baseLightingStaticGlobals;
         defObjectsLodView.valid = view.valid;
         if (!defObjectsLod->DrawIntoActiveGBuffer(backend, defObjectsLodView, error))
@@ -2979,6 +4643,12 @@ bool renderProductionScene(
     }
     if (!backend.EndRenderPass(error))
         return false;
+    completeActiveOcclusionObservation(scene, activeOcclusionObservation);
+    if (!captureColorPhase(backend, view, "gbuffer_world", scene.gBufferTargets,
+            {"position_packed_normal", "diffuse", "auxiliary", "motion"}, error)) return false;
+    if (!runStaticMotionProbe(backend, scene, terrain, defVertex, defObjectsLod,
+            view, gBufferPass, error))
+        return false;
 
     const std::shared_ptr<const R4EngineHudSnapshot> hudSnapshot =
         ((hud && hud->IsReady()) || (scope && scope->IsReady())) ?
@@ -2989,6 +4659,9 @@ bool renderProductionScene(
             [](const R4EngineHudRenderable& renderable) {
                 return !renderable.scopeLeaves.empty();
             });
+    const bool hasEmissiveHud = hudSnapshot && hudSnapshot->valid && hud && hud->IsReady() &&
+        std::any_of(hudSnapshot->renderables.begin(), hudSnapshot->renderables.end(),
+            [](const R4EngineHudRenderable& renderable) { return !renderable.emissiveGeometryIndices.empty(); });
     const bool hasOpaqueHud = hudSnapshot && hudSnapshot->valid && hud && hud->IsReady() &&
         std::any_of(hudSnapshot->renderables.begin(), hudSnapshot->renderables.end(),
             [](const R4EngineHudRenderable& renderable) {
@@ -3063,10 +4736,91 @@ bool renderProductionScene(
             return false;
     }
 
-    if (localLights && localLights->IsReady() && localShadows && localShadows->ready &&
-        !renderLocalShadowAtlas(backend, scene, *localShadows, view,
-			backend.EngineLightingFrameSnapshot(), dynamicWorld, error))
-        return false;
+    const bool volumeFrame = volumetric && volumetric->IsReady() && view.valid && environment.valid &&
+        environment.ssfxVolumetricAvailable;
+    if (volumeFrame)
+    {
+        const auto& size = scene.gBufferTargets[0]->Descriptor();
+        if (!volumetric->PrepareRenderTargets(backend, size.width, size.height,
+                environment.volumetricResolutionDivisor, error)) return false;
+        MetalR4VolumetricAdapter::FrameInputs inputs;
+        inputs.engineFrame = view.engineFrame; inputs.position = scene.gBufferTargets[0];
+        inputs.staticGlobals = scene.baseLightingStaticGlobals;
+        if (!volumetric->BeginFrame(backend, inputs, error)) return false;
+    }
+
+    if (bloom)
+    {
+        const auto& size = scene.gBufferTargets[0]->Descriptor();
+        if (!emissiveTarget || emissiveTarget->Descriptor().width != size.width ||
+            emissiveTarget->Descriptor().height != size.height)
+        {
+            R4Texture2DDesc target;
+            target.width = size.width; target.height = size.height;
+            target.format = R4PixelFormat::BGRA8Unorm;
+            target.storage = R4ResourceStorage::Private;
+            target.usage = R4TextureUsage::RenderTarget | R4TextureUsage::ShaderRead;
+            target.label = "R4 exact rt_ssfx_bloom_emissive";
+            emissiveTarget = backend.Resources().CreateTexture2D(target, error);
+            if (!emissiveTarget) return false;
+        }
+        R4RenderPassDesc pass;
+        pass.label = "R4 exact admitted selflightl emissive producer";
+        pass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = emissiveTarget;
+        color.clearColor = {0.0, 0.0, 0.0, 0.0};
+        color.storeAction = R4StoreAction::Store;
+        pass.colorAttachments = {color};
+        pass.depthStencilAttachment.texture = scene.depthTarget;
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        pass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        R4DynamicWorldViewState dynamicView;
+        dynamicView.view = view.view; dynamicView.projection = view.projection;
+        dynamicView.previousView = view.previousView;
+        dynamicView.previousProjection = view.previousProjection;
+        dynamicView.eye = view.eye; dynamicView.engineFrame = view.engineFrame;
+        dynamicView.previousFrame = view.previousFrame;
+        dynamicView.valid = view.valid; dynamicView.previousValid = view.previousValid;
+        dynamicView.cameraCut = view.cameraCut;
+        if (!backend.BeginRenderPass(pass, error)) return false;
+        const bool drawn = !dynamicWorld || !dynamicWorld->IsEnabled() ||
+            dynamicWorld->DrawEmissive(backend, dynamicView, backend.EngineWorldSnapshot(), pdaDisplayFactor, error);
+        std::string endError; const bool ended = backend.EndRenderPass(endError);
+        if (!drawn) return false;
+        if (!ended) { error = endError; return false; }
+        if (hasEmissiveHud)
+        {
+            pass.label = "R4 exact admitted HUD selflightl emissive producer";
+            pass.colorAttachments[0].loadAction = R4LoadAction::Load;
+            pass.hasViewport = true;
+            pass.viewport = {0.0, 0.0, double(size.width), double(size.height), 0.0, 0.02};
+            if (!backend.BeginRenderPass(pass, error)) return false;
+            const bool hudDrawn = hud->DrawEmissive(backend, hudSnapshot, pdaDisplayFactor, error);
+            const bool hudEnded = backend.EndRenderPass(endError);
+            if (!hudDrawn) return false;
+            if (!hudEnded) { error = endError; return false; }
+        }
+        const auto world = dynamicWorld ? dynamicWorld->LastTelemetry() : MetalR4DynamicWorldAdapter::Telemetry{};
+        const auto ui = hud ? hud->LastTelemetry() : MetalR4HudAdapter::Telemetry{};
+        static std::uint32_t lastEmissiveFrame = UINT32_MAX;
+        static std::size_t lastCandidates = SIZE_MAX, lastDraws = SIZE_MAX;
+        const auto candidates = world.emissiveCandidates + ui.emissiveCandidates;
+        const auto draws = world.emissiveDraws + ui.emissiveDraws;
+        if (lastEmissiveFrame == UINT32_MAX || environment.engineFrame < lastEmissiveFrame ||
+            environment.engineFrame - lastEmissiveFrame >= 300u ||
+            candidates != lastCandidates || draws != lastDraws)
+        {
+            std::fprintf(stderr, "METAL_EMISSIVE_FRAME frame=%u world=%zu/%zu rejected=%zu hud=%zu/%zu rejected=%zu family=selflightl\n",
+                environment.engineFrame, world.emissiveDraws, world.emissiveCandidates, world.emissiveRejected,
+                ui.emissiveDraws, ui.emissiveCandidates, ui.emissiveRejected);
+            lastEmissiveFrame = environment.engineFrame;
+            lastCandidates = candidates; lastDraws = draws;
+        }
+
+    }
 
     R4RenderPassDesc accumulatorPass;
     accumulatorPass.label = "R4 engine light accumulator clear";
@@ -3089,28 +4843,118 @@ bool renderProductionScene(
         sunDepthStencil.stencilLoadAction = R4LoadAction::Load;
         sunDepthStencil.stencilStoreAction = R4StoreAction::Store;
 
+        const auto validateSun = [&](R4SunShadowValidationPhase phase, unsigned cascade) {
+            const char* output=std::getenv("XRAY_METAL_SHADOW_PROBE_DIR");
+            if (!output || !*output || !view.valid || !scene.sunCascadesValid ||
+                view.engineFrame % shadowProbeInterval != 0u) return true;
+            R4SunShadowValidationDesc witness;
+            witness.shadowR32=scene.sunCascades[cascade].shadow;
+            witness.positionRGBA16F=scene.gBufferTargets[0];
+            witness.positionDecompressionParams=scene.positionDecompressionParams;
+            witness.sceneDepthStencil=scene.depthTarget;
+            witness.accumulationRGBA16F=scene.lightingAccumulator;
+            witness.family="production"; witness.outputDirectory=output;
+            witness.engineFrame=view.engineFrame; witness.phase=phase;
+            const Matrix4 inverse=inverseRigidTransform(scene.view);
+            std::memcpy(witness.inverseView.data(),&inverse,sizeof(inverse));
+            std::memcpy(witness.currentViewProjection.data(),&scene.uniformData.viewProjection,sizeof(Matrix4));
+            std::memcpy(witness.stageVolumeViewProjection.data(),
+                &scene.sunCascades[cascade==2?1:cascade].lightViewProjection,sizeof(Matrix4));
+            witness.receiverVolume=scene.sunCascadeContract.cascades[cascade].receiverVolume;
+            witness.hasReceiverVolume=true;
+            witness.farZCullEnabled=scene.sunZCulling;
+            witness.nearDepthScale=environment.sunDepthScale[0]; witness.nearDepthBias=scene.sunCascadeContract.cascades[cascade].bias;
+            witness.farDepthScale=environment.sunDepthScale[1]; witness.farDepthBias=scene.sunCascadeContract.cascades[cascade].bias;
+            witness.sourceCascadeSize=scene.sunCascadeContract.cascades[cascade].size;
+            witness.sourceCascadeBias=scene.sunCascadeContract.cascades[cascade].bias;
+            witness.tsmBias=environment.sunTsmBias;
+            witness.sunColorIntensity=environment.adaptedSunColor[0]+environment.adaptedSunColor[1]+environment.adaptedSunColor[2];
+            witness.grassShadowsEnabled=environment.grassShadows;
+            return backend.ValidateSunShadowCascade(witness,error);
+        };
         R4RenderPassDesc maskPass;
         maskPass.label = "R4 engine converted direct-sun stencil mask";
         maskPass.useDrawable = false;
         maskPass.colorAttachments = {accumulatorAttachment};
         maskPass.depthStencilAttachment = sunDepthStencil;
         if (!backend.BeginRenderPass(maskPass, error) ||
-            !drawSunMask(backend, scene, error) || !backend.EndRenderPass(error))
+            !drawSunMask(backend, scene, error) || !backend.EndRenderPass(error) ||
+            !validateSun(R4SunShadowValidationPhase::StencilBaseline,0u))
             return false;
 
-        R4RenderPassDesc sunPass;
-        sunPass.label = "R4 engine converted direct-sun near cascade";
-        sunPass.useDrawable = false;
-        sunPass.colorAttachments = {accumulatorAttachment};
-        sunPass.depthStencilAttachment = sunDepthStencil;
-        if (!backend.BeginRenderPass(sunPass, error) ||
-            !drawSunCascade(backend, scene, false, error) || !backend.EndRenderPass(error))
-            return false;
+        if (scene.sunCascadesValid)
+        for (unsigned cascade=0;cascade<3;++cascade)
+        {
+            R4RenderPassDesc sunPass;
+            const std::string sunLabel="R4 engine converted direct-sun accumulation cascade " + std::to_string(cascade);
+            sunPass.label=sunLabel.c_str();
+            sunPass.useDrawable=false;
+            sunPass.colorAttachments={accumulatorAttachment};
+            sunPass.depthStencilAttachment=sunDepthStencil;
+            if (!backend.BeginRenderPass(sunPass,error) || !drawSunCascade(backend,scene,cascade,error) ||
+                !backend.EndRenderPass(error) || !validateSun(
+                    static_cast<R4SunShadowValidationPhase>(cascade+1u),cascade)) return false;
+        }
+    }
 
-        sunPass.label = "R4 engine converted direct-sun far cascade";
-        if (!backend.BeginRenderPass(sunPass, error) ||
-            !drawSunCascade(backend, scene, true, error) || !backend.EndRenderPass(error))
-            return false;
+    if (volumeFrame && scene.productionSun && scene.sunCascadesValid && environment.sunShaftsEnabled &&
+        (environment.sunShaftsMode == 1u || environment.sunShaftsMode == 3u) &&
+        environment.sunShaftsIntensity >= 0.0001f)
+    {
+        if (environment.sunShaftsQuality != 1u)
+        { error = "volumetric sun cook only admits source low quality 1"; return false; }
+        MetalR4VolumetricAdapter::SunPass pass;
+        pass.shadowMap = scene.sunCascades[2].shadow;
+        pass.dynamicLight = scene.baseLightingDynamicLight;
+        pass.vertexGlobals = scene.sunVertexGlobals; pass.vertexTransforms = scene.sunVertexTransforms;
+        pass.volumeVertices = scene.sunCascades[2].volume; pass.volumeIndices = scene.sunVolumeIndices;
+        std::memcpy(pass.shadowMatrix.data(), scene.sunCascades[2].shadowLookup.elements, sizeof(Matrix4));
+        pass.nearRange = 0; pass.farRange = environment.sunShaftsFarRange;
+        pass.shaftsIntensity = environment.sunShaftsIntensity;
+        if (!volumetric->DrawSun(backend, pass, error)) return false;
+    }
+
+    if (!captureColorPhase(backend, view, "sun_accumulator", {scene.lightingAccumulator}, {"accumulator"}, error)) return false;
+
+    // Windows first emissive contribution follows sun and precedes local lights.
+    // The bloom target is a separate later destination of the same exact shader.
+    if (dynamicWorld || hasEmissiveHud)
+    {
+        R4RenderPassDesc pass;
+        pass.label = "R4 exact selflightl first accumulator contribution";
+        pass.useDrawable = false;
+        auto color = accumulatorAttachment; color.loadAction = R4LoadAction::Load;
+        color.storeAction = R4StoreAction::Store; pass.colorAttachments = {color};
+        pass.depthStencilAttachment.texture = scene.depthTarget;
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        pass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        R4DynamicWorldViewState dynamicView;
+        dynamicView.view = view.view; dynamicView.projection = view.projection;
+        dynamicView.previousView = view.previousView; dynamicView.previousProjection = view.previousProjection;
+        dynamicView.eye = view.eye; dynamicView.engineFrame = view.engineFrame;
+        dynamicView.previousFrame = view.previousFrame; dynamicView.valid = view.valid;
+        dynamicView.previousValid = view.previousValid; dynamicView.cameraCut = view.cameraCut;
+        if (!backend.BeginRenderPass(pass, error)) return false;
+        const bool drawn = !dynamicWorld || !dynamicWorld->IsEnabled() ||
+            dynamicWorld->DrawEmissiveAccumulator(backend, dynamicView, backend.EngineWorldSnapshot(), pdaDisplayFactor, error);
+        std::string endError; const bool ended = backend.EndRenderPass(endError);
+        if (!drawn) return false;
+        if (!ended) { error=endError; return false; }
+        if (hasEmissiveHud)
+        {
+            pass.label = "R4 exact HUD selflightl first accumulator contribution";
+            pass.hasViewport = true;
+            const auto& size = scene.gBufferTargets[0]->Descriptor();
+            pass.viewport = {0, 0, double(size.width), double(size.height), 0, 0.02};
+            if (!backend.BeginRenderPass(pass, error)) return false;
+            const bool hudDrawn = hud->DrawEmissiveAccumulator(backend, hudSnapshot, pdaDisplayFactor, error);
+            const bool hudEnded = backend.EndRenderPass(endError);
+            if (!hudDrawn) return false;
+            if (!hudEnded) { error=endError; return false; }
+        }
+        if (!captureColorPhase(backend, view, "emissive_accumulator", {scene.lightingAccumulator}, {"accumulator"}, error)) return false;
     }
 
     if (localLights && localLights->IsReady())
@@ -3143,10 +4987,473 @@ bool renderProductionScene(
         MetalR4LocalLightAdapter::ViewState localView;
         localView.view = view.view; localView.projection = view.projection;
         localView.eye = view.eye; localView.valid = view.valid;
-        if (!backend.BeginRenderPass(localLightPass, error) ||
-            !localLights->DrawIntoActiveAccumulator(backend, inputs, localView,
-				backend.EngineLightingFrameSnapshot(), error) || !backend.EndRenderPass(error))
-            return false;
+        const auto snapshot=backend.EngineLightingFrameSnapshot();
+        std::vector<std::vector<std::size_t>> batches;
+        std::vector<std::size_t> unshadowed;
+        const bool e08PlanTiming = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120u == 0u;
+        const auto e08PlanStart = e08PlanTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (!planLocalShadowBatches(view,snapshot,environment,batches,unshadowed,error)) return false;
+        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
+        xray::metal::R4WholeLightVisibilitySelectionStats visibilityStats;
+        const bool visibilityOptIn = wholeLightVisibilityEnabled();
+        const std::uint32_t visibilityFirstFrame = visibilityOptIn ?
+            wholeLightVisibilityFirstFrame() : UINT32_MAX;
+        const char* visibilityFailureReason = nullptr;
+        std::string visibilitySelectionError;
+        if (visibilityOptIn && snapshot)
+        {
+            try
+            {
+                if (visibilityFirstFrame != UINT32_MAX)
+                    xray::metal::SelectR4WholeLightVisibilitySamples(*snapshot, environment, batches,
+                        visibilityFirstFrame, view.engineFrame, visibilitySamples, visibilityStats,
+                        visibilitySelectionError);
+            }
+            catch (const std::bad_alloc&)
+            {
+                visibilityFailureReason = "selection-allocation-failed";
+                visibilitySamples.clear();
+                visibilityStats = {};
+            }
+            if (!visibilitySelectionError.empty())
+                visibilityFailureReason = "selection-invalid-input";
+        }
+        const bool activeOcclusionObserveRequested = scene.activeOcclusionRequested &&
+            visibilityOptIn && activeOcclusionFrameInWindow(view.engineFrame);
+        if (activeOcclusionObserveRequested)
+        {
+            ActiveOcclusionGridStats activeStats;
+            activeStats.scopeId = scene.activeOcclusionObservation.scopeId;
+            R4ActiveOcclusion::CoverageGrid activeGrid;
+            try
+            {
+                if (!scene.activeOcclusionEnabled)
+                    activeStats.reason = "static-source-not-enabled";
+                else if (!scene.activeOcclusionLocalVolumeShaderQualified)
+                    activeStats.reason = scene.activeOcclusionLocalVolumeShaderReason ?
+                        scene.activeOcclusionLocalVolumeShaderReason : "local-volume-shader-unqualified";
+                else if (visibilitySamples.empty())
+                    activeStats.reason = "no-selected-complete-groups";
+                else
+                    buildActiveOcclusionGrid(scene, snapshot, visibilitySamples, activeGrid, activeStats);
+                if (!visibilitySamples.empty())
+                    queryActiveOcclusionSamples(scene, snapshot, localView, batches,
+                        visibilitySamples, activeGrid, activeStats);
+            }
+            catch (...)
+            {
+                activeGrid.Reset();
+                activeStats.ready = false;
+                activeStats.reason = "observer-exception-fail-open";
+                for (auto& sample : visibilitySamples)
+                    sample.cpuObservationScopeId = 0u;
+            }
+            {
+                const char* gridStatus = activeStats.ready ? "ready" :
+                    (activeStats.reason && std::strcmp(activeStats.reason,
+                        "no-selected-complete-groups") != 0 &&
+                        std::strcmp(activeStats.reason, "static-source-not-enabled") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-artifact-identity-mismatch") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-source-or-receipt-identity-mismatch") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-metallib-unreadable-or-oversized") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-reflection-unreadable-or-oversized") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-receipt-unreadable-or-oversized") != 0 &&
+                        std::strcmp(activeStats.reason, "local-volume-qualification-failed") != 0 ?
+                        "unknown" : "skipped");
+                std::fprintf(stderr,
+                    "METAL_ACTIVE_OCCLUSION_GRID status=%s cpu_observation_scope=%llu engine_frame=%u "
+                    "selected_groups=%zu selected_faces=%zu draw_receipts=%zu selected_draws=%zu "
+                    "draws_used=%zu draws_skipped=%zu receipt_triangles=%llu selected_triangles=%llu "
+                    "omitted_receipt_triangles=%llu selector_invalid=%zu selector_duplicate=%zu "
+                    "selector_unknown_projection=%zu selector_outside_viewport=%zu selector_budget_omissions=%zu "
+                    "selection_budget=%u triangles=%zu source_pairs=%zu "
+                    "paired_unions_accepted=%u cells_marked=%u primitive_cell_tests=%llu "
+                    "query_cell_tests=%llu query_invalid=%u triangle_cap=%u cell_test_cap=%u build_ms=%.6f query_ms=%.6f "
+                    "raster_convention=synthetic_only suppression=disabled reason=%s\n",
+                    gridStatus, static_cast<unsigned long long>(activeStats.scopeId),
+                    view.engineFrame, visibilityStats.selectedGroups, visibilitySamples.size(),
+                    activeStats.receiptsSeen, activeStats.selectedDraws,
+                    activeStats.drawsUsed, activeStats.drawsSkipped,
+                    static_cast<unsigned long long>(activeStats.receiptTriangles),
+                    static_cast<unsigned long long>(activeStats.selectedTriangles),
+                    static_cast<unsigned long long>(activeStats.omittedReceiptTriangles),
+                    activeStats.selectorInvalidReceipts,
+                    activeStats.selectorDuplicateReceipts,
+                    activeStats.selectorUnknownProjection,
+                    activeStats.selectorOutsideViewport,
+                    activeStats.selectorBudgetOmissions,
+                    activeStats.selectionBudget,
+                    activeStats.inputTriangles, activeStats.sourcePairs,
+                    activeStats.build.pairedUnionsAccepted, activeStats.build.cellsMarked,
+                    static_cast<unsigned long long>(activeStats.build.primitiveCellTests),
+                    static_cast<unsigned long long>(activeStats.queryCellTests),
+                    unsigned(activeStats.queryInvalid),
+                    unsigned(activeStats.sourceTriangleCap || activeStats.build.triangleCapReached),
+                    unsigned(activeStats.build.cellTestCapReached || activeStats.queryCellCap),
+                    activeStats.buildMs, activeStats.queryMs,
+                    activeStats.reason ? activeStats.reason : "none");
+            }
+        }
+        if (e08PlanTiming)
+            std::fprintf(stderr, "METAL_E08_LOCAL_PLAN frame=%u cpu_ms=%.6f batches=%zu\n", view.engineFrame,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08PlanStart).count(), batches.size());
+        const auto homDiagnostic=BeginMetalR4LightHomDiagnostic(view.view,view.projection,view.eye,
+            view.valid,view.engineFrame,snapshot.get(),environment,batches,unshadowed);
+        localLights->BeginFrame();
+        MetalR4LocalLightAdapter::DrawState drawState;
+        if (!visibilitySamples.empty())
+        {
+            try
+            {
+                drawState.visibilitySamples = visibilitySamples;
+            }
+            catch (const std::bad_alloc&)
+            {
+                visibilityFailureReason = "draw-state-allocation-failed";
+                visibilitySamples.clear();
+                drawState.visibilitySamples.clear();
+                visibilityStats = {};
+            }
+        }
+        if (visibilityFailureReason)
+        {
+            static bool loggedDiagnosticFailure = false;
+            if (!loggedDiagnosticFailure)
+            {
+                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=skipped reason=%s\n",
+                    visibilityFailureReason);
+                loggedDiagnosticFailure = true;
+            }
+        }
+        if (visibilityOptIn && visibilityFirstFrame != UINT32_MAX &&
+            view.engineFrame >= visibilityFirstFrame && view.engineFrame - visibilityFirstFrame < 12u)
+            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_FRAME frame=%u status=%s planned_groups=%zu eligible_groups=%zu selected_groups=%zu selected_records=%zu omitted_quota=%zu incomplete_or_collision=%zu hud_exempt_records=%zu volumetric_exempt_records=%zu invalid_exempt_records=%zu\n",
+                view.engineFrame, visibilityStats.eligibleGroups ? "selected" : "inconclusive_no_eligible_groups",
+                visibilityStats.plannedGroups, visibilityStats.eligibleGroups,
+                visibilityStats.selectedGroups, visibilityStats.selectedRecords,
+                visibilityStats.omittedByQuota, visibilityStats.incompleteOrCollision,
+                visibilityStats.hudExemptRecords, visibilityStats.volumetricExemptRecords,
+                visibilityStats.invalidExemptRecords);
+        if (localShadows)
+        {
+            auto& sh=*localShadows;
+            sh.records.clear(); sh.candidates=sh.renderedLights=sh.submittedCasters=sh.culledCasters=0;
+            sh.dynamicCandidates=sh.submittedDynamicCasters=sh.culledDynamicCasters=sh.rejectedDynamicCasters=sh.omittedDynamicCasters=0;
+            sh.batches=batches.size(); sh.transformUploadBytes=0; sh.mergedEncodedDraws=0;
+            for (const auto& batch:batches) sh.candidates+=batch.size();
+        }
+        const auto accumulate=[&](const std::vector<std::size_t>& indices, std::int64_t batchId) {
+            if (indices.empty()) return true;
+            const auto homAccumStart=homDiagnostic.enabled?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            const bool enableCounts = visibilityOptIn && batchId >= 0 &&
+                std::any_of(visibilitySamples.begin(), visibilitySamples.end(), [batchId](const auto& sample) {
+                    return sample.batchId == batchId;
+                });
+            drawState.activeVisibilityBatch = enableCounts ? batchId : -1;
+            if (enableCounts)
+            {
+                R4RenderPassDesc pass = localLightPass;
+                pass.enableVisibilityResultCounts = true;
+                if (!backend.BeginRenderPass(pass,error)) return false;
+            }
+            else if (!backend.BeginRenderPass(localLightPass,error)) return false;
+            const bool drawn=localLights->DrawBatchIntoActiveAccumulator(backend,inputs,localView,snapshot,indices,drawState,error);
+            std::string endError;
+            const bool ended=backend.EndRenderPass(endError);
+            if (!drawn) return false;
+            if (!ended) { error=endError; return false; }
+            if (homDiagnostic.enabled)
+                std::fprintf(stderr,"METAL_LIGHT_HOM_ACCUM frame=%u sample=%llu batch=%lld records=%zu hidden_records=%zu eligible_hidden_records=%zu cpu_ms=%.6f\n",
+                    view.engineFrame,(unsigned long long)homDiagnostic.sample,(long long)batchId,indices.size(),
+                    homDiagnostic.CountHidden(indices,false),homDiagnostic.CountHidden(indices,true),
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-homAccumStart).count());
+            return true;
+        };
+        if (!accumulate(unshadowed,-1)) return false;
+        std::vector<xray::metal::R4LocalShadowAtlasRecord> recordArchive;
+        for (std::size_t batchId=0;batchId<batches.size();++batchId)
+        {
+            if (!localShadows) { error="shadowed local lights have no atlas owner"; return false; }
+            // The atlas is consumed in this encoder before the next batch can
+            // overwrite it. The accumulator, depth and stencil all load/store.
+            if (!renderLocalShadowBatch(backend,scene,*localShadows,view,snapshot,batches[batchId],
+                static_cast<std::uint32_t>(batchId),dynamicWorld,defVertex,defObjectsLod,
+                flora,floraView,detail,detailView,environment,visibilitySamples.empty()?nullptr:&visibilitySamples,
+                homDiagnostic.enabled?&homDiagnostic:nullptr,error) ||
+                !accumulate(batches[batchId],static_cast<std::int64_t>(batchId))) return false;
+            if (volumeFrame)
+            {
+                for (const auto& record : localShadows->records)
+                {
+                    const auto lightIndex = std::find_if(batches[batchId].begin(), batches[batchId].end(),
+                        [&](std::size_t index) { return snapshot->lights[index].lightId == record.lightIdentity; });
+                    if (lightIndex == batches[batchId].end())
+                    { error="volumetric record has no light in its active atlas batch"; return false; }
+                    MetalR4VolumetricAdapter::SpotPass pass;
+                    if (!BuildMetalR4VolumetricSpotPass(snapshot->lights[*lightIndex], environment,
+                            record, view.view, view.projection, pass, error)) return false;
+                    if (!pass.sliceCount) continue;
+                    pass.shadowAtlas = localShadows->atlas;
+                    // Source s_accum_volume is created globally with this cookie;
+                    // authored per-light surface projectors are not its inputs.
+                    R4EngineLocalLight cookieSource; cookieSource.type = R4EngineLocalLightType::Spot;
+                    if (!localLights->ResolveProjectorTexture(backend, cookieSource, pass.lightMap, error) ||
+                        !volumetric->DrawSpot(backend, pass, error)) return false;
+                }
+            }
+            const char* probeDirectory=std::getenv("XRAY_METAL_LOCAL_SHADOW_BATCH_PROBE_DIR");
+            const char* probeEvery=std::getenv("XRAY_METAL_LOCAL_SHADOW_BATCH_PROBE_EVERY");
+            const unsigned interval=probeEvery?std::max(1, std::atoi(probeEvery)):20;
+            if (probeDirectory && *probeDirectory && view.engineFrame%interval==0u)
+            {
+                R4LocalShadowBatchValidationDesc witness;
+                witness.records=localShadows->records;
+                for (const auto index:batches[batchId]) witness.parentIds.push_back(snapshot->lights[index].parentLightId);
+                witness.view=view.view; witness.projection=view.projection;
+                const Matrix4 inv=inverseRigidTransform(scene.view);
+                std::memcpy(witness.inverseView.data(),&inv,sizeof(inv));
+                witness.positionDecompressionParams=scene.positionDecompressionParams;
+                witness.engineFrame=view.engineFrame; witness.batchId=static_cast<std::uint32_t>(batchId);
+                witness.outputDirectory=probeDirectory;
+                if (!backend.ValidateLocalShadowBatch(witness,localShadows->atlas,inputs.position,
+                    scene.depthTarget,scene.lightingAccumulator,error)) return false;
+            }
+            recordArchive.insert(recordArchive.end(),localShadows->records.begin(),localShadows->records.end());
+        }
+        if (localShadows) localShadows->records=std::move(recordArchive); // metadata only; atlas owns the final batch
+        const char* batchProbe=std::getenv("XRAY_METAL_LOCAL_SHADOW_BATCH_PROBE");
+        if (batchProbe && *batchProbe && view.valid)
+        {
+            const auto& t=localLights->LastTelemetry();
+            std::fprintf(stderr,"METAL_LOCAL_SHADOW_BATCH_FRAME frame=%u batches=%zu records=%zu rendered=%zu shadowed=%zu submitted=%zu culled=%zu fallback=%zu resets=%zu marker=%u transform_bytes=%zu eye=%.6f,%.6f,%.6f\n",
+                view.engineFrame,batches.size(),localShadows?localShadows->candidates:0u,
+                localShadows?localShadows->renderedLights:0u,t.submittedShadowed,t.submitted,t.culled,t.skippedShadowed,t.markerResets,drawState.marker.next,localShadows?localShadows->transformUploadBytes:0u,view.eye[0],view.eye[1],view.eye[2]);
+            for (std::size_t batchId=0;batchId<batches.size();++batchId)
+                for (std::size_t tile=0;tile<batches[batchId].size();++tile)
+                {
+                    const auto& l=snapshot->lights[batches[batchId][tile]];
+                    std::fprintf(stderr,"METAL_LOCAL_SHADOW_BATCH_RECORD frame=%u batch=%zu tile=%zu id=%llu parent=%llu face=%u type=%u\n",view.engineFrame,batchId,tile,
+                        static_cast<unsigned long long>(l.lightId),static_cast<unsigned long long>(l.parentLightId),l.omniFace,static_cast<unsigned>(l.type));
+                }
+        }
+    }
+
+    if (volumeFrame && !volumetric->BlurAndMerge(backend, error)) return false;
+    if (volumeFrame && !captureColorPhase(backend, view, "volumetric_merged", {volumetric->OutputTexture()},
+            {"volumetric"}, error)) return false;
+
+    // Opt-in witness: actual production casters outside the primary frustum
+    // render into an isolated map, then project primary G-buffer receivers.
+    const char* shadowProbeDirectory=std::getenv("XRAY_METAL_SHADOW_PROBE_DIR");
+    if (shadowProbeDirectory && *shadowProbeDirectory && scene.sunCascadesValid &&
+        view.valid && view.engineFrame % shadowProbeInterval == 0u)
+    {
+        if (const auto sourceWorld=backend.EngineWorldSnapshot())
+        for (const auto& object:sourceWorld->renderables)
+            if (object.asset && object.asset->sourceName.find("metal_shadow_item")!=std::string::npos)
+                std::fprintf(stderr,"METAL_STATIC_SHADOW_FIXTURE frame=%u position=%.6f,%.6f,%.6f local_sphere=%.6f,%.6f,%.6f,%.6f casts=%u\n",
+                    view.engineFrame,object.transform[12],object.transform[13],object.transform[14],
+                    object.bounds[0],object.bounds[1],object.bounds[2],object.bounds[3],object.castsShadow);
+        auto outsideWorld=std::make_shared<R4EngineWorldSnapshot>();
+        outsideWorld->engineFrame=view.engineFrame;
+        if (const auto world=backend.EngineWorldSnapshot())
+        for (const auto& renderable:world->renderables)
+        {
+            if (!renderable.castsShadow || !renderable.asset) continue;
+            auto staticAsset=std::make_shared<R4EngineWorldAsset>(*renderable.asset);
+            staticAsset->geometry.erase(std::remove_if(staticAsset->geometry.begin(),staticAsset->geometry.end(),
+                [](const auto& geometry) { return geometry.skinned; }),staticAsset->geometry.end());
+            if (staticAsset->geometry.empty()) continue;
+            Matrix4 model{}; std::memcpy(&model,renderable.transform.data(),sizeof(model));
+            const Vec3 center=transformPoint(model,{renderable.bounds[0],renderable.bounds[1],renderable.bounds[2]});
+            float stretch2=0;
+            for (unsigned column=0;column<3;++column)
+                for (unsigned row=0;row<3;++row) stretch2+=model.elements[column*4+row]*model.elements[column*4+row];
+            const float conservativeRadius=renderable.bounds[3]*std::sqrt(stretch2);
+            if (sphereOutsideMainView({center.x,center.y,center.z},conservativeRadius,scene.uniformData.viewProjection))
+            {
+                auto witnessRenderable=renderable; witnessRenderable.asset=staticAsset;
+                outsideWorld->renderables.push_back(std::move(witnessRenderable));
+            }
+        }
+        // This adapter starts with an empty geometry cache, never draws the
+        // primary view, and prewarms only genuinely off-camera source objects.
+        // It exercises the production non-skinned admission fix independently
+        // of anything seen during precache or an earlier camera turn.
+        MetalR4DynamicWorldAdapter coldDynamic;
+        std::string coldStatus;
+        if (!coldDynamic.Configure(backend,dynamicProbeOptions,coldStatus))
+        { error="cold shadow witness configure: "+coldStatus; return false; }
+        const std::size_t cacheBefore=coldDynamic.LastTelemetry().cachedGeometry;
+        R4DynamicWorldViewState coldView;
+        coldView.view=view.view; coldView.projection=view.projection; coldView.eye=view.eye;
+        coldView.previousView=view.previousView; coldView.previousProjection=view.previousProjection;
+        coldView.engineFrame=view.engineFrame; coldView.previousFrame=view.previousFrame;
+        coldView.valid=view.valid; coldView.previousValid=view.previousValid; coldView.cameraCut=view.cameraCut;
+        if (!coldDynamic.Prewarm(backend,coldView,outsideWorld,error)) return false;
+        std::fprintf(stderr,"METAL_COLD_SHADOW_CACHE frame=%u outside_objects=%zu cache_before=%zu cache_after=%zu main_draws=0\n",
+            view.engineFrame,outsideWorld->renderables.size(),cacheBefore,coldDynamic.LastTelemetry().cachedGeometry);
+        auto outsideNpc=std::make_shared<R4EngineWorldSnapshot>();
+        if (const auto world=backend.EngineWorldSnapshot())
+        {
+            *outsideNpc=*world;
+            for (auto& renderable:outsideNpc->renderables)
+            {
+                bool outside=false;
+                if (renderable.asset && std::any_of(renderable.asset->geometry.begin(),renderable.asset->geometry.end(),
+                    [](const auto& geometry) { return geometry.skinned; }))
+                {
+                    Matrix4 model{}; std::memcpy(&model,renderable.transform.data(),sizeof(model));
+                    const Vec3 center=transformPoint(model,{renderable.bounds[0],renderable.bounds[1],renderable.bounds[2]});
+                    float stretch2=0;
+                    for (unsigned column=0;column<3;++column)
+                        for (unsigned row=0;row<3;++row) stretch2+=model.elements[column*4+row]*model.elements[column*4+row];
+                    outside=sphereOutsideMainView({center.x,center.y,center.z},renderable.bounds[3]*std::sqrt(stretch2),scene.uniformData.viewProjection);
+                }
+                renderable.castsShadow=renderable.castsShadow && outside;
+            }
+        }
+        R4Texture2DDesc target;
+        target.width=target.height=2048; target.format=R4PixelFormat::R32Float;
+        target.storage=R4ResourceStorage::Private;
+        target.usage=R4TextureUsage::RenderTarget | R4TextureUsage::ShaderRead;
+        target.label="R4 isolated off-camera caster witness";
+        auto isolatedMap=backend.Resources().CreateTexture2D(target,error);
+        if (!isolatedMap) return false;
+        for (unsigned cascade=0;cascade<3;++cascade)
+        for (unsigned family=0;family<10;++family)
+        {
+            if (family>=2 && family!=4 && family!=5 && cascade!=2) continue;
+            if (family==5 && (!environment.grassShadows || cascade>environment.ssfxGrassShadows[0])) continue;
+            R4RenderPassDesc pass;
+            pass.label="R4 isolated production off-camera shadow casters"; pass.useDrawable=false;
+            R4ColorAttachmentDesc color; color.texture=isolatedMap; color.clearColor={1,1,1,1};
+            pass.colorAttachments={color};
+            pass.depthStencilAttachment.texture=scene.sunShadowDepthTarget;
+            pass.depthStencilAttachment.depthStoreAction=R4StoreAction::DontCare;
+            if (!backend.BeginRenderPass(pass,error)) return false;
+            std::size_t submitted=0;
+            const auto& lightVP=scene.sunCascadeContract.cascades[cascade].lightViewProjection;
+            if ((family==0 || family==2 || family==3) && flora && flora->HasShadowCasters())
+            {
+                auto outsideView=floraView; outsideView.shadowOnlyOffCamera=family==0;
+                outsideView.shadowIgnoreAlpha=family==3;
+                if (!flora->DrawShadowCasters(backend,lightVP,outsideView,error)) return false;
+                submitted=flora->LastTelemetry().shadowSubmittedVisuals;
+            }
+            if (family==1 && coldDynamic.IsEnabled())
+            {
+                std::size_t candidates=0,culled=0,rejected=0;
+                if (!coldDynamic.DrawLocalShadowTile(backend,lightVP,outsideWorld,
+                    candidates,submitted,culled,rejected,error)) return false;
+            }
+            if (family==4 && dynamicWorld && dynamicWorld->IsEnabled())
+            {
+                std::size_t candidates=0,culled=0,rejected=0;
+                if (!dynamicWorld->DrawLocalShadowTile(backend,lightVP,outsideNpc,candidates,submitted,culled,rejected,error)) return false;
+            }
+            if ((family==6 || family==7) && !drawSunShadowMap(backend,scene,cascade,error,true,family==7,&submitted)) return false;
+            if ((family==8 || family==9) && !drawSunShadowMap(backend,scene,cascade,error,true,family==9,&submitted,"mtl_fence")) return false;
+            if (family==5 && detail && detail->IsReady())
+            {
+                R4DetailGrassShadowState shadow;
+                shadow.lightView={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+                shadow.lightProjection=lightVP; shadow.lightViewProjection=lightVP;
+                shadow.fadeDistance=environment.detailFadeDistance*environment.detailFadeDistance*environment.ssfxGrassShadows[1];
+                if (!detail->DrawShadowCasters(backend,detailView,shadow,error)) return false;
+                submitted=detail->LastTelemetry().shadowDraws;
+            }
+            if (!backend.EndRenderPass(error)) return false;
+            R4SunShadowValidationDesc witness;
+            witness.phase=R4SunShadowValidationPhase::OffCameraCasters;
+            witness.shadowR32=isolatedMap; witness.positionRGBA16F=scene.gBufferTargets[0];
+            witness.positionDecompressionParams=scene.positionDecompressionParams;
+            witness.sceneDepthStencil=scene.depthTarget; witness.accumulationRGBA16F=scene.lightingAccumulator;
+            witness.family=std::string(family==0?"offcamera_flora_":family==1?"offcamera_dynamic_":
+                family==2?"alpha_flora_":family==3?"opaque_flora_":family==4?"offcamera_npc_":family==5?"grass_sun_":family==6?"alpha_aref_":family==7?"opaque_aref_":family==8?"alpha_fence_":"opaque_fence_")+std::to_string(cascade);
+            witness.exportShadowMap=family==1 || family==2 || family==3 || family>=5; witness.requireShadowedReceivers=family<2 || family==4;
+            witness.outputDirectory=shadowProbeDirectory; witness.engineFrame=view.engineFrame;
+            const Matrix4 inverse=inverseRigidTransform(scene.view);
+            std::memcpy(witness.inverseView.data(),&inverse,sizeof(inverse));
+            std::memcpy(witness.currentViewProjection.data(),&scene.uniformData.viewProjection,sizeof(Matrix4));
+            witness.stageVolumeViewProjection=lightVP;
+            witness.sourceCascadeSize=scene.sunCascadeContract.cascades[cascade].size;
+            witness.sourceCascadeBias=scene.sunCascadeContract.cascades[cascade].bias;
+            witness.offCameraCasterCount=static_cast<std::uint32_t>(submitted);
+            if (!backend.ValidateSunShadowCascade(witness,error)) return false;
+        }
+        if (std::getenv("XRAY_METAL_SHADOW_LOCAL_PROBE") && localShadows && !localShadows->records.empty())
+        {
+            const unsigned localSize=localShadows->records.front().atlasSize;
+            target.width=target.height=localSize;
+            auto localMap=backend.Resources().CreateTexture2D(target,error);
+            target.format=R4PixelFormat::Depth32Float; target.usage=R4TextureUsage::RenderTarget;
+            auto localDepth=backend.Resources().CreateTexture2D(target,error);
+            if (!localMap || !localDepth) return false;
+            for (const auto& record:localShadows->records)
+            for (unsigned family=0;family<4;++family)
+            {
+                const auto lights=backend.EngineLightingFrameSnapshot();
+                const auto sourceLight=lights?std::find_if(lights->lights.begin(),lights->lights.end(),
+                    [&](const auto& light) { return light.lightId==record.lightIdentity; }):std::vector<R4EngineLocalLight>::const_iterator{};
+                if (family==3 && (!detail || !detail->IsReady() || !environment.grassShadows ||
+                    environment.ssfxGrassShadows[0]<3 || !lights || sourceLight==lights->lights.end() ||
+                    sourceLight->decorative || sourceLight->cameraDistance>environment.ssfxGrassShadows[2] ||
+                    sphereOutsideMainView(sourceLight->position,sourceLight->range*0.6f,scene.uniformData.viewProjection))) continue;
+                if (family==0 && lights && sourceLight!=lights->lights.end())
+                    std::fprintf(stderr,"METAL_LOCAL_SHADOW_SOURCE frame=%u id=%llu type=%u face=%u position=%.6f,%.6f,%.6f range=%.6f\n",
+                        view.engineFrame,static_cast<unsigned long long>(record.lightIdentity),static_cast<unsigned>(sourceLight->type),
+                        record.face,sourceLight->position[0],sourceLight->position[1],sourceLight->position[2],sourceLight->range);
+                Matrix4 lightView{},lightProjection{};
+                std::memcpy(&lightView,record.lightView.data(),sizeof(lightView));
+                std::memcpy(&lightProjection,record.lightProjection.data(),sizeof(lightProjection));
+                const Matrix4 lightMatrix=multiply(lightProjection,lightView);
+                std::array<float,16> lightVP{}; std::memcpy(lightVP.data(),&lightMatrix,sizeof(lightMatrix));
+                R4RenderPassDesc pass; pass.label="R4 isolated local off-camera production casters"; pass.useDrawable=false;
+                R4ColorAttachmentDesc color; color.texture=localMap; color.clearColor={1,1,1,1}; pass.colorAttachments={color};
+                pass.depthStencilAttachment.texture=localDepth;
+                pass.depthStencilAttachment.depthStoreAction=R4StoreAction::DontCare;
+                if (!backend.BeginRenderPass(pass,error)) return false;
+                std::size_t submitted=0;
+                if (family==0 && flora && flora->HasShadowCasters())
+                {
+                    auto outsideView=floraView; outsideView.shadowOnlyOffCamera=true;
+                    if (!flora->DrawShadowCasters(backend,lightVP,outsideView,error)) return false;
+                    submitted=flora->LastTelemetry().shadowSubmittedVisuals;
+                }
+                if (family==1 || family==2)
+                {
+                    std::size_t candidates=0,culled=0,rejected=0;
+                    auto* producer=family==1?&coldDynamic:dynamicWorld;
+                    if (producer && producer->IsEnabled() && !producer->DrawLocalShadowTile(backend,lightVP,
+                        family==1?outsideWorld:outsideNpc,candidates,submitted,culled,rejected,error)) return false;
+                }
+                if (family==3)
+                {
+                    R4DetailGrassShadowState shadow;
+                    shadow.lightView=record.lightView; shadow.lightProjection=record.lightProjection;
+                    shadow.lightViewProjection=lightVP; shadow.lightPosition=sourceLight->position;
+                    shadow.fadeFromLight=true; shadow.fadeDistance=-1; shadow.lightRange=sourceLight->range;
+                    if (!detail->DrawShadowCasters(backend,detailView,shadow,error)) return false;
+                    submitted=detail->LastTelemetry().shadowDraws;
+                }
+                if (!backend.EndRenderPass(error)) return false;
+                R4SunShadowValidationDesc witness;
+                witness.phase=R4SunShadowValidationPhase::OffCameraCasters; witness.shadowR32=localMap;
+                witness.positionRGBA16F=scene.gBufferTargets[0]; witness.positionDecompressionParams=scene.positionDecompressionParams;
+                witness.sceneDepthStencil=scene.depthTarget; witness.accumulationRGBA16F=scene.lightingAccumulator;
+                witness.family=std::string(family==0?"offcamera_local_flora_":family==1?"offcamera_local_dynamic_":family==2?"offcamera_local_npc_":"grass_local_")+std::to_string(record.lightIdentity)+"_face_"+std::to_string(record.face);
+                witness.requireShadowedReceivers=family!=3;
+                if (lights && sourceLight!=lights->lights.end())
+                    witness.family+="_type_"+std::to_string(static_cast<unsigned>(sourceLight->type));
+                witness.outputDirectory=shadowProbeDirectory; witness.engineFrame=view.engineFrame;
+                const Matrix4 inverse=inverseRigidTransform(scene.view);
+                std::memcpy(witness.inverseView.data(),&inverse,sizeof(inverse));
+                std::memcpy(witness.currentViewProjection.data(),&scene.uniformData.viewProjection,sizeof(Matrix4));
+                witness.stageVolumeViewProjection=lightVP; witness.offCameraCasterCount=static_cast<std::uint32_t>(submitted);
+                if (!backend.ValidateSunShadowCascade(witness,error)) return false;
+            }
+        }
     }
 
     if (scene.productionBaseLighting && sky.configured)
@@ -3189,7 +5496,12 @@ bool renderProductionScene(
         aoInputs.staticGlobals = scene.baseLightingStaticGlobals;
         aoInputs.view = view.view;
         aoInputs.projection = view.projection;
+        aoInputs.previousView = view.previousView;
+        aoInputs.previousProjection = view.previousProjection;
         aoInputs.environment = environment;
+        aoInputs.cameraCut = view.cameraCut;
+        aoInputs.previousValid = view.previousValid;
+        aoInputs.previousFrame = view.previousFrame;
 		if (!ssfxAo->Draw(backend, aoInputs, error))
 		{
 			// History/position targets can legitimately lag the first production
@@ -3226,6 +5538,14 @@ bool renderProductionScene(
                 telemetry.temporalHistory ? "true" : "false");
     }
 
+    if (!captureColorPhase(backend, view, "accumulator", {scene.lightingAccumulator}, {"accumulator"}, error)) return false;
+    if (scene.ssfxAoOutput && !captureColorPhase(backend, view, "ao", {scene.ssfxAoOutput}, {"ao"}, error,
+            !environment.ssfxAoAvailable || environment.ssfxAo[1] <= 0.0f,
+            !environment.ssfxAoAvailable || environment.ssfxAo[1] <= 0.0f)) return false;
+    const bool ilDisabled = !environment.ssfxIlAvailable || environment.ssfxIl[1] <= 0.0f;
+    if (scene.ssfxIlOutput && !captureColorPhase(backend, view, "il", {scene.ssfxIlOutput}, {"il"}, error,
+            ilDisabled, ilDisabled)) return false;
+
     R4RenderPassDesc lightingPass;
     lightingPass.label = "R4 engine converted combine_1 base lighting";
     lightingPass.useDrawable = false;
@@ -3239,6 +5559,57 @@ bool renderProductionScene(
     if (!backend.BeginRenderPass(lightingPass, error) ||
         !drawBaseLighting(backend, scene, error) || !backend.EndRenderPass(error))
         return false;
+
+    if (!captureColorPhase(backend, view, "combine_base", scene.lightingTargets, {"low", "high"}, error)) return false;
+    // Repeat the exact converted combine against an explicit neutral IL input.
+    // Same frame G-buffer/AO/accumulator/constants; only IL texture differs.
+    const char* colorProbeDirectory = std::getenv("XRAY_METAL_COLOR_PROBE_DIR");
+    if (ilDisabled && scene.ssfxIlOutput && colorProbeDirectory && *colorProbeDirectory && view.valid &&
+        shouldCaptureColorFrame(backend, view))
+    {
+        const auto actualTargets = scene.lightingTargets;
+        const auto actualIl = scene.ssfxIlOutput;
+        std::vector<std::shared_ptr<IR4Texture>> referenceTargets;
+        for (const auto& target : actualTargets)
+        {
+            auto descriptor = target->Descriptor(); descriptor.label = "R4 IL disabled neutral combine reference";
+            auto reference = backend.Resources().CreateTexture2D(descriptor, error);
+            if (!reference) return false;
+            referenceTargets.push_back(reference);
+        }
+        scene.lightingTargets = referenceTargets; scene.ssfxIlOutput = scene.lightingBlack;
+        auto referencePass = lightingPass;
+        referencePass.label = "R4 converted combine_1 IL disabled neutral reference";
+        for (std::size_t i=0; i<referenceTargets.size(); ++i) referencePass.colorAttachments[i].texture = referenceTargets[i];
+        bool referenceDrawn = backend.BeginRenderPass(referencePass, error);
+        if (referenceDrawn)
+        {
+            referenceDrawn = drawBaseLighting(backend, scene, error);
+            std::string endError;
+            if (!backend.EndRenderPass(endError)) { if (error.empty()) error=endError; referenceDrawn=false; }
+        }
+        scene.lightingTargets = actualTargets; scene.ssfxIlOutput = actualIl;
+        if (!referenceDrawn) return false;
+        for (std::size_t i=0; i<actualTargets.size(); ++i)
+            if (!captureColorPhase(backend, view, "il_neutral_combine_"+std::to_string(i),
+                {actualTargets[i], referenceTargets[i]}, {"actual", "neutral_reference"}, error, false, false, true)) return false;
+        // Sensitivity control: stale nonzero IL at intensity zero must differ.
+        // Readbacks above precede these overwrites on the same command buffer.
+        scene.lightingTargets = referenceTargets; scene.ssfxIlOutput = scene.lightingWhite;
+        referencePass.label = "R4 converted combine_1 stale IL positive defect control";
+        bool staleDrawn = backend.BeginRenderPass(referencePass, error);
+        if (staleDrawn)
+        {
+            staleDrawn = drawBaseLighting(backend, scene, error);
+            std::string endError;
+            if (!backend.EndRenderPass(endError)) { if (error.empty()) error=endError; staleDrawn=false; }
+        }
+        scene.lightingTargets = actualTargets; scene.ssfxIlOutput = actualIl;
+        if (!staleDrawn) return false;
+        for (std::size_t i=0; i<actualTargets.size(); ++i)
+            if (!captureColorPhase(backend, view, "il_stale_positive_control_"+std::to_string(i),
+                {actualTargets[i], referenceTargets[i]}, {"actual", "stale_nonzero_il"}, error)) return false;
+    }
 
     if (sky.ready)
     {
@@ -3330,10 +5701,123 @@ bool renderProductionScene(
         }
     }
 
-    if (!drawLuminanceAdaptation(backend, scene, environment, error))
-        return false;
+    if (lensFlare && lensFlare->HasFlares())
+    {
+        R4RenderPassDesc flarePass;
+        flarePass.label = "R4 exact effects_sun forward"; flarePass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = scene.lightingTargets[0]; color.loadAction = R4LoadAction::Load;
+        color.storeAction = R4StoreAction::Store; flarePass.colorAttachments = {color};
+        flarePass.depthStencilAttachment.texture = scene.depthTarget;
+        flarePass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        flarePass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        flarePass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        flarePass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        if (!backend.BeginRenderPass(flarePass, error)) return false;
+        const bool drawn = lensFlare->DrawIntoActiveForward(backend, scene.baseLightingStaticGlobals, environment.engineFrame, error);
+        std::string endError; const bool ended = backend.EndRenderPass(endError);
+        if (!drawn) return false;
+        if (!ended) { error = endError; return false; }
+        const auto& telemetry = lensFlare->LastTelemetry();
+        if (++lensFlareTelemetryFrame == 1 || lensFlareTelemetryFrame % 300 == 0)
+            std::fprintf(stderr, "METAL_LENS_FLARE_FRAME frame=%u captured=%zu staged=%zu submitted=%zu rejected=%zu\n",
+                environment.engineFrame, telemetry.capturedDraws, telemetry.stagedDraws, telemetry.submittedDraws, telemetry.rejectedDraws);
+    }
 
-    // Reference R4 places SSFX water after combine/sky/luminance and before
+    // Windows copies rt_Generic_0 to rt_Generic_temp immediately before the
+    // general SSR chain. Keep an equivalent non-aliasing source snapshot so
+    // trace/combine never sample the color target they are writing.
+    if (ssfxSsr && ssfxSsr->IsReady())
+    {
+        MetalR4SsrAdapter::FrameInputs inputs;
+        inputs.engineFrame = environment.engineFrame;
+        inputs.previousFrame = view.previousFrame;
+        inputs.previousValid = view.previousValid;
+        inputs.cameraCut = view.cameraCut;
+        inputs.enabled = environment.valid && view.valid &&
+            environment.ssfxSsrAvailable && environment.ssfxSsrQuality == 0u;
+        if (inputs.enabled)
+        {
+            std::string resourceError;
+            std::shared_ptr<IR4Texture> sky0;
+            std::shared_ptr<IR4Texture> sky1;
+            if (!resolveSkyTexture(backend, sky, environment.sky0TextureName, sky0, resourceError) ||
+                !resolveSkyTexture(backend, sky, environment.sky1TextureName, sky1, resourceError))
+            {
+                inputs.enabled = false;
+                if (ssfxSsr && ssfxSsr->BlueNoiseTexture() &&
+                    (view.engineFrame == 0u || view.engineFrame % 300u == 0u))
+                    std::fprintf(stderr, "METAL_SSR_SKIP phase=resources frame=%u reason=\"%s\"\n",
+                        view.engineFrame, resourceError.c_str());
+            }
+            else if (scene.lightingTargets.empty() || !scene.lightingTargets[0] ||
+                scene.gBufferTargets.size() < 4u || !scene.gBufferTargets[0] ||
+                !scene.gBufferTargets[1] || !scene.gBufferTargets[3] || !scene.depthTarget ||
+                !scene.baseLightingStaticGlobals || !ssrSceneColorSnapshot ||
+                !ssfxSsr->BlueNoiseTexture())
+            {
+                inputs.enabled = false;
+                if (view.engineFrame == 0u || view.engineFrame % 300u == 0u)
+                    std::fprintf(stderr, "METAL_SSR_SKIP phase=resources frame=%u reason=production_inputs_unavailable\n",
+                        view.engineFrame);
+            }
+            else
+            {
+                inputs.combinedSceneColor = scene.lightingTargets[0];
+                inputs.sceneColorSnapshot = ssrSceneColorSnapshot;
+                inputs.position = scene.gBufferTargets[0];
+                inputs.diffuse = scene.gBufferTargets[1];
+                inputs.motionVectors = scene.gBufferTargets[3];
+                inputs.blueNoise = ssfxSsr->BlueNoiseTexture();
+                inputs.sky0 = std::move(sky0);
+                inputs.sky1 = std::move(sky1);
+                inputs.depth = scene.depthTarget;
+                inputs.staticGlobals = scene.baseLightingStaticGlobals;
+                inputs.noFilterSampler = scene.lightingNoFilterSampler;
+                inputs.linearSampler = scene.lightingLinearSampler;
+                inputs.baseSampler = scene.baseSampler;
+                inputs.ssrSetup = environment.ssfxSsr;
+                inputs.ssfxSsr2 = environment.ssfxSsr2;
+                inputs.underground = environment.ssfxIsUnderground;
+
+                Matrix4 currentView{};
+                Matrix4 currentProjection{};
+                std::memcpy(currentView.elements, view.view.data(), sizeof(currentView.elements));
+                std::memcpy(currentProjection.elements, view.projection.data(), sizeof(currentProjection.elements));
+                // R4 sets m_current to the current projection and m_previous
+                // to previousViewProjection * inverse(currentView), matching
+                // Matrix_previous.mul(saved_viewproj, Device.mInvView).
+                std::memcpy(inputs.currentMatrix.data(), currentProjection.elements,
+                    sizeof(currentProjection.elements));
+                inputs.previousMatrix = inputs.currentMatrix;
+                if (view.previousValid && !view.cameraCut)
+                {
+                    Matrix4 previousView{};
+                    Matrix4 previousProjection{};
+                    std::memcpy(previousView.elements, view.previousView.data(), sizeof(previousView.elements));
+                    std::memcpy(previousProjection.elements, view.previousProjection.data(), sizeof(previousProjection.elements));
+                    const Matrix4 previousViewProjection = multiply(previousProjection, previousView);
+                    const Matrix4 previousRelative = multiply(previousViewProjection,
+                        inverseRigidTransform(currentView));
+                    std::memcpy(inputs.previousMatrix.data(), previousRelative.elements,
+                        sizeof(previousRelative.elements));
+                }
+                if (!backend.CopyTexture2D(inputs.combinedSceneColor,
+                        inputs.sceneColorSnapshot, error))
+                    return false;
+            }
+        }
+        if (!ssfxSsr->Draw(backend, inputs, error))
+            return false;
+        if (inputs.enabled && (view.engineFrame == 0u || view.engineFrame % 300u == 0u))
+            std::fprintf(stderr,
+                "METAL_SSR_FRAME frame=%u previous=%u quality=%u extent=%ux%u passes=5 history=adapter_owned\n",
+                view.engineFrame, view.previousFrame, environment.ssfxSsrQuality,
+                scene.lightingTargets[0]->Descriptor().width,
+                scene.lightingTargets[0]->Descriptor().height);
+    }
+
+    // Reference R4 places SSFX water after combine/sky and before
     // the remaining alpha-forward families.  The dedicated adapter owns the
     // temporal read/write chain; static-forward therefore skips only water
     // when that adapter was admitted successfully.
@@ -3353,7 +5837,11 @@ bool renderProductionScene(
         inputs.staticGlobals = scene.baseLightingStaticGlobals;
         inputs.view = view.view;
         inputs.projection = view.projection;
+        inputs.previousView = view.previousView;
+        inputs.previousProjection = view.previousProjection;
         inputs.environment = environment;
+        inputs.cameraCut = view.cameraCut;
+        inputs.previousValid = view.previousValid;
         if (!water->Draw(backend, inputs, error))
             return false;
     }
@@ -3391,7 +5879,45 @@ bool renderProductionScene(
             return false;
     }
 
-    if (rain && rain->IsReady() && rain->HasDrops())
+    if (dynamicWorld && dynamicWorld->HasForwardLightplanes())
+    {
+        if (scene.lightingTargets.empty() || !scene.lightingTargets[0] || !scene.depthTarget)
+        {
+            error = "dynamic model lightplanes require combined color and scene depth";
+            return false;
+        }
+        R4RenderPassDesc lightplanePass;
+        lightplanePass.label = "R4 dynamic models lightplanes additive forward pass";
+        lightplanePass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = scene.lightingTargets[0];
+        color.loadAction = R4LoadAction::Load;
+        color.storeAction = R4StoreAction::Store;
+        lightplanePass.colorAttachments = {color};
+        lightplanePass.depthStencilAttachment.texture = scene.depthTarget;
+        lightplanePass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        lightplanePass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        lightplanePass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        lightplanePass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        R4DynamicWorldViewState dynamicView;
+        dynamicView.view = view.view;
+        dynamicView.projection = view.projection;
+        dynamicView.previousView = view.previousView;
+        dynamicView.previousProjection = view.previousProjection;
+        dynamicView.eye = view.eye;
+        dynamicView.engineFrame = view.engineFrame;
+        dynamicView.previousFrame = view.previousFrame;
+        dynamicView.cameraCut = view.cameraCut;
+        dynamicView.valid = view.valid;
+        dynamicView.previousValid = view.previousValid;
+        if (!backend.BeginRenderPass(lightplanePass, error) ||
+            !dynamicWorld->DrawForwardLightplanes(
+                backend, dynamicView, backend.EngineWorldSnapshot(), error) ||
+            !backend.EndRenderPass(error))
+            return false;
+    }
+
+    if (rain && rain->IsReady() && (rain->HasDrops() || rain->HasSplashes()))
     {
         if (scene.lightingTargets.size() != 2u || !scene.lightingTargets[0] ||
             !scene.scopeSceneColorSnapshot || !scene.depthTarget ||
@@ -3413,9 +5939,13 @@ bool renderProductionScene(
         refraction.texture = rain->RefractionTarget();
         rainPrepass.colorAttachments = {refraction};
         if (!backend.BeginRenderPass(rainPrepass, error) ||
-            !rain->DrawRefraction(backend, scene.scopeSceneColorSnapshot, scene.lightingBlack,
+            !rain->DrawRefraction(backend, scene.scopeSceneColorSnapshot,
+                volumeFrame ? volumetric->OutputTexture() : scene.lightingBlack,
                 scene.baseLightingStaticGlobals, error) || !backend.EndRenderPass(error))
             return false;
+        ++rainTelemetryFrame;
+        if (rain->HasDrops())
+        {
         R4RenderPassDesc rainPass;
         rainPass.label = "R4 exact effects_rain forward pass";
         rainPass.useDrawable = false;
@@ -3438,7 +5968,7 @@ bool renderProductionScene(
                 rain->RefractionTarget(), scene.lightingAccumulator,
                 scene.baseLightingStaticGlobals, error) || !backend.EndRenderPass(error))
             return false;
-        const std::uint64_t sample = ++rainTelemetryFrame;
+        const std::uint64_t sample = rainTelemetryFrame;
         if (sample == 1u || sample % 300u == 0u)
         {
             const MetalR4RainAdapter::Telemetry& telemetry = rain->LastTelemetry();
@@ -3447,6 +5977,35 @@ bool renderProductionScene(
                 static_cast<unsigned long long>(sample), telemetry.submittedDrops,
                 telemetry.capturedVertices, telemetry.density, telemetry.ssfx ? "true" : "false",
                 telemetry.droppedVertices);
+        }
+        }
+    }
+
+    if (rain && rain->IsReady() && rain->HasSplashes())
+    {
+        R4RenderPassDesc pass;
+        pass.label = "R4 exact SSFX ground rain splashes"; pass.useDrawable = false;
+        R4ColorAttachmentDesc color;
+        color.texture = scene.lightingTargets[0]; color.loadAction = R4LoadAction::Load;
+        color.storeAction = R4StoreAction::Store; pass.colorAttachments = {color};
+        pass.depthStencilAttachment.texture = scene.depthTarget;
+        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        pass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        std::array<float, 16> viewProjection{};
+        std::memcpy(viewProjection.data(), scene.uniformData.viewProjection.elements, sizeof(viewProjection));
+        if (!backend.BeginRenderPass(pass, error)) return false;
+        const bool drawn = rain->DrawSplashesIntoActiveForward(backend, viewProjection, rain->RefractionTarget(), error);
+        std::string endError; const bool ended = backend.EndRenderPass(endError);
+        if (!drawn) return false;
+        if (!ended) { error = endError; return false; }
+        static std::uint64_t splashDrawSamples = 0;
+        if (++splashDrawSamples == 1u || splashDrawSamples % 300u == 0u)
+        {
+            const auto& t = rain->LastTelemetry();
+            std::fprintf(stderr, "METAL_RAIN_SPLASH_FRAME frame=%u vertices=%zu triangles=%zu dropped=%zu\n",
+                environment.engineFrame, t.capturedSplashVertices, t.submittedSplashTriangles, t.droppedSplashVertices);
         }
     }
 
@@ -3481,6 +6040,28 @@ bool renderProductionScene(
             return false;
     }
 
+    if (volumeFrame)
+    {
+        const auto& telemetry = volumetric->LastTelemetry();
+        if (telemetry.sunDraws || telemetry.spotDraws)
+        {
+            MetalR4VolumetricAdapter::CompositeInputs inputs;
+            inputs.blueNoise = ssfxSsr ? ssfxSsr->BlueNoiseTexture() : nullptr;
+            inputs.lightingLow = scene.lightingTargets[0]; inputs.lightingHigh = scene.lightingTargets[1];
+            if (!volumetric->DrawFinalComposite(backend, inputs, error)) return false;
+            if (!captureColorPhase(backend, view, "volumetric_combine", scene.lightingTargets, {"low", "high"}, error)) return false;
+        }
+        if (view.engineFrame % 20u == 0u || view.cameraCut)
+            std::fprintf(stderr, "METAL_VOLUMETRIC_FRAME frame=%u sun=%zu spot=%zu blur=%zu merged=%d composited=%d divisor=%u\n",
+                view.engineFrame, telemetry.sunDraws, telemetry.spotDraws, telemetry.blurDraws,
+                telemetry.spotMerged, telemetry.finalComposited, environment.volumetricResolutionDivisor);
+    }
+
+    // phase_combine calls phase_bloom/phase_luminance after water and
+    // alpha-forward/rain/particles, before distortion, scope and SSFX bloom.
+    if (!drawLuminanceAdaptation(backend, scene, environment, error))
+        return false;
+
     if (particles && particles->IsReady())
     {
         if (!particles->DistortionTarget() || !scene.depthTarget)
@@ -3507,6 +6088,50 @@ bool renderProductionScene(
             !particles->DrawIntoActiveDistortion(backend, viewProjection,
                 scene.baseLightingStaticGlobals, error) ||
             !backend.EndRenderPass(error))
+            return false;
+    }
+
+    if (environment.valid && environment.ssfxFogScatteringAvailable &&
+        !std::isfinite(environment.ssfxFogScattering))
+    {
+        error = "active R4 SSFX fog-scattering control is non-finite";
+        return false;
+    }
+    const bool fogScatteringRequested = environment.valid && environment.ssfxFogScatteringAvailable &&
+        environment.ssfxFogScattering > 0.0f;
+    if (fogScatteringRequested)
+    {
+        if (!fogScattering || !fogScattering->IsReady())
+        {
+            error = "active R4 SSFX fog scattering has no prepared converted shader bundle";
+            return false;
+        }
+        if (scene.lightingTargets.empty() || !scene.lightingTargets[0] ||
+            scene.gBufferTargets.empty() || !scene.gBufferTargets[0] ||
+            !scene.baseLightingStaticGlobals)
+        {
+            error = "active SSFX fog scattering requires combined color, position, and static_globals";
+            return false;
+        }
+        const R4Texture2DDesc& sceneColor = scene.lightingTargets[0]->Descriptor();
+        if (!fogScattering->Draw(backend, scene.gBufferTargets[0], scene.lightingTargets[0],
+                scene.baseLightingStaticGlobals, environment, error) ||
+            !backend.CopyTexture2D(fogScattering->Output(), scene.lightingTargets[0], error))
+            return false;
+        static std::uint32_t lastFogScatteringLogFrame = UINT32_MAX;
+        if (lastFogScatteringLogFrame == UINT32_MAX ||
+            environment.engineFrame - lastFogScatteringLogFrame >= 300u)
+        {
+            lastFogScatteringLogFrame = environment.engineFrame;
+            std::fprintf(stderr,
+                "METAL_FOG_SCATTERING_FRAME frame=%u scattering=%.4f fog=%.4f,%.4f,%.4f,%.4f "
+                "extent=%ux%u order=after_distortion_before_scope_bloom\n",
+                environment.engineFrame, environment.ssfxFogScattering,
+                environment.ssfxFog[0], environment.ssfxFog[1], environment.ssfxFog[2],
+                environment.ssfxFog[3], sceneColor.width, sceneColor.height);
+        }
+        if (!captureColorPhase(backend, view, "fog_scattering", {scene.lightingTargets[0]},
+                {"scene"}, error))
             return false;
     }
 
@@ -3549,6 +6174,21 @@ bool renderProductionScene(
             return false;
     }
 
+    if (bloom)
+    {
+        MetalR4BloomAdapter::Inputs inputs;
+        inputs.position = scene.gBufferTargets[0];
+        inputs.scene = scene.lightingTargets[0];
+        inputs.emissive = emissiveTarget;
+        // HUD mask and unsupported emitter families remain explicit matrix gaps.
+        inputs.hudMask = scene.lightingBlack;
+        inputs.staticGlobals = scene.baseLightingStaticGlobals;
+        inputs.environment = environment;
+        inputs.vision = vision;
+        if (!bloom->Draw(backend, inputs, error)) return false;
+    }
+    if (bloom && !captureColorPhase(backend, view, "bloom", {bloom->Output()}, {"bloom"}, error)) return false;
+    if (!captureColorPhase(backend, view, "scene_before_postprocess", scene.lightingTargets, {"low", "high"}, error)) return false;
     if (nightVision && !drawNightVision(
             backend, scene, *nightVision, environment, vision, error))
         return false;
@@ -3559,13 +6199,14 @@ bool renderProductionScene(
     const auto drawPresentation = [&]() {
         if (particles && particles->IsReady())
         {
-            const bool hasLut = scene.lutAtlas && scene.lutAtlasUploaded;
+            const bool hasLut = scene.lutAtlas &&
+                (scene.lutAtlasUploaded || scene.pendingLutAtlasUploaded);
             const std::shared_ptr<IR4Texture>& lut = hasLut ? scene.lutAtlas : scene.lightingBlack;
             const std::array<float, 4> ssfxLut = hasLut ?
                 std::array<float, 4>{1.0f, 16.0f, 0.0f, 0.0f} :
                 std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f};
             return particles->DrawPostprocess(backend, scene.gBufferTargets[0],
-                scene.lightingTargets[0], scene.lightingBlack, lut,
+                scene.lightingTargets[0], bloom ? bloom->Output() : scene.lightingBlack, lut,
                 scene.baseLightingStaticGlobals, ssfxLut, error);
         }
         return drawGBufferDisplay(backend, scene, error);
@@ -3573,6 +6214,27 @@ bool renderProductionScene(
     if (!backend.BeginRenderPass(displayPass, error) ||
         !drawPresentation() || !backend.EndRenderPass(error))
         return false;
+    if (lensOverlay && lensOverlay->HasFlares())
+    {
+        R4RenderPassDesc overlayPass;
+        overlayPass.label = "R4 exact lens flares after combine_2";
+        overlayPass.drawableColor.loadAction = R4LoadAction::Load;
+        overlayPass.drawableColor.storeAction = R4StoreAction::Store;
+        overlayPass.depthStencilAttachment.texture = scene.depthTarget;
+        overlayPass.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
+        overlayPass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
+        overlayPass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
+        overlayPass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+        if (!backend.BeginRenderPass(overlayPass, error)) return false;
+        const bool drawn = lensOverlay->DrawIntoActiveForward(backend, scene.baseLightingStaticGlobals, environment.engineFrame, error);
+        std::string endError; const bool ended = backend.EndRenderPass(endError);
+        if (!drawn) return false;
+        if (!ended) { error = endError; return false; }
+        const auto& telemetry = lensOverlay->LastTelemetry();
+        if (lensFlareTelemetryFrame == 0 || lensFlareTelemetryFrame % 300 == 0)
+            std::fprintf(stderr, "METAL_LENS_OVERLAY_FRAME frame=%u submitted=%zu rejected=%zu order=after_combine_2\n",
+                environment.engineFrame, telemetry.submittedDraws, telemetry.rejectedDraws);
+    }
     return true;
 }
 } // namespace
@@ -3645,6 +6307,8 @@ bool RunMetalR4EngineSceneFrustumCullingSelfTest(std::string& error)
 struct MetalR4EngineScene::Impl
 {
     LevelScene scene;
+    R4SubmittedViewHistory viewHistory;
+    R4DetailGrassMotionSnapshot floraMotion;
     TerrainScene terrain;
     SkyScene sky;
     bool prepared = false;
@@ -3654,11 +6318,29 @@ struct MetalR4EngineScene::Impl
     std::unique_ptr<MetalR4DefVertexAdapter> defVertex;
     std::unique_ptr<MetalR4DefObjectsLodAdapter> defObjectsLod;
     std::unique_ptr<MetalR4DynamicWorldAdapter> dynamicWorld;
+    MetalR4DynamicWorldAdapter::Options dynamicProbeOptions;
     std::unique_ptr<MetalR4HudAdapter> hud;
     std::unique_ptr<MetalR4ScopeAdapter> scope;
     std::unique_ptr<MetalR4ParticleAdapter> particles;
     std::unique_ptr<MetalR4StaticForwardAdapter> staticForward;
     std::unique_ptr<MetalR4SsfxAoAdapter> ssfxAo;
+    std::unique_ptr<MetalR4FogScatteringAdapter> fogScattering;
+    std::unique_ptr<MetalR4SsrAdapter> ssfxSsr;
+    std::shared_ptr<IR4Texture> ssrSceneColorSnapshot;
+    std::uint32_t ssrSnapshotWidth = 0u;
+    std::uint32_t ssrSnapshotHeight = 0u;
+    R4PixelFormat ssrSnapshotFormat = R4PixelFormat::Invalid;
+    std::uint32_t lastSsrStatusFrame = UINT32_MAX;
+    std::unique_ptr<MetalR4VolumetricAdapter> volumetric;
+    std::unique_ptr<MetalR4BloomAdapter> bloom;
+    std::unique_ptr<MetalR4LensFlareAdapter> lensFlare;
+    std::unique_ptr<MetalR4LensFlareAdapter> lensOverlay;
+    std::uint64_t lensFlareTelemetryFrame = 0;
+    std::uint32_t emissiveFactorFrame = UINT32_MAX;
+    float emissiveFactor = 0.0f;
+    std::uint32_t luminanceThresholdFrame = UINT32_MAX;
+    float luminanceThreshold = 0.0f;
+    std::shared_ptr<IR4Texture> emissiveTarget;
     std::uint64_t ssfxAoTelemetryFrame = 0;
     std::unique_ptr<MetalR4RainAdapter> rain;
     std::uint64_t rainTelemetryFrame = 0;
@@ -3792,6 +6474,14 @@ bool MetalR4EngineScene::OptionsFromEnvironment(Options& options, std::string& e
         options.terrainShaderDirectory = terrainDirectory && *terrainDirectory ?
             std::filesystem::path(terrainDirectory) : options.mscVertexMetallibPath.parent_path();
     }
+    if (const char* shadowDirectory=std::getenv("XRAY_METAL_MSC_FLORA_SHADOW_DIR"))
+        options.flora.shadowShaderDirectory=shadowDirectory;
+    if (!ResolveMetalR4EngineTextureDdsPath(std::filesystem::path("fx")/"wind_wave.dds",
+            options.flora.wavesTexturePath,error)) return false;
+    if (const char* shadowDirectory=std::getenv("XRAY_METAL_MSC_DETAIL_SHADOW_DIR"))
+        options.detailGrass.shadowShaderDirectory=shadowDirectory;
+    if (const char* dir = std::getenv("XRAY_METAL_MSC_FLORA_INSTANCED_SHADOW_DIR"))
+        options.flora.instancedShadowShaderDirectory = dir;
     const char* floraDirectory = std::getenv("XRAY_METAL_MSC_FLORA_DIR");
     const std::filesystem::path floraShaderDirectory = floraDirectory && *floraDirectory ?
         std::filesystem::path(floraDirectory) : options.mscVertexMetallibPath.parent_path();
@@ -3861,6 +6551,15 @@ bool MetalR4EngineScene::OptionsFromEnvironment(Options& options, std::string& e
         options.dynamicWorld.shadowFragmentMetallibPath =
             options.sunShaderDirectory / "shadow_direct_base_color.ps.metallib";
     }
+    if (const char* emissiveDirectory = std::getenv("XRAY_METAL_MSC_EMISSIVE_DIR");
+        emissiveDirectory && *emissiveDirectory)
+    {
+        options.dynamicWorld.emissiveShaderDirectory = emissiveDirectory;
+        options.hud.emissiveShaderDirectory = emissiveDirectory;
+    }
+    if (const char* splashDirectory = std::getenv("XRAY_METAL_MSC_RAIN_SPLASH_DIR");
+        splashDirectory && *splashDirectory)
+        options.rain.splashShaderDirectory = splashDirectory;
     if (const char* hudDirectory = std::getenv("XRAY_METAL_MSC_HUD_DIR"); hudDirectory && *hudDirectory)
     {
         options.hud.shaderDirectory = hudDirectory;
@@ -3885,6 +6584,20 @@ bool MetalR4EngineScene::OptionsFromEnvironment(Options& options, std::string& e
             return false;
         options.staticForward.ddsBytesProvider = options.ddsBytesProvider;
     }
+    if (const char* bloomDirectory = std::getenv("XRAY_METAL_MSC_BLOOM_DIR");
+        bloomDirectory && *bloomDirectory)
+    {
+        options.bloom.shaderDirectory = bloomDirectory;
+        if (!options.ddsBytesProvider && !CreateMetalR4EngineXrfsProvider(options.ddsBytesProvider, error))
+            return false;
+        options.bloom.ddsBytesProvider = options.ddsBytesProvider;
+    }
+    if (const char* directory = std::getenv("XRAY_METAL_MSC_EMISSIVE_NONE_DIR"))
+        options.dynamicWorld.emissiveNoneShaderDirectory = directory;
+    if (const char* directory = std::getenv("XRAY_METAL_MSC_EMISSIVE_SKIN4_DIR"))
+        options.hud.emissiveSkin4ShaderDirectory = directory;
+    if (const char* directory = std::getenv("XRAY_METAL_MSC_VOLUMETRIC_DIR"))
+        options.volumetric.shaderDirectory = directory;
     if (const char* waterDirectory = std::getenv("XRAY_METAL_MSC_WATER_DIR");
         waterDirectory && *waterDirectory)
     {
@@ -3893,9 +6606,22 @@ bool MetalR4EngineScene::OptionsFromEnvironment(Options& options, std::string& e
             return false;
         options.water.ddsBytesProvider = options.ddsBytesProvider;
     }
+    if (const char* ssrDirectory = std::getenv("XRAY_METAL_MSC_SSR_DIR");
+        ssrDirectory && *ssrDirectory)
+        options.ssfxSsr.shaderDirectory = ssrDirectory;
+    if (!options.ddsBytesProvider &&
+        !CreateMetalR4EngineXrfsProvider(options.ddsBytesProvider, error))
+        return false;
+    options.ssfxSsr.ddsBytesProvider = options.ddsBytesProvider;
+    if (!ResolveMetalR4EngineTextureDdsPath(std::filesystem::path("fx") / "blue_noise.dds",
+            options.ssfxSsr.blueNoiseTexturePath, error))
+        return false;
     if (const char* aoDirectory = std::getenv("XRAY_METAL_MSC_AO_DIR");
         aoDirectory && *aoDirectory)
         options.ssfxAo.shaderDirectory = aoDirectory;
+    if (const char* fogDirectory = std::getenv("XRAY_METAL_MSC_FOG_SCATTERING_DIR");
+        fogDirectory && *fogDirectory)
+        options.fogScattering.shaderDirectory = fogDirectory;
     if (const char* rainDirectory = std::getenv("XRAY_METAL_MSC_RAIN_DIR");
         rainDirectory && *rainDirectory)
     {
@@ -4002,9 +6728,45 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
             "constants=192+528 bundle=%s\n",
             options.nightVisionShaderDirectory.generic_string().c_str());
     std::fprintf(stderr,
-        "METAL_LUMINANCE_PREPARED shaders=bloom_luminance_1,2,3 "
-        "binding=automatic_linear chain=64x64,8x8,1x1 source=combine_high bundle=%s\n",
+        "METAL_LUMINANCE_PREPARED shaders=bloom_build+bloom_luminance_1,2,3 "
+        "binding=automatic_linear chain=256x256,64x64,8x8,1x1 source=rt_Bloom1_RGBA8 bundle=%s\n",
         options.luminanceShaderDirectory.generic_string().c_str());
+    if (!options.luminanceShaderDirectory.empty() &&
+        !validateE06Receipt(options.luminanceShaderDirectory, "effects-msc-receipt.json",
+            "exact_active_e06_leaf_non_msaa", {"stub_notransform_build.vs", "stub_notransform_filter.vs",
+                "bloom_build.ps", "bloom_luminance_1.ps", "bloom_luminance_2.ps", "bloom_luminance_3.ps"}, error))
+    { Reset(); return false; }
+    if (!options.dynamicWorld.emissiveShaderDirectory.empty() &&
+        !validateE06Receipt(options.dynamicWorld.emissiveShaderDirectory, "effects-msc-receipt.json",
+            "exact_active_e06_leaf_non_msaa", {"deffer_model_flat.vs", "accum_emissivel.ps"}, error))
+    { Reset(); return false; }
+    if (!options.rain.splashShaderDirectory.empty() &&
+        !validateE06Receipt(options.rain.splashShaderDirectory, "effects-msc-receipt.json",
+            "exact_active_e06_leaf_non_msaa", {"effects_rain.vs", "effects_rain_splash.ps"}, error))
+    { Reset(); return false; }
+    if (!options.bloom.shaderDirectory.empty())
+    {
+        impl->bloom = std::make_unique<MetalR4BloomAdapter>();
+        if (!validateE06Receipt(options.bloom.shaderDirectory, "bloom-msc-receipt.json",
+                "exact_active_ssfx_bloom_non_msaa", {"stub_screen_space.vs", "pp_blur.ps",
+                "ssfx_bloom.ps", "ssfx_bloom_downsample.ps", "ssfx_bloom_upsample.ps",
+                "ssfx_bloom_combine.ps", "ssfx_bloom_flares.ps"}, error) ||
+            !impl->bloom->Prepare(backend, options.bloom, error))
+        { Reset(); return false; }
+        std::fprintf(stderr, "METAL_BLOOM_PREPARED bundle=%s shaders=exact_ssfx_chain emissive_producer=admitted_selflightl\n",
+            options.bloom.shaderDirectory.string().c_str());
+    }
+    if (!options.volumetric.shaderDirectory.empty())
+    {
+        impl->volumetric = std::make_unique<MetalR4VolumetricAdapter>();
+        if (!validateE06Receipt(options.volumetric.shaderDirectory, "effects-msc-receipt.json",
+                "exact_active_e06_leaf_non_msaa", {"stub_screen_space.vs", "accum_sun.vs",
+                "accum_volumetric_sun_nomsaa.ps", "accum_volumetric_nomsaa.vs", "accum_volumetric_nomsaa.ps",
+                "ssfx_volumetric_blur.ps", "ssfx_volumetric_combine.ps", "combine_volumetric.ps"}, error)) return false;
+        if (!impl->volumetric->Configure(backend, options.volumetric, error) || !impl->volumetric->IsReady()) return false;
+        std::fprintf(stderr, "METAL_VOLUMETRIC_PREPARED bundle=%s source=original_sun_spot_blur_combine\n",
+            options.volumetric.shaderDirectory.generic_string().c_str());
+    }
     if (!options.ssfxAo.shaderDirectory.empty())
     {
         impl->ssfxAo = std::make_unique<MetalR4SsfxAoAdapter>();
@@ -4019,6 +6781,34 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
         std::fprintf(stderr,
             "METAL_SSFX_AO_IL_PREPARED shaders=ssfx_ao+blurx4+ssfx_il+blurx4 bundle=%s tlab=24/240/120/264/72\n",
             options.ssfxAo.shaderDirectory.generic_string().c_str());
+    }
+    if (!options.fogScattering.shaderDirectory.empty())
+    {
+        impl->fogScattering = std::make_unique<MetalR4FogScatteringAdapter>();
+        if (!validateE06Receipt(options.fogScattering.shaderDirectory,
+                "effects-msc-receipt.json", "exact_active_e06_leaf_non_msaa",
+                {"stub_screen_space.vs", "ssfx_fog_scattering_blur.ps",
+                 "ssfx_fog_scattering.ps"}, error) ||
+            !impl->fogScattering->Prepare(backend, options.fogScattering, error))
+        {
+            error = "SSFX fog-scattering MSC adapter preparation failed: " + error;
+            Reset();
+            return false;
+        }
+    }
+    if (!options.lensFlareShaderDirectory.empty())
+    {
+        impl->lensFlare = std::make_unique<MetalR4LensFlareAdapter>();
+        impl->lensOverlay = std::make_unique<MetalR4LensFlareAdapter>();
+        MetalR4LensFlareAdapter::Options flareOptions;
+        flareOptions.shaderDirectory = options.lensFlareShaderDirectory;
+        flareOptions.ddsBytesProvider = options.ddsBytesProvider;
+        if (!impl->lensFlare->Configure(backend, flareOptions, error) || !impl->lensFlare->IsReady())
+        { Reset(); return false; }
+        flareOptions.colorFormat = R4PixelFormat::BGRA8Unorm;
+        if (!impl->lensOverlay->Configure(backend, flareOptions, error) || !impl->lensOverlay->IsReady())
+        { Reset(); return false; }
+        std::fprintf(stderr, "METAL_LENS_FLARE_PREPARED bundle=%s tlab=24/72\n", options.lensFlareShaderDirectory.string().c_str());
     }
     if (!options.rain.shaderDirectory.empty())
     {
@@ -4172,6 +6962,25 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
         Reset();
         return false;
     }
+    impl->ssfxSsr = std::make_unique<MetalR4SsrAdapter>();
+    std::string ssrStatus;
+    if (!options.ssfxSsr.shaderDirectory.empty() &&
+        !validateE06Receipt(options.ssfxSsr.shaderDirectory, "effects-msc-receipt.json",
+            "exact_active_e06_leaf_non_msaa", {"stub_screen_space.vs", "ssfx_ssr_gloss.ps", "ssfx_ssr.ps",
+            "ssfx_ssr_blur.ps", "ssfx_ssr_combine.ps"}, error)) return false;
+    if (!impl->ssfxSsr->Prepare(backend, options.ssfxSsr, ssrStatus))
+    {
+        error = "general SSFX SSR adapter preparation failed: " + ssrStatus;
+        Reset();
+        return false;
+    }
+    if (impl->ssfxSsr->IsReady())
+        std::fprintf(stderr, "METAL_SSR_PREPARED shaders=ssfx_ssr_gloss,trace,blur_x,blur_y,combine quality=0 bundle=%s blue_noise=%s\n",
+            options.ssfxSsr.shaderDirectory.generic_string().c_str(),
+            impl->ssfxSsr->BlueNoiseTexture() ? "ready" : "missing");
+    else
+        std::fprintf(stderr, "METAL_SSR_SKIP phase=prepare reason=\"%s\" blue_noise=%s\n",
+            ssrStatus.c_str(), impl->ssfxSsr->BlueNoiseTexture() ? "ready" : "missing");
     if (impl->sky.ready)
         std::fprintf(stderr, "METAL_SKY_PREPARED shader=sky2_msc bundle=%s tlab=48/120 targets=2\n",
             options.skyShaderDirectory.generic_string().c_str());
@@ -4243,6 +7052,11 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
     }
     if (!floraOptions.ddsBytesProvider)
         floraOptions.ddsBytesProvider = options.ddsBytesProvider;
+    if (!floraOptions.instancedShadowShaderDirectory.empty() &&
+        !validateE06Receipt(floraOptions.instancedShadowShaderDirectory,
+            "flora-instanced-shadow-receipt.json", "e08-flora-instanced-shadow",
+            {"shadow_direct_tree_instanced.vs", "shadow_direct_tree_instanced_aref.vs"}, error))
+    { Reset(); return false; }
     impl->flora = std::make_unique<MetalR4FloraAdapter>();
     std::string floraStatus;
     if (!impl->flora->Prepare(backend, impl->scene.geometry, impl->scene.geometryBytes,
@@ -4257,6 +7071,7 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
         floraStatus.c_str(), floraTelemetry.totalVisuals, floraTelemetry.admittedVisuals,
         floraTelemetry.skippedVisuals);
     impl->prepared = true;
+    impl->dynamicProbeOptions=options.dynamicWorld;
     impl->dynamicWorld = std::make_unique<MetalR4DynamicWorldAdapter>();
     std::string dynamicStatus;
     if (!impl->dynamicWorld->Configure(backend, options.dynamicWorld, dynamicStatus))
@@ -4347,6 +7162,15 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
         }
         std::fprintf(stderr, "METAL_LOCAL_LIGHT_PREPARE status=\"%s\" enabled=%s\n",
             localLightStatus.c_str(), impl->localLights->IsReady() ? "true" : "false");
+        if (impl->scene.activeOcclusionRequested && impl->localLights->IsReady())
+        {
+            const char* qualificationReason = nullptr;
+            impl->scene.activeOcclusionLocalVolumeShaderQualified =
+                qualifyActiveOcclusionLocalVolumeShader(options.localLights.shaderDirectory,
+                    qualificationReason);
+            impl->scene.activeOcclusionLocalVolumeShaderReason = qualificationReason ?
+                qualificationReason : "qualified-pinned-local-volume-vs";
+        }
         if (impl->localLights->IsReady())
         {
             if (!prepareLocalShadowScene(backend, impl->scene, impl->localShadows, error))
@@ -4406,18 +7230,8 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
                 return true;
             if (impl->flora && impl->flora->IsReady())
             {
-                R4FloraViewState floraView;
-                floraView.view = callbackView.view;
-                floraView.projection = callbackView.projection;
-                floraView.previousView = callbackView.previousView;
-                floraView.previousProjection = callbackView.previousProjection;
-                floraView.eye = callbackView.eye;
-                floraView.staticGlobals = impl->scene.baseLightingStaticGlobals;
-                floraView.timeSeconds = impl->floraEnvironment.globalTime;
-                floraView.treeScaleBiasCorrection =
-                    impl->floraEnvironment.treeScaleBiasCorrection;
-                floraView.valid = callbackView.valid;
-                floraView.previousValid = callbackView.previousValid;
+                R4FloraViewState floraView=makeFloraView(callbackView,impl->floraEnvironment,
+                    impl->floraMotion,impl->scene.baseLightingStaticGlobals);
                 if (!impl->flora->DrawIntoActiveGBuffer(callbackBackend, floraView, callbackError))
                     return false;
                 const MetalR4FloraAdapter::Telemetry& flora = impl->flora->LastTelemetry();
@@ -4441,23 +7255,7 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
             }
             if (impl->detailGrass && impl->detailGrass->IsReady())
             {
-                R4DetailGrassViewState detailView;
-                detailView.view = callbackView.view;
-                detailView.projection = callbackView.projection;
-                detailView.previousView = callbackView.previousView;
-                detailView.previousProjection = callbackView.previousProjection;
-                detailView.eye = callbackView.eye;
-                detailView.timeSeconds = impl->detailEnvironment.globalTime;
-                detailView.ambient = impl->detailEnvironment.ambient;
-                detailView.hemiColor = impl->detailEnvironment.hemiColor;
-                detailView.sunColor = impl->detailEnvironment.adaptedSunColor;
-                detailView.sunDirection = impl->detailEnvironment.adaptedSunDirection;
-                detailView.fogColor = impl->detailEnvironment.fogColor;
-                detailView.fogDensity = impl->detailEnvironment.fogDensity;
-                detailView.fogNear = impl->detailEnvironment.fogNear;
-                detailView.fogFar = impl->detailEnvironment.fogFar;
-                detailView.valid = callbackView.valid && impl->detailEnvironment.valid;
-                detailView.previousValid = callbackView.previousValid;
+                R4DetailGrassViewState detailView=makeDetailView(callbackView,impl->detailEnvironment);
                 if (!impl->detailGrass->DrawIntoActiveGBuffer(callbackBackend, detailView, callbackError))
                     return false;
                 const MetalR4DetailGrassAdapter::Telemetry& detail = impl->detailGrass->LastTelemetry();
@@ -4478,7 +7276,14 @@ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, st
             R4DynamicWorldViewState dynamicView;
             dynamicView.view = callbackView.view;
             dynamicView.projection = callbackView.projection;
+            dynamicView.previousView = callbackView.previousView;
+            dynamicView.previousProjection = callbackView.previousProjection;
+            dynamicView.eye = callbackView.eye;
+            dynamicView.engineFrame = callbackView.engineFrame;
+            dynamicView.previousFrame = callbackView.previousFrame;
+            dynamicView.cameraCut = callbackView.cameraCut;
             dynamicView.valid = callbackView.valid;
+            dynamicView.previousValid = callbackView.previousValid;
             const bool drawn = impl->dynamicWorld->Draw(
                 callbackBackend, dynamicView, world, callbackError);
             const MetalR4DynamicWorldAdapter::Telemetry& telemetry =
@@ -4568,9 +7373,23 @@ void MetalR4EngineScene::SubmitLensFlareFrame(xray::metal::lensflare::Frame fram
     impl->lensFlareFrame = std::move(frame);
 }
 
+void MetalR4EngineScene::SubmitEmissiveFactor(std::uint32_t engineFrame, float factor)
+{
+    if (!impl) impl = std::make_unique<Impl>();
+    impl->emissiveFactorFrame = engineFrame;
+    impl->emissiveFactor = std::isfinite(factor) ? factor : 0.0f;
+}
+
+void MetalR4EngineScene::SubmitLuminanceBloomThreshold(std::uint32_t engineFrame, float threshold)
+{
+    if (!impl) impl = std::make_unique<Impl>();
+    impl->luminanceThresholdFrame = engineFrame;
+    impl->luminanceThreshold = std::isfinite(threshold) ? threshold : 0.0f;
+}
+
 bool MetalR4EngineScene::Render(
     IR4Backend& backend,
-    const ViewState& view,
+    const ViewState& incomingView,
     const R4EnvironmentSnapshot& environment,
     const R4GameplayVisionSnapshot& vision,
     std::string& error)
@@ -4580,9 +7399,32 @@ bool MetalR4EngineScene::Render(
         error = "engine scene is not prepared";
         return false;
     }
+    if (impl->viewHistory.HasPending())
+    { error = "only one primary world view may produce temporal history per Metal submission"; return false; }
+    DiscardUnsubmittedFrame();
+    std::uint32_t width = 0, height = 0;
+    backend.DrawableSize(width, height);
+    const ViewState view = impl->viewHistory.Select(incomingView, width, height);
+    // Reallocate producers before preparing temporal consumers. Otherwise AO
+    // would bind the old-sized history on the first frame after a resize.
+    if (!ensureLevelDepthTarget(backend, impl->scene, error)) return false;
+    if (impl->scene.activeOcclusionEnabled && activeOcclusionFrameInWindow(view.engineFrame))
+        beginActiveOcclusionObservation(impl->scene, view.engineFrame, view.valid);
     impl->floraEnvironment = environment;
+    if (view.valid && environment.valid)
+    {
+        std::string motionError;
+        if (!CaptureMetalR4EngineDetailGrassMotion(impl->floraMotion,motionError))
+        { error="tree/grass shadow wind snapshot unavailable: "+motionError; return false; }
+    }
+    const bool e08Timing = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120 == 0;
+    const auto e08SceneUpdateStart = e08Timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!updateSceneView(backend, impl->scene, view, environment, error))
         return false;
+    if (e08Timing)
+        std::fprintf(stderr, "METAL_E08_STATIC_UPDATE frame=%u cpu_ms=%.6f materials=%zu\n",
+            view.engineFrame, std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - e08SceneUpdateStart).count(), impl->scene.textureMaterials.size());
     if (impl->scene.productionBaseLighting)
     {
         // combine_1 performs the first authored NV luminance/gain encoding;
@@ -4594,6 +7436,7 @@ bool MetalR4EngineScene::Render(
                 vision.shaderParam7.data(), sizeof(float) * vision.shaderParam7.size(), error))
             return false;
     }
+    const auto e01GrassStart = std::chrono::steady_clock::now();
     if (impl->detailGrass && impl->detailGrass->IsReady())
     {
         impl->detailEnvironment = environment;
@@ -4646,6 +7489,8 @@ bool MetalR4EngineScene::Render(
             }
         }
     }
+    backend.AddE01CpuStage("grass", std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - e01GrassStart).count());
     if (!updateTerrainConstants(backend, impl->scene, impl->terrain, error))
     {
         std::fprintf(stderr, "METAL_TERRAIN_REJECT phase=constants error=%s\n", error.c_str());
@@ -4654,25 +7499,58 @@ bool MetalR4EngineScene::Render(
     }
     if (impl->dynamicWorld && impl->dynamicWorld->IsEnabled())
     {
+        const auto e01DynamicStart = std::chrono::steady_clock::now();
         R4DynamicWorldViewState dynamicView;
         dynamicView.view = view.view;
         dynamicView.projection = view.projection;
+        dynamicView.previousView = view.previousView;
+        dynamicView.previousProjection = view.previousProjection;
+        dynamicView.eye = view.eye;
+        dynamicView.engineFrame = view.engineFrame;
+        dynamicView.previousFrame = view.previousFrame;
+        dynamicView.cameraCut = view.cameraCut;
         dynamicView.valid = view.valid;
+        dynamicView.previousValid = view.previousValid;
         if (!impl->dynamicWorld->Prewarm(
                 backend, dynamicView, backend.EngineWorldSnapshot(), error))
             return false;
+        backend.AddE01CpuStage("dynamic_prewarm", std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - e01DynamicStart).count());
     }
+    const auto e08HudStart = e08Timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (impl->hud && impl->hud->IsReady() && !impl->hud->Prewarm(backend, backend.EngineHudSnapshot(), error))
         return false;
     if (impl->scope && impl->scope->IsReady() &&
         !impl->scope->Prewarm(backend, backend.EngineHudSnapshot(), error))
         return false;
+    if (e08Timing)
+        std::fprintf(stderr, "METAL_E08_HUD_STAGE frame=%u cpu_ms=%.6f\n", view.engineFrame,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08HudStart).count());
     if (impl->particles && impl->particles->IsReady())
     {
+        const auto e08ParticleStart = e08Timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool particleArena = std::getenv("XRAY_METAL_E08_PARTICLE_LEGACY") == nullptr;
         if (!impl->particles->PrepareRenderTargets(backend, error) ||
-            !impl->particles->StageFrame(backend.Resources(), impl->particleFrame, error))
+            !impl->particles->StageFrame(backend.Resources(), impl->particleFrame, error,
+                particleArena ? &backend : nullptr))
             return false;
+        if (e08Timing)
+            std::fprintf(stderr, "METAL_E08_PARTICLE_STAGE frame=%u cpu_ms=%.6f draws=%zu vertices=%zu arena=%u\n",
+                view.engineFrame, std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - e08ParticleStart).count(),
+                impl->particles->LastTelemetry().preparedDraws,
+                impl->particles->LastTelemetry().preparedVertices, unsigned(particleArena));
         impl->particleFrame = {};
+    }
+    if (impl->lensFlare && impl->lensFlare->IsReady())
+    {
+        xray::metal::lensflare::Frame source, overlay;
+        for (auto& draw : impl->lensFlareFrame.draws)
+            (draw.afterPostprocess ? overlay.draws : source.draws).push_back(std::move(draw));
+        if (!impl->lensFlare->StageFrame(backend, std::move(source), environment.engineFrame, error) ||
+            !impl->lensOverlay->StageFrame(backend, std::move(overlay), environment.engineFrame, error))
+            return false;
+        impl->lensFlareFrame = {};
     }
     if (impl->rain && impl->rain->IsReady())
     {
@@ -4701,24 +7579,80 @@ bool MetalR4EngineScene::Render(
         if (!impl->ssfxAo->PrepareRenderTargets(backend, target.width, target.height, error))
             return false;
     }
+    if (impl->ssfxSsr && impl->ssfxSsr->IsReady() &&
+        !impl->scene.lightingTargets.empty() && impl->scene.lightingTargets[0] &&
+        !impl->scene.gBufferTargets.empty() && impl->scene.gBufferTargets[0])
+    {
+        const R4Texture2DDesc& colorTarget = impl->scene.lightingTargets[0]->Descriptor();
+        const R4Texture2DDesc& positionTarget = impl->scene.gBufferTargets[0]->Descriptor();
+        if (!impl->ssfxSsr->PrepareRenderTargets(backend, colorTarget.width,
+                colorTarget.height, colorTarget.format, positionTarget, error))
+            return false;
+        if (!impl->ssrSceneColorSnapshot ||
+            impl->ssrSnapshotWidth != colorTarget.width ||
+            impl->ssrSnapshotHeight != colorTarget.height ||
+            impl->ssrSnapshotFormat != colorTarget.format)
+        {
+            impl->ssrSceneColorSnapshot.reset();
+            R4Texture2DDesc snapshotDescriptor = colorTarget;
+            snapshotDescriptor.storage = R4ResourceStorage::Private;
+            snapshotDescriptor.usage = R4TextureUsage::ShaderRead;
+            snapshotDescriptor.label = "R4 general SSR pre-effect scene-color snapshot";
+            impl->ssrSceneColorSnapshot = backend.Resources().CreateTexture2D(
+                snapshotDescriptor, error);
+            if (!impl->ssrSceneColorSnapshot)
+                return false;
+            impl->ssrSnapshotWidth = colorTarget.width;
+            impl->ssrSnapshotHeight = colorTarget.height;
+            impl->ssrSnapshotFormat = colorTarget.format;
+        }
+    }
+    if (impl->fogScattering && impl->fogScattering->IsReady() && view.valid &&
+        environment.valid && environment.ssfxFogScatteringAvailable &&
+        std::isfinite(environment.ssfxFogScattering) && environment.ssfxFogScattering > 0.0f)
+    {
+        if (impl->scene.lightingTargets.empty() || !impl->scene.lightingTargets[0])
+        {
+            error = "active SSFX fog scattering has no prepared combined scene color";
+            return false;
+        }
+        const R4Texture2DDesc& target = impl->scene.lightingTargets[0]->Descriptor();
+        if (!impl->fogScattering->PrepareRenderTargets(backend, target.width,
+                target.height, target.format, error))
+            return false;
+    }
     std::shared_ptr<const GBufferWorldDrawCallback> worldDraw;
     {
         std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
         worldDraw = impl->worldDraw;
     }
+    if (impl->emissiveFactorFrame != view.engineFrame &&
+        (view.engineFrame == 0u || view.engineFrame % 300u == 0u))
+        std::fprintf(stderr, "METAL_EMISSIVE_FACTOR_REJECT frame=%u owner=%u\n",
+            view.engineFrame, impl->emissiveFactorFrame);
+    impl->scene.luminanceBloomThreshold = impl->luminanceThresholdFrame == view.engineFrame ? impl->luminanceThreshold : 0.0f;
     const bool rendered = renderProductionScene(backend, impl->scene, impl->terrain, impl->sky,
         impl->defVertex.get(), impl->defObjectsLod.get(), impl->staticForward.get(), impl->ssfxAo.get(),
         impl->ssfxAoTelemetryFrame,
+        impl->ssfxSsr.get(), impl->ssrSceneColorSnapshot,
+        impl->volumetric.get(),
         impl->rain.get(),
         impl->rainTelemetryFrame,
         impl->water.get(),
+        impl->lensFlare.get(),
+        impl->lensOverlay.get(),
+        impl->lensFlareTelemetryFrame,
         impl->localLights.get(),
         &impl->localShadows,
-        impl->dynamicWorld.get(),
+        impl->dynamicWorld.get(), impl->dynamicProbeOptions,
+        impl->flora.get(), makeFloraView(view,environment,impl->floraMotion,impl->scene.baseLightingStaticGlobals),
+        impl->detailGrass.get(), makeDetailView(view,environment),
         impl->hud.get(),
         impl->scope.get(),
-        impl->particles.get(), &impl->nightVision, view, environment, vision,
-        worldDraw, error);
+        impl->particles.get(), impl->bloom.get(), impl->emissiveTarget,
+        impl->emissiveFactorFrame == view.engineFrame ? impl->emissiveFactor : 0.0f,
+        &impl->nightVision, view, environment, vision,
+        worldDraw, impl->fogScattering.get(), error);
     if (rendered && impl->hud && impl->hud->IsReady())
     {
         const MetalR4HudAdapter::Telemetry& hud = impl->hud->LastTelemetry();
@@ -4833,14 +7767,15 @@ bool MetalR4EngineScene::Render(
     {
         const MetalR4LocalLightAdapter::Telemetry& local = impl->localLights->LastTelemetry();
         const bool reportLocalTelemetry = impl->lastLocalLightTelemetryFrame == UINT32_MAX ||
-            environment.engineFrame - impl->lastLocalLightTelemetryFrame >= 300u;
+            environment.engineFrame - impl->lastLocalLightTelemetryFrame >= 300u ||
+            std::getenv("XRAY_METAL_LOCAL_LIGHT_DIAGNOSTICS") != nullptr;
         if (reportLocalTelemetry)
         {
-            std::fprintf(stderr, "METAL_LOCAL_LIGHT_FRAME frame=%u requested=%zu admitted=%zu submitted=%zu shadowed_submitted=%zu culled=%zu unavailable_skipped=%zu shadowed_skipped=%zu shadowed_point_skipped=%zu invalid_skipped=%zu cookie_skipped=%zu\n",
+            std::fprintf(stderr, "METAL_LOCAL_LIGHT_FRAME frame=%u requested=%zu admitted=%zu submitted=%zu shadowed_submitted=%zu culled=%zu unavailable_skipped=%zu shadowed_skipped=%zu shadowed_point_skipped=%zu unsupported_skipped=%zu invalid_skipped=%zu cookie_skipped=%zu marker_resets=%zu\n",
                 environment.engineFrame, local.requested, local.admitted, local.submitted,
                 local.submittedShadowed, local.culled, local.skippedUnavailable,
-                local.skippedShadowed, local.skippedShadowedPoint, local.skippedInvalid,
-                local.skippedCookie);
+                local.skippedShadowed, local.skippedShadowedPoint, local.skippedUnsupported, local.skippedInvalid,
+                local.skippedCookie, local.markerResets);
             impl->lastLocalLightTelemetryFrame = environment.engineFrame;
             impl->lastLocalLightRequested = local.requested;
             impl->lastLocalLightAdmitted = local.admitted;
@@ -4852,7 +7787,7 @@ bool MetalR4EngineScene::Render(
             std::fprintf(stderr,
                 "METAL_LOCAL_SHADOW_FRAME frame=%u candidates=%zu rendered=%zu static_casters=%zu "
                 "culled_casters=%zu dynamic_candidates=%zu dynamic_casters=%zu culled_dynamic_casters=%zu "
-                "rejected_dynamic_casters=%zu dynamic_renderables_omitted=%zu tile=%u capacity=%zu\n",
+                "rejected_dynamic_casters=%zu dynamic_renderables_omitted=%zu tile=%u capacity=%zu batches=%zu\n",
                 environment.engineFrame, impl->localShadows.candidates,
                 impl->localShadows.renderedLights, impl->localShadows.submittedCasters,
                 impl->localShadows.culledCasters,
@@ -4861,7 +7796,11 @@ bool MetalR4EngineScene::Render(
                 impl->localShadows.culledDynamicCasters,
                 impl->localShadows.rejectedDynamicCasters,
                 impl->localShadows.omittedDynamicCasters,
-                LocalShadowTileSize, LocalShadowTileCapacity);
+                LocalShadowTileSize, LocalShadowTileCapacity, impl->localShadows.batches);
+            if (impl->localShadows.mergeStatic)
+                std::fprintf(stderr, "METAL_E08_STATIC_MERGE frame=%u source_rows=%zu encoded_draws=%zu cache_payload_bytes=%zu keys=%zu\n",
+                    environment.engineFrame, impl->localShadows.submittedCasters, impl->localShadows.mergedEncodedDraws,
+                    impl->localShadows.mergeCacheBytes, impl->localShadows.mergeCache.size());
             impl->lastLocalShadowRendered = impl->localShadows.renderedLights;
         }
     }
@@ -4911,7 +7850,77 @@ bool MetalR4EngineScene::Render(
             if (firstGameplayReport) impl->defObjectsLodGameplayFrustumReported = true;
         }
     }
+    if (rendered && view.valid && environment.valid)
+    {
+        impl->viewHistory.Stage(view, width, height, backend.LastSubmittedSerial() + 1u);
+        if (std::getenv("XRAY_METAL_TEMPORAL_DIAGNOSTICS"))
+            std::fprintf(stderr, "METAL_TEMPORAL_STAGE frame=%u previous_frame=%u previous_serial=%llu next_serial=%llu reset=%d extent=%ux%u\n",
+                view.engineFrame, view.previousFrame,
+                static_cast<unsigned long long>(impl->viewHistory.Serial()),
+                static_cast<unsigned long long>(backend.LastSubmittedSerial() + 1u),
+                view.cameraCut ? 1 : 0, width, height);
+    }
+    if (impl->dynamicWorld && impl->dynamicWorld->IsEnabled())
+    {
+        R4DynamicWorldViewState diagnosticView;
+        diagnosticView.view = view.view;
+        diagnosticView.projection = view.projection;
+        diagnosticView.valid = view.valid;
+        diagnosticView.engineFrame = view.engineFrame;
+        impl->dynamicWorld->WriteE07Frame(backend, diagnosticView,
+            backend.EngineWorldSnapshot(), rendered);
+    }
     return rendered;
+}
+
+void MetalR4EngineScene::OnFrameSubmitted()
+{
+    if (!impl) return;
+    commitLevelSceneUploads(impl->scene);
+    commitTerrainSceneUploads(impl->terrain);
+    if (impl->defVertex) impl->defVertex->CommitSubmittedFrame();
+    if (impl->defObjectsLod) impl->defObjectsLod->CommitSubmittedFrame();
+    if (impl->dynamicWorld) impl->dynamicWorld->CommitSubmittedSkin();
+    if (!impl->viewHistory.HasPending()) return;
+    impl->viewHistory.Commit();
+    if (impl->dynamicWorld) impl->dynamicWorld->CommitSubmittedFrame();
+    if (impl && impl->ssfxAo)
+        impl->ssfxAo->CommitSubmittedFrame();
+    if (impl && impl->ssfxSsr)
+        impl->ssfxSsr->CommitSubmittedFrame();
+    if (impl && impl->water)
+        impl->water->CommitSubmittedFrame();
+    if (impl && impl->bloom) impl->bloom->CommitSubmittedFrame();
+    if (impl && impl->lensFlare) impl->lensFlare->CommitSubmittedFrame(impl->floraEnvironment.engineFrame);
+    if (impl && impl->lensOverlay) impl->lensOverlay->CommitSubmittedFrame(impl->floraEnvironment.engineFrame);
+}
+
+void MetalR4EngineScene::DiscardUnsubmittedFrame()
+{
+    if (!impl) return;
+    impl->viewHistory.Discard();
+    discardLevelSceneUploads(impl->scene);
+    discardTerrainSceneUploads(impl->terrain);
+    if (impl->defVertex) impl->defVertex->DiscardUnsubmittedFrame();
+    if (impl->defObjectsLod) impl->defObjectsLod->DiscardUnsubmittedFrame();
+    if (impl->particles) impl->particles->DiscardFrame();
+    if (impl->dynamicWorld) impl->dynamicWorld->DiscardUnsubmittedFrame();
+    if (impl->ssfxAo) impl->ssfxAo->DiscardUnsubmittedFrame();
+    if (impl->ssfxSsr) impl->ssfxSsr->DiscardUnsubmittedFrame();
+    if (impl->water) impl->water->DiscardUnsubmittedFrame();
+    if (impl->bloom) impl->bloom->DiscardUnsubmittedFrame();
+    if (impl->lensFlare) impl->lensFlare->DiscardUnsubmittedFrame();
+    if (impl->lensOverlay) impl->lensOverlay->DiscardUnsubmittedFrame();
+}
+
+void MetalR4EngineScene::InvalidateHistory()
+{
+    if (!impl) return;
+    DiscardUnsubmittedFrame();
+    impl->viewHistory.Invalidate();
+    if (impl->ssfxAo) impl->ssfxAo->InvalidateHistory();
+    if (impl->ssfxSsr) impl->ssfxSsr->InvalidateHistory();
+    if (impl->dynamicWorld) impl->dynamicWorld->InvalidateHistory();
 }
 
 bool MetalR4EngineScene::IsPrepared() const

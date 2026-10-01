@@ -793,6 +793,8 @@ void CConsole::Show()
 	this->IR_Capture();
 
 	#if defined(XR_PLATFORM_APPLE)
+	if (pInput)
+		pInput->SetRelativeMouseMode(false);
 	SDL_StartTextInput();
 	#endif
 

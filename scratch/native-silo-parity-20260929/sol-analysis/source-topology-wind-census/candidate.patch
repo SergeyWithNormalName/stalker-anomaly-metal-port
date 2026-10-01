@@ -1,0 +1,407 @@
+--- a/src/Layers/xrRender/R_calculate.cpp
++++ b/src/Layers/xrRender/R_calculate.cpp
+@@ -1,7 +1,21 @@
+ #include "stdafx.h"
+ #include "../../xrEngine/customhud.h"
+ #include "../../Include/xrRender/R4BackendSelection.h"
++#include "xrRender_console.h"
+ 
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <limits>
++#include <locale>
++#include <sstream>
++#include <string>
++#include <vector>
++
+ float g_fSCREEN;
+ 
+ extern float r_dtex_range;
+@@ -11,7 +25,374 @@
+ extern float r_ssaLOD_B;
+ extern float r_ssaHZBvsTEX;
+ extern float r_ssaGLOD_start, r_ssaGLOD_end;
++
++namespace
++{
++struct TopologyCensusFrustum
++{
++	u32 mask = 0;
++	std::vector<std::array<float, 4>> planes;
++};
++
++struct TopologyCensusSector
++{
++	int sectorIndex = -1;
++	int rootVisualIndex = -1;
++	std::vector<TopologyCensusFrustum> frustums;
++};
++
++bool topologyFinite(const float value)
++{
++	return std::isfinite(value);
++}
++
++bool topologyMatrixValid(const Fmatrix& matrix)
++{
++	bool anyNonZero = false;
++	for (int row = 0; row < 4; ++row)
++	{
++		for (int column = 0; column < 4; ++column)
++		{
++			const float value = matrix.m[row][column];
++			if (!topologyFinite(value))
++				return false;
++			anyNonZero = anyNonZero || value != 0.0f;
++		}
++	}
++	return anyNonZero;
++}
++
++bool topologyFloatHasBits(const float value, const u32 expectedBits)
++{
++	u32 bits = 0;
++	std::memcpy(&bits, &value, sizeof(bits));
++	return bits == expectedBits;
++}
++
++u32 topologyFloatBits(const float value)
++{
++	u32 bits = 0;
++	std::memcpy(&bits, &value, sizeof(bits));
++	return bits;
++}
++
++bool topologySameVectorBits(const Fvector& left, const Fvector& right)
++{
++	return topologyFloatBits(left.x) == topologyFloatBits(right.x) &&
++		topologyFloatBits(left.y) == topologyFloatBits(right.y) &&
++		topologyFloatBits(left.z) == topologyFloatBits(right.z);
++}
++
++bool topologySameMatrixBits(const Fmatrix& left, const Fmatrix& right)
++{
++	for (int row = 0; row < 4; ++row)
++	{
++		for (int column = 0; column < 4; ++column)
++		{
++			u32 leftBits = 0;
++			u32 rightBits = 0;
++			std::memcpy(&leftBits, &left.m[row][column], sizeof(leftBits));
++			std::memcpy(&rightBits, &right.m[row][column], sizeof(rightBits));
++			if (leftBits != rightBits)
++				return false;
++		}
++	}
++	return true;
++}
++
++void topologyAddReason(std::string& reason, const char* item)
++{
++	if (!reason.empty())
++		reason += ";";
++	reason += item;
++}
++
++void topologyJsonString(std::ostream& out, const char* value)
++{
++	out << '"';
++	if (value)
++	{
++		for (const unsigned char ch : std::string(value))
++		{
++			if (ch == '"' || ch == '\\')
++				out << '\\' << char(ch);
++			else if (ch < 0x20u)
++				out << "\\u00" << std::hex << std::setw(2) << std::setfill('0') << unsigned(ch)
++					<< std::dec << std::setfill(' ');
++			else
++				out << char(ch);
++		}
++	}
++	out << '"';
++}
++
++void topologyJsonFloat(std::ostream& out, const float value)
++{
++	if (topologyFinite(value))
++		out << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
++	else
++		out << "null";
++}
++
++void topologyJsonVector3(std::ostream& out, const Fvector& value)
++{
++	out << '[';
++	topologyJsonFloat(out, value.x); out << ',';
++	topologyJsonFloat(out, value.y); out << ',';
++	topologyJsonFloat(out, value.z);
++	out << ']';
++}
++
++void topologyJsonMatrix(std::ostream& out, const Fmatrix& value)
++{
++	out << '[';
++	for (int row = 0, index = 0; row < 4; ++row)
++	{
++		for (int column = 0; column < 4; ++column, ++index)
++		{
++			if (index)
++				out << ',';
++			topologyJsonFloat(out, value.m[row][column]);
++		}
++	}
++	out << ']';
++}
++
++bool WriteMetalSourceTopologyCensus(const char* path)
++{
++	std::string reason;
++	if (!g_pGameLevel)
++		topologyAddReason(reason, "no_level");
++	if (Device.dwFrame != 700u)
++		topologyAddReason(reason, "wrong_frame");
++	if (Device.dwWidth != 1920u || Device.dwHeight != 1200u)
++		topologyAddReason(reason, "wrong_extent");
++	if (!topologyFinite(Device.fFOV) || Device.fFOV <= 0.0f)
++		topologyAddReason(reason, "invalid_fov");
++	if (!topologyFinite(Device.vCameraPosition.x) || !topologyFinite(Device.vCameraPosition.y) ||
++		!topologyFinite(Device.vCameraPosition.z))
++		topologyAddReason(reason, "invalid_eye");
++	if (!topologyMatrixValid(Device.mView) || !topologyMatrixValid(Device.mProject) ||
++		!topologyMatrixValid(Device.mFullTransform))
++		topologyAddReason(reason, "invalid_frame_matrix");
++	if (!topologyFinite(r_dtex_range) || !topologyFinite(ps_r2_df_parallax_range) ||
++		!topologyFinite(g_fSCREEN) || !topologyFinite(r_ssaDISCARD))
++		topologyAddReason(reason, "invalid_renderer_provenance");
++
++	const shared_str levelNameRef = g_pGameLevel ? g_pGameLevel->name() : shared_str();
++	const char* levelName = levelNameRef.c_str();
++	if (!levelName || std::strcmp(levelName, "l01_escape") != 0)
++		topologyAddReason(reason, "unexpected_level_name");
++	if (Sectors.empty() && Visuals.empty())
++		topologyAddReason(reason, "source_sector_visual_graph_unavailable");
++	else if (Sectors.empty() || Visuals.empty())
++		topologyAddReason(reason, "incomplete_source_sector_visual_graph");
++	else if (Sectors.size() != 32u || Visuals.size() != 22453u)
++		topologyAddReason(reason, "unexpected_level_structure_counts");
++	if (!topologyFloatHasBits(Device.fFOV, 0x42a00000u))
++		topologyAddReason(reason, "unexpected_fixed_fov");
++	if (!topologyFloatHasBits(Device.vCameraPosition.x, 0xc35d1523u) ||
++		!topologyFloatHasBits(Device.vCameraPosition.y, 0xc1924768u) ||
++		!topologyFloatHasBits(Device.vCameraPosition.z, 0xc3282e9au))
++		topologyAddReason(reason, "unexpected_fixed_eye");
++
++	int startSectorIndex = -1;
++	for (u32 index = 0; index < Sectors.size(); ++index)
++	{
++		if (Sectors[index] == GMBase.i_start)
++		{
++			startSectorIndex = static_cast<int>(index);
++			break;
++		}
++	}
++	if (!GMBase.i_start || startSectorIndex < 0)
++		topologyAddReason(reason, "unknown_start_sector");
++	if (!pLastSector || GMBase.i_start != pLastSector ||
++		!topologySameVectorBits(GMBase.i_vBase, Device.vCameraPosition) ||
++		!topologySameMatrixBits(GMBase.i_mXFORM, Device.mFullTransform))
++		topologyAddReason(reason, "missing_or_stale_frame_traversal");
+ 
++	std::vector<TopologyCensusSector> visibleSectors;
++	{
++		// m_sector_frustums is frame-local and is read under its shared lock.
++		xrSRWLockGuard guard(&GMBase.S_LC, true);
++		if (GMBase.m_sector_frustums.size() == 0u)
++			topologyAddReason(reason, "empty_visible_sector_map");
++		for (auto node = GMBase.m_sector_frustums.begin(); node != GMBase.m_sector_frustums.end(); ++node)
++		{
++			TopologyCensusSector record;
++			for (u32 index = 0; index < Sectors.size(); ++index)
++			{
++				if (Sectors[index] == node->key)
++				{
++					record.sectorIndex = static_cast<int>(index);
++					break;
++				}
++			}
++			if (record.sectorIndex < 0 || !node->key)
++				topologyAddReason(reason, "unknown_visible_sector");
++			if (node->val.first.empty())
++				topologyAddReason(reason, "empty_sector_frustums");
++			if (node->key)
++			{
++				dxRender_Visual* rootVisual = static_cast<CSector*>(node->key)->root();
++				for (u32 index = 0; index < Visuals.size(); ++index)
++				{
++					if (Visuals[index] == rootVisual)
++					{
++						record.rootVisualIndex = static_cast<int>(index);
++						break;
++					}
++				}
++			}
++			if (record.rootVisualIndex < 0)
++				topologyAddReason(reason, "unknown_sector_root_visual");
++			for (const CFrustum& frustum : node->val.first)
++			{
++				TopologyCensusFrustum frustumRecord;
++				if (frustum.p_count <= 0 || frustum.p_count > FRUSTUM_MAXPLANES)
++					topologyAddReason(reason, "invalid_frustum_plane_count");
++				frustumRecord.mask = frustum.getMask();
++				const int planeCount = (frustum.p_count < 0 || frustum.p_count > FRUSTUM_MAXPLANES)
++					? 0 : frustum.p_count;
++				for (int planeIndex = 0; planeIndex < planeCount; ++planeIndex)
++				{
++					const CFrustum::fplane& plane = frustum.planes[planeIndex];
++					if (!topologyFinite(plane.n.x) || !topologyFinite(plane.n.y) ||
++						!topologyFinite(plane.n.z) || !topologyFinite(plane.d))
++						topologyAddReason(reason, "invalid_frustum_plane");
++					frustumRecord.planes.push_back({plane.n.x, plane.n.y, plane.n.z, plane.d});
++				}
++				record.frustums.push_back(std::move(frustumRecord));
++			}
++			visibleSectors.push_back(std::move(record));
++		}
++	}
++	if (visibleSectors.empty())
++		topologyAddReason(reason, "no_visible_sectors");
++	else if (startSectorIndex >= 0 && std::none_of(visibleSectors.begin(), visibleSectors.end(),
++		[startSectorIndex](const TopologyCensusSector& sector) { return sector.sectorIndex == startSectorIndex; }))
++		topologyAddReason(reason, "start_sector_not_in_visible_map");
++
++	std::ostringstream json;
++	json.imbue(std::locale::classic());
++	json << std::setprecision(std::numeric_limits<float>::max_digits10);
++	json << "{\n  \"schema\":\"xray-metal-source-topology-census/v1\",\n  \"status\":";
++	topologyJsonString(json, reason.empty() ? "known_snapshot" : "unknown");
++	json << ",\n  \"reason\":";
++	if (reason.empty())
++		json << "null";
++	else
++		topologyJsonString(json, reason.c_str());
++	json << ",\n  \"frame\":" << Device.dwFrame
++		<< ",\n  \"provenance\":{\"level_name\":";
++	topologyJsonString(json, levelName);
++	json << ",\"expected_level\":\"l01_escape\",\"sector_graph_available\":"
++		<< ((!Sectors.empty() && !Visuals.empty()) ? "true" : "false")
++		<< ",\"sector_count\":" << Sectors.size()
++		<< ",\"visual_count\":" << Visuals.size()
++		<< ",\"archive_level_sha256\":\"1800a451d0bba9af1da69fae8683b36b6e6346709c0d6b9bf14385f4a48d19f7\""
++		<< ",\"archive_level_geom_sha256\":\"a4552d34eec6f87ed7eb461327c8a331d1f7a3b9911a2b51342ca4d377f8d78a\""
++		<< ",\"archive_level_cform_sha256\":\"6a8e56d483d60da0f461fb2e20ca64ba193b94ed883013c337c7d293a2410e31\""
++		<< ",\"runtime_file_hashes_verified\":false}"
++		<< ",\n  \"extent\":[" << Device.dwWidth << ',' << Device.dwHeight << ']'
++		<< ",\n  \"fov\":";
++	topologyJsonFloat(json, Device.fFOV);
++	json << ",\n  \"eye\":";
++	topologyJsonVector3(json, Device.vCameraPosition);
++	json << ",\n  \"view\":";
++	topologyJsonMatrix(json, Device.mView);
++	json << ",\n  \"projection\":";
++	topologyJsonMatrix(json, Device.mProject);
++	json << ",\n  \"full_transform\":";
++	topologyJsonMatrix(json, Device.mFullTransform);
++	json << ",\n  \"start_sector_index\":";
++	if (startSectorIndex >= 0)
++		json << startSectorIndex;
++	else
++		json << "null";
++	json << ",\n  \"renderer_state\":{\"i_options\":" << GMBase.i_options
++		<< ",\"hom_enabled\":" << ((GMBase.i_options & CDSGraphManager::VQ_HOM) ? "true" : "false")
++		<< ",\"r_dtex_range\":";
++	topologyJsonFloat(json, r_dtex_range);
++	json << ",\"ps_r2_df_parallax_range\":";
++	topologyJsonFloat(json, ps_r2_df_parallax_range);
++	json << ",\"g_fSCREEN\":";
++	topologyJsonFloat(json, g_fSCREEN);
++	json << ",\"r_ssaDISCARD\":";
++	topologyJsonFloat(json, r_ssaDISCARD);
++	json << "},\n  \"visible_sector_count\":" << visibleSectors.size() << ",\n  \"visible_sectors\":[";
++	for (std::size_t sectorIndex = 0; sectorIndex < visibleSectors.size(); ++sectorIndex)
++	{
++		const TopologyCensusSector& sector = visibleSectors[sectorIndex];
++		if (sectorIndex)
++			json << ',';
++		json << "{\"sector_index\":";
++		if (sector.sectorIndex >= 0) json << sector.sectorIndex; else json << "null";
++		json << ",\"root_visual_index\":";
++		if (sector.rootVisualIndex >= 0) json << sector.rootVisualIndex; else json << "null";
++		json << ",\"frustum_count\":" << sector.frustums.size() << ",\"frustums\":[";
++		for (std::size_t frustumIndex = 0; frustumIndex < sector.frustums.size(); ++frustumIndex)
++		{
++			if (frustumIndex) json << ',';
++			const TopologyCensusFrustum& frustum = sector.frustums[frustumIndex];
++			json << "{\"mask\":" << frustum.mask << ",\"planes\":[";
++			for (std::size_t planeIndex = 0; planeIndex < frustum.planes.size(); ++planeIndex)
++			{
++				if (planeIndex) json << ',';
++				json << '[';
++				for (std::size_t component = 0; component < frustum.planes[planeIndex].size(); ++component)
++				{
++					if (component) json << ',';
++					topologyJsonFloat(json, frustum.planes[planeIndex][component]);
++				}
++				json << ']';
++			}
++			json << "]}";
++		}
++		json << "]}";
++	}
++	json << "]\n}\n";
++
++	std::ofstream output(path, std::ios::binary | std::ios::trunc);
++	if (!output)
++	{
++		Msg("! XRAY_METAL_SOURCE_TOPOLOGY_CENSUS status=unknown reason=output_open_failed");
++		return false;
++	}
++	const std::string payload = json.str();
++	output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
++	output.close();
++	if (!output)
++	{
++		Msg("! XRAY_METAL_SOURCE_TOPOLOGY_CENSUS status=unknown reason=output_write_failed");
++		return false;
++	}
++	Msg("* XRAY_METAL_SOURCE_TOPOLOGY_CENSUS status=%s frame=%u visible_sectors=%u suppression=0",
++		reason.empty() ? "known_snapshot" : "unknown", Device.dwFrame,
++		static_cast<u32>(visibleSectors.size()));
++	return reason.empty();
++}
++
++void MaybeWriteMetalSourceTopologyCensus()
++{
++	static bool attempted = false;
++	if (attempted || Device.dwFrame != 700u)
++		return;
++	const char* enabled = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++	if (!enabled || std::strcmp(enabled, "1") != 0)
++		return;
++	attempted = true;
++	const char* path = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_FILE");
++	if (!path || path[0] != '/')
++	{
++		Msg("! XRAY_METAL_SOURCE_TOPOLOGY_CENSUS status=unknown reason=absolute_output_path_required");
++		return;
++	}
++	WriteMetalSourceTopologyCensus(path);
++}
++} // namespace
++
+ void CRender::Calculate()
+ {
+ 	if (SelectedR4Backend() == R4BackendKind::Metal)
+@@ -68,6 +449,7 @@
+ 			}
+ 			ViewBase.CreateFromMatrix(Device.mFullTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+ 			GMBase.traverse(pLastSector, ViewBase, Device.vCameraPosition, Device.mFullTransform);
++			MaybeWriteMetalSourceTopologyCensus();
+ 		}
+ 		RImplementation.phase = PHASE_NORMAL;
+ 		GMBase.r_dsgraph_capture_metal_world();

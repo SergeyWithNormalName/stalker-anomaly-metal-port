@@ -1,4 +1,5 @@
 #include "StdAfx.h"
+#include <dinput.h>
 
 #include "UITrackBar.h"
 #include "UI3tButton.h"
@@ -86,6 +87,49 @@ bool CUITrackBar::OnMouseAction(float x, float y, EUIMessages mouse_action)
 		break;
 	};
 	return true;
+}
+
+bool CUITrackBar::OnKeyboardAction(int dik, EUIMessages keyboard_action)
+{
+	if (keyboard_action == WINDOW_KEY_PRESSED && IsShown() && CursorOverWindow())
+	{
+		if (dik == DIK_LEFT)
+		{
+			if (m_b_is_float)
+			{
+				m_f_val -= GetInvert() ? -m_f_step : m_f_step;
+				clamp(m_f_val, m_f_min, m_f_max);
+			}
+			else
+			{
+				m_i_val -= GetInvert() ? -m_i_step : m_i_step;
+				clamp(m_i_val, m_i_min, m_i_max);
+			}
+			GetMessageTarget()->SendMessage(this, BUTTON_CLICKED, NULL);
+			UpdatePos();
+			OnChangedOptValue();
+			return true;
+		}
+		else if (dik == DIK_RIGHT)
+		{
+			if (m_b_is_float)
+			{
+				m_f_val += GetInvert() ? -m_f_step : m_f_step;
+				clamp(m_f_val, m_f_min, m_f_max);
+			}
+			else
+			{
+				m_i_val += GetInvert() ? -m_i_step : m_i_step;
+				clamp(m_i_val, m_i_min, m_i_max);
+			}
+			GetMessageTarget()->SendMessage(this, BUTTON_CLICKED, NULL);
+			UpdatePos();
+			OnChangedOptValue();
+			return true;
+		}
+	}
+
+	return CUI_IB_FrameLineWnd::OnKeyboardAction(dik, keyboard_action);
 }
 
 void CUITrackBar::InitTrackBar(Fvector2 pos, Fvector2 size)

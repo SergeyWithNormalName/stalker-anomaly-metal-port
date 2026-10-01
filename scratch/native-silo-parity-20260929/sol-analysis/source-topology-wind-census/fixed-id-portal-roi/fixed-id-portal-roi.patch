@@ -1,0 +1,290 @@
+--- a/MetalR4FloraAdapter.base.cpp
++++ b/MetalR4FloraAdapter.cpp
+@@ -109,6 +109,173 @@
+         return false;
+     value.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+     return input.good() || input.eof();
++}
++
++constexpr std::size_t kFixedPortalRoiVisualCount = 4086u;
++
++struct FixedPortalRoiFixture
++{
++    std::array<std::uint32_t, 16> viewBits{};
++    std::array<std::uint32_t, 16> projectionBits{};
++    std::array<std::uint32_t, 3> eyeBits{};
++    // true means LeafBump; false means TrunkFlat.
++    std::unordered_map<std::uint32_t, bool> visualMaterials;
++};
++
++std::vector<std::string> splitPortalRoiCsvRow(const std::string& row)
++{
++    std::vector<std::string> fields;
++    std::size_t begin = 0;
++    for (;;)
++    {
++        const std::size_t comma = row.find(',', begin);
++        fields.emplace_back(row.substr(begin,
++            comma == std::string::npos ? comma : comma - begin));
++        if (comma == std::string::npos)
++            break;
++        begin = comma + 1u;
++    }
++    return fields;
++}
++
++bool parsePortalRoiHexWord(const std::string& value, std::uint32_t& result)
++{
++    if (value.size() != 8u)
++        return false;
++    result = 0u;
++    for (const char digit : value)
++    {
++        std::uint32_t nibble = 0u;
++        if (digit >= '0' && digit <= '9') nibble = std::uint32_t(digit - '0');
++        else if (digit >= 'a' && digit <= 'f') nibble = std::uint32_t(digit - 'a' + 10);
++        else if (digit >= 'A' && digit <= 'F') nibble = std::uint32_t(digit - 'A' + 10);
++        else return false;
++        result = (result << 4u) | nibble;
++    }
++    return true;
++}
++
++bool parsePortalRoiId(const std::string& value, std::uint32_t& result)
++{
++    if (value.empty())
++        return false;
++    std::uint64_t parsed = 0u;
++    for (const char digit : value)
++    {
++        if (digit < '0' || digit > '9')
++            return false;
++        parsed = parsed * 10u + std::uint32_t(digit - '0');
++        if (parsed > std::numeric_limits<std::uint32_t>::max())
++            return false;
++    }
++    result = std::uint32_t(parsed);
++    return true;
++}
++
++template <std::size_t N>
++bool parsePortalRoiBitsRow(const std::vector<std::string>& fields, const char* key,
++    std::array<std::uint32_t, N>& output)
++{
++    if (fields.size() != N + 1u || fields[0] != key)
++        return false;
++    for (std::size_t i = 0; i < N; ++i)
++        if (!parsePortalRoiHexWord(fields[i + 1u], output[i]))
++            return false;
++    return true;
++}
++
++template <std::size_t N>
++bool portalRoiBitsFinite(const std::array<std::uint32_t, N>& bits)
++{
++    for (const std::uint32_t word : bits)
++    {
++        float value = 0.0f;
++        std::memcpy(&value, &word, sizeof(value));
++        if (!std::isfinite(value))
++            return false;
++    }
++    return true;
++}
++
++bool readFixedPortalRoiFixture(const std::filesystem::path& path,
++    FixedPortalRoiFixture& fixture, std::string& error)
++{
++    std::ifstream input(path, std::ios::binary);
++    if (!input)
++    {
++        error = "fixed-ID portal fixture is unavailable";
++        return false;
++    }
++    std::string row;
++    if (!std::getline(input, row) || row != "schema,main-flora-portal-upper-bound-fixed-id/v1")
++    {
++        error = "fixed-ID portal fixture schema is invalid";
++        return false;
++    }
++    if (!std::getline(input, row) || row != "visual_id_count,4086")
++    {
++        error = "fixed-ID portal fixture must contain exactly 4086 IDs";
++        return false;
++    }
++    if (!std::getline(input, row) ||
++        !parsePortalRoiBitsRow(splitPortalRoiCsvRow(row), "view_bits", fixture.viewBits) ||
++        !std::getline(input, row) ||
++        !parsePortalRoiBitsRow(splitPortalRoiCsvRow(row), "projection_bits", fixture.projectionBits) ||
++        !std::getline(input, row) ||
++        !parsePortalRoiBitsRow(splitPortalRoiCsvRow(row), "eye_bits", fixture.eyeBits) ||
++        !std::getline(input, row) || row != "visual_id,material")
++    {
++        error = "fixed-ID portal fixture camera header is malformed";
++        return false;
++    }
++    if (!portalRoiBitsFinite(fixture.viewBits) || !portalRoiBitsFinite(fixture.projectionBits) ||
++        !portalRoiBitsFinite(fixture.eyeBits))
++    {
++        error = "fixed-ID portal fixture camera contains non-finite float bits";
++        return false;
++    }
++    while (std::getline(input, row))
++    {
++        const std::vector<std::string> fields = splitPortalRoiCsvRow(row);
++        std::uint32_t visualId = 0u;
++        const bool leaf = fields.size() == 2u && fields[1] == "leaf";
++        const bool trunk = fields.size() == 2u && fields[1] == "trunk";
++        if (fields.size() != 2u || (!leaf && !trunk) ||
++            !parsePortalRoiId(fields[0], visualId) ||
++            !fixture.visualMaterials.emplace(visualId, leaf).second)
++        {
++            error = "fixed-ID portal fixture contains an invalid material, ID, or duplicate";
++            return false;
++        }
++    }
++    if (!input.eof() || fixture.visualMaterials.size() != kFixedPortalRoiVisualCount)
++    {
++        error = "fixed-ID portal fixture read failed or its ID count changed";
++        return false;
++    }
++    return true;
++}
++
++template <std::size_t N>
++bool portalRoiFloatsMatch(const std::array<float, N>& values,
++    const std::array<std::uint32_t, N>& bits)
++{
++    for (std::size_t i = 0; i < N; ++i)
++    {
++        std::uint32_t actual = 0u;
++        std::memcpy(&actual, &values[i], sizeof(actual));
++        if (actual != bits[i])
++            return false;
++    }
++    return true;
++}
++
++bool fixedPortalRoiCameraMatches(const FixedPortalRoiFixture& fixture,
++    const R4FloraViewState& view)
++{
++    return view.valid && portalRoiFloatsMatch(view.view, fixture.viewBits) &&
++        portalRoiFloatsMatch(view.projection, fixture.projectionBits) &&
++        portalRoiFloatsMatch(view.eye, fixture.eyeBits);
+ }
+ 
+ bool hasElement(const xray::metal::R4VertexBufferSummary& buffer,
+@@ -456,6 +623,10 @@
+     };
+     std::shared_ptr<IR4GraphicsPipeline> leafPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> trunkPipeline;
++    FixedPortalRoiFixture portalRoiFixture;
++    bool portalRoiCandidate = false;
++    bool portalRoiActivationReported = false;
++    bool portalRoiFailOpenReported = false;
+     std::shared_ptr<IR4GraphicsPipeline> leafShadowPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaShadowPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> trunkShadowPipeline;
+@@ -838,6 +1009,45 @@
+         m_impl->draws.emplace_back(std::move(draw));
+         ++m_telemetry.admittedVisuals;
+     }
++    const char* portalRoiOptIn = std::getenv("XRAY_METAL_FLORA_PORTAL_ROI");
++    if (portalRoiOptIn && std::strcmp(portalRoiOptIn, "1") == 0)
++    {
++        const char* portalRoiIdFile = std::getenv("XRAY_METAL_FLORA_PORTAL_ID_FILE");
++        std::string portalRoiError;
++        FixedPortalRoiFixture fixture;
++        if (!portalRoiIdFile || !*portalRoiIdFile ||
++            !std::filesystem::path(portalRoiIdFile).is_absolute())
++            portalRoiError = "fixed-ID portal fixture path is missing or not absolute";
++        else if (!readFixedPortalRoiFixture(
++                std::filesystem::path(portalRoiIdFile), fixture, portalRoiError))
++            ;
++        else
++        {
++            std::unordered_set<std::uint32_t> matchedIds;
++            for (const Impl::Draw& draw : m_impl->draws)
++            {
++                const auto expected = fixture.visualMaterials.find(draw.visualId);
++                if (expected == fixture.visualMaterials.end())
++                    continue;
++                const bool isLeaf = draw.material == Impl::Material::LeafBump;
++                if (expected->second != isLeaf || !matchedIds.emplace(draw.visualId).second)
++                {
++                    portalRoiError = "fixed-ID portal fixture material or admitted inventory is ambiguous";
++                    break;
++                }
++            }
++            if (portalRoiError.empty() && matchedIds.size() != fixture.visualMaterials.size())
++                portalRoiError = "fixed-ID portal fixture contains a visual absent from admitted Flora inventory";
++            if (portalRoiError.empty())
++            {
++                m_impl->portalRoiFixture = std::move(fixture);
++                m_impl->portalRoiCandidate = true;
++            }
++        }
++        if (!m_impl->portalRoiCandidate)
++            std::fprintf(stderr, "METAL_FLORA_PORTAL_ROI enabled=0 fail_open=keep_all reason=\"%s\"\n",
++                portalRoiError.c_str());
++    }
+     for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+     {
+         const auto& d = m_impl->draws[i];
+@@ -905,15 +1115,41 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    const bool portalRoiFrameActive = m_impl->portalRoiCandidate && view.windValid &&
++        fixedPortalRoiCameraMatches(m_impl->portalRoiFixture, view);
++    std::size_t portalRoiSkipped = 0u;
++    std::size_t portalRoiKept = 0u;
++    std::size_t portalRoiClipRejected = 0u;
++    if (m_impl->portalRoiCandidate && !portalRoiFrameActive &&
++        !m_impl->portalRoiFailOpenReported)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_PORTAL_ROI enabled=0 fail_open=keep_all reason=\"camera_or_wind_state_mismatch\"\n");
++        m_impl->portalRoiFailOpenReported = true;
++    }
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+         const Matrix4 wv = multiply(viewMatrix, draw.model);
++        const auto portalRoiId = m_impl->portalRoiCandidate ?
++            m_impl->portalRoiFixture.visualMaterials.find(draw.visualId) :
++            m_impl->portalRoiFixture.visualMaterials.end();
++        const bool fixedPortalRoiId = portalRoiFrameActive &&
++            portalRoiId != m_impl->portalRoiFixture.visualMaterials.end();
+         if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
+         {
+             ++m_telemetry.culledVisuals;
++            if (fixedPortalRoiId)
++                ++portalRoiClipRejected;
+             continue;
+         }
++        if (fixedPortalRoiId)
++        {
++            ++portalRoiSkipped;
++            continue;
++        }
++        if (portalRoiFrameActive)
++            ++portalRoiKept;
+         std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+         auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+         auto& fragmentGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleFragmentGlobals : localFragment;
+@@ -1045,6 +1281,14 @@
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
++    }
++    if (portalRoiFrameActive && !m_impl->portalRoiActivationReported)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_PORTAL_ROI enabled=1 skipped=%zu kept=%zu already_clip_rejected=%zu configured=%zu scope=fixed-frame-main-gbuffer-potential-upper-bound wind_temporal_qualification=0\n",
++            portalRoiSkipped, portalRoiKept, portalRoiClipRejected,
++            m_impl->portalRoiFixture.visualMaterials.size());
++        m_impl->portalRoiActivationReported = true;
+     }
+     return true;
+ }

@@ -1,0 +1,29 @@
+--- prestate/R4ActiveOcclusionCatalogSelection.cpp	2026-09-29 19:36:48
++++ draft/R4ActiveOcclusionCatalogSelection.cpp	2026-09-29 19:37:34
+@@ -159,6 +159,26 @@
+         r.opaque && r.writesDepth && r.stencilPassGuaranteed;
+ }
+ } // namespace
++
++std::size_t NormalizeReciprocalMateHints(SourceTriangle* triangles,
++    const std::size_t triangleCount)
++{
++    if (!triangles)
++        return 0u;
++    std::size_t cleared = 0u;
++    for (std::size_t i = 0u; i < triangleCount; ++i)
++    {
++        const std::uint32_t mate = triangles[i].mateTriangleId;
++        if (mate == kNoMateTriangle)
++            continue;
++        if (mate >= triangleCount || mate == i || triangles[mate].mateTriangleId != i)
++        {
++            triangles[i].mateTriangleId = kNoMateTriangle;
++            ++cleared;
++        }
++    }
++    return cleared;
++}
+ 
+ Catalog::BuildResult Catalog::Build(std::vector<VisualRange>&& ranges,
+     std::vector<SourceTriangle>&& triangles, const std::size_t byteBudget)

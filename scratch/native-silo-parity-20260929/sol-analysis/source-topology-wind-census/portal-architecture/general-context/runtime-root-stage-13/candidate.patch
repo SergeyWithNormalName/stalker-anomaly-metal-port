@@ -1,0 +1,303 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -4936,6 +4936,7 @@
+     float pdaDisplayFactor,
+     NightVisionScene* nightVision,
+     const MetalR4EngineScene::ViewState& view,
++    const xray::metal::R4PortalMainPassContext* portalMainPassContext,
+     const R4EnvironmentSnapshot& environment,
+     const R4GameplayVisionSnapshot& vision,
+     const std::shared_ptr<const MetalR4EngineScene::GBufferWorldDrawCallback>& worldDraw,
+@@ -5145,9 +5146,40 @@
+     LevelScene::ActiveOcclusionObservation* activeOcclusionObservation = nullptr;
+     if (scene.activeOcclusionEnabled && activeOcclusionFrameInWindow(view.engineFrame))
+         activeOcclusionObservation = currentActiveOcclusionObservation(scene, view.engineFrame);
++    const xray::metal::R4PortalMainPassContext* qualifiedPortalContext = nullptr;
++    if (portalMainPassContext && portalMainPassContext->requested &&
++        portalMainPassContext->cache && portalMainPassContext->input && portalMainPassContext->output)
++    {
++        const auto& cache = *portalMainPassContext->cache;
++        const auto& input = *portalMainPassContext->input;
++        const auto& output = *portalMainPassContext->output;
++        std::uint32_t width = 0u, height = 0u;
++        if (scene.depthTarget)
++        {
++            const R4Texture2DDesc& target = scene.depthTarget->Descriptor();
++            width = target.width;
++            height = target.height;
++        }
++        const bool ownersMatch = scene.geometry.portalMetadata.available &&
++            cache.graph.portalMetadata.available &&
++            scene.geometry.portalMetadata.visualOwnerSectors ==
++                cache.graph.portalMetadata.visualOwnerSectors;
++        const bool contextFresh = view.valid && scene.automaticLmhFrustumCulling &&
++            scene.liveViewProjectionValid && portalMainPassContext->sourceOrderFullTransformMatches &&
++            cache.qualified && cache.generation != 0u && input.generation == cache.generation &&
++            output.generation == cache.generation && input.frameID == view.engineFrame &&
++            output.frameID == view.engineFrame && output.valid && output.graph.valid &&
++            output.graph.rawVisualVisible.size() == cache.graph.portalMetadata.visualOwnerSectors.size() &&
++            std::memcmp(input.currentView.data(), view.view.data(), sizeof(float) * 16u) == 0 &&
++            std::memcmp(input.currentProjection.data(), view.projection.data(), sizeof(float) * 16u) == 0 &&
++            std::memcmp(&input.currentEye, view.eye.data(), sizeof(float) * 3u) == 0 &&
++            width != 0u && height != 0u && input.width == width && input.height == height && ownersMatch;
++        if (contextFresh)
++            qualifiedPortalContext = portalMainPassContext;
++    }
+     if (!backend.BeginRenderPass(gBufferPass, error) ||
+         !backend.SetStencilReference(1, error) ||
+-        !drawLevelScene(backend, scene, error, activeOcclusionObservation))
++        !drawLevelScene(backend, scene, error, activeOcclusionObservation, qualifiedPortalContext))
+         return false;
+     if (defVertex)
+     {
+@@ -6884,6 +6916,8 @@
+     bool portalObserverEnabled = false;
+     bool portalPerFrameEnabled = false;
+     bool portalPerFrameSuppress = false;
++    bool lmhPortalPerFrameEnabled = false;
++    bool lmhPortalPerFrameSuppress = false;
+     bool portalPerFrameReady = false;
+     bool portalCachePopulation = false;
+     std::uint64_t portalPopulationGeneration = 0u;
+@@ -7306,6 +7340,10 @@
+     impl->portalPerFrameEnabled = portalPerFrame &&
+         (std::strcmp(portalPerFrame, "observe") == 0 || std::strcmp(portalPerFrame, "on") == 0);
+     impl->portalPerFrameSuppress = portalPerFrame && std::strcmp(portalPerFrame, "on") == 0;
++    const char* lmhPortalPerFrame = std::getenv("XRAY_METAL_LMH_PORTAL_PERFRAME");
++    impl->lmhPortalPerFrameEnabled = lmhPortalPerFrame &&
++        (std::strcmp(lmhPortalPerFrame, "observe") == 0 || std::strcmp(lmhPortalPerFrame, "on") == 0);
++    impl->lmhPortalPerFrameSuppress = lmhPortalPerFrame && std::strcmp(lmhPortalPerFrame, "on") == 0;
+     const char* cachePopulation = std::getenv("XRAY_METAL_FLORA_PORTAL_CACHE_POPULATION");
+     impl->portalCachePopulation = cachePopulation && std::strcmp(cachePopulation, "1") == 0;
+     if (impl->portalPerFrameEnabled)
+@@ -8470,6 +8508,18 @@
+         std::fprintf(stderr, "METAL_EMISSIVE_FACTOR_REJECT frame=%u owner=%u\n",
+             view.engineFrame, impl->emissiveFactorFrame);
+     impl->scene.luminanceBloomThreshold = impl->luminanceThresholdFrame == view.engineFrame ? impl->luminanceThreshold : 0.0f;
++    xray::metal::R4PortalMainPassContext lmhPortalContext;
++    if (impl->lmhPortalPerFrameEnabled && impl->portalPerFrameEnabled)
++    {
++        lmhPortalContext.cache = &impl->portalCache;
++        lmhPortalContext.input = &impl->portalPerFrameInput;
++        lmhPortalContext.output = &impl->portalPerFrameOutput;
++        lmhPortalContext.frameID = view.engineFrame;
++        lmhPortalContext.requested = true;
++        lmhPortalContext.suppress = impl->lmhPortalPerFrameSuppress;
++        lmhPortalContext.sourceOrderFullTransformMatches =
++            portalFullTransformMatchesSourceOrder(impl->portalPerFrameInput);
++    }
+     const bool rendered = renderProductionScene(backend, impl->scene, impl->terrain, impl->sky,
+         impl->defVertex.get(), impl->defObjectsLod.get(), impl->staticForward.get(), impl->ssfxAo.get(),
+         impl->ssfxAoTelemetryFrame,
+@@ -8490,7 +8540,7 @@
+         impl->scope.get(),
+         impl->particles.get(), impl->bloom.get(), impl->emissiveTarget,
+         impl->emissiveFactorFrame == view.engineFrame ? impl->emissiveFactor : 0.0f,
+-        &impl->nightVision, view, environment, vision,
++        &impl->nightVision, view, &lmhPortalContext, environment, vision,
+         worldDraw, portalOraclePrepare, portalOracleDraw, impl->fogScattering.get(), error);
+     if (rendered && impl->hud && impl->hud->IsReady())
+     {
+--- a/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
++++ b/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
+@@ -80,6 +80,20 @@
+     R4PortalGraphResult graph; // owns all reached CFrustum values
+ };
+ 
++// Borrowed only for the synchronous main LMH draw.  Callers construct this
++// after matching the observer result to the current primary ViewState; null or
++// unqualified contexts mean draw every admitted visual.
++struct R4PortalMainPassContext
++{
++    const R4PortalGenerationCache* cache = nullptr;
++    const R4PortalContextFrameInput* input = nullptr;
++    const R4PortalContextFrameOutput* output = nullptr;
++    u32 frameID = u32(-1);
++    bool requested = false;
++    bool suppress = false;
++    bool sourceOrderFullTransformMatches = false;
++};
++
+ // Reuses actual CFrustum/ClipPoly traversal math with the generation's already
+ // qualified CPortal planes/spheres; it does not call CPortal::Setup.
+ bool ObserveR4PreparedPortalGraph(const R4PreparedPortalGraph& prepared,
+--- a/src/Layers/xrRenderMetal/MetalBootstrap.mm
++++ b/src/Layers/xrRenderMetal/MetalBootstrap.mm
+@@ -8,6 +8,7 @@
+ #include "IR4Resources.h"
+ #include "R4DdsTexture.h"
+ #include "R4LevelGeometry.h"
++#include "R4PortalGenerationContext.h"
+ #include "R4ActiveOcclusionCatalogSelection.h"
+ #include "R4StaticConstantGroups.h"
+ 
+@@ -754,6 +755,102 @@
+     bool pendingUploaded = false;
+ };
+ 
++// LMH portal predicate for the main pass only. Unknown topology, bounds,
++// transforms, owner IDs, or frustum records always keep the draw.
++bool portalOutsideEveryOwnerFrustum(
++    const xray::metal::R4PortalMainPassContext& context,
++    const LevelScene& scene, const xray::metal::R4StaticVisual& visual,
++    const LevelScene::TextureMaterial& binding)
++{
++    if (!context.cache || !context.output || !context.output->valid ||
++        !context.output->graph.valid || !scene.geometry.portalMetadata.available ||
++        visual.visualId >= scene.geometry.portalMetadata.visualOwnerSectors.size() ||
++        visual.visualId >= scene.geometry.visualNodes.size() ||
++        !visual.referencedPositionBounds.available ||
++        !binding.localPositionBounds.available || !finiteMatrix(binding.modelTransform) ||
++        binding.modelTransform.elements[3] != 0.f || binding.modelTransform.elements[7] != 0.f ||
++        binding.modelTransform.elements[11] != 0.f || binding.modelTransform.elements[15] != 1.f)
++        return false;
++
++    const auto& owners = scene.geometry.portalMetadata.visualOwnerSectors[visual.visualId];
++    const auto& sectors = scene.geometry.portalMetadata.sectors;
++    const auto& reached = context.output->graph.reached;
++    if (owners.empty() || reached.size() != sectors.size())
++        return false;
++    const auto& local = visual.referencedPositionBounds;
++    for (unsigned axis = 0; axis != 3; ++axis)
++        if (!std::isfinite(local.minimum[axis]) || !std::isfinite(local.maximum[axis]) ||
++            local.minimum[axis] > local.maximum[axis] ||
++            local.minimum[axis] != binding.localPositionBounds.minimum[axis] ||
++            local.maximum[axis] != binding.localPositionBounds.maximum[axis])
++            return false;
++
++    float worldBox[6] = {
++        std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(),
++        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
++        -std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()};
++    for (const float x : {local.minimum[0], local.maximum[0]})
++        for (const float y : {local.minimum[1], local.maximum[1]})
++            for (const float z : {local.minimum[2], local.maximum[2]})
++            {
++                const Vec3 world = transformPoint(binding.modelTransform, {x, y, z});
++                if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z))
++                    return false;
++                worldBox[0] = std::min(worldBox[0], world.x);
++                worldBox[1] = std::min(worldBox[1], world.y);
++                worldBox[2] = std::min(worldBox[2], world.z);
++                worldBox[3] = std::max(worldBox[3], world.x);
++                worldBox[4] = std::max(worldBox[4], world.y);
++                worldBox[5] = std::max(worldBox[5], world.z);
++            }
++    const float boxMargin = std::max(1.0e-3f,
++        std::max(worldBox[3] - worldBox[0],
++            std::max(worldBox[4] - worldBox[1], worldBox[5] - worldBox[2])) * 1.0e-5f);
++    for (unsigned axis = 0; axis != 3; ++axis)
++    {
++        worldBox[axis] -= boxMargin;
++        worldBox[axis + 3u] += boxMargin;
++        if (!std::isfinite(worldBox[axis]) || !std::isfinite(worldBox[axis + 3u]))
++            return false;
++    }
++    Fvector center;
++    center.set((worldBox[0] + worldBox[3]) * 0.5f,
++        (worldBox[1] + worldBox[4]) * 0.5f, (worldBox[2] + worldBox[5]) * 0.5f);
++    const float dx = worldBox[3] - center.x;
++    const float dy = worldBox[4] - center.y;
++    const float dz = worldBox[5] - center.z;
++    float radius = std::sqrt(dx * dx + dy * dy + dz * dz);
++    if (!std::isfinite(radius))
++        return false;
++    radius += std::max(1.0e-3f, radius * 1.0e-5f);
++
++    for (const std::uint32_t owner : owners)
++    {
++        if (owner >= sectors.size() || owner >= reached.size() ||
++            sectors[owner].sectorId != owner || reached[owner].sectorId != owner)
++            return false;
++        for (const CFrustum& frustum : reached[owner].values)
++        {
++            std::uint32_t mask = frustum.getMask();
++            if (frustum.testSAABB(center, radius, worldBox, mask) != fcvNone)
++                return false;
++        }
++    }
++    return true;
++}
++
++bool isPortalLmhVisual(const LevelScene& scene,
++    const xray::metal::R4StaticVisual& visual,
++    const LevelScene::TextureMaterial& binding)
++{
++    if (binding.visualId != visual.visualId || binding.shaderId != visual.shaderId ||
++        visual.shaderId >= scene.geometry.shaders.size())
++        return false;
++    const auto& textures = scene.geometry.shaders[visual.shaderId].textures;
++    return textures.size() >= 3u && textures[2].rfind("lmap#", 0u) == 0u;
++}
++
++
+ bool readTextFile(const std::filesystem::path& path, std::string& text)
+ {
+     std::ifstream stream(path, std::ios::binary);
+@@ -4179,7 +4276,8 @@
+ }
+ 
+ bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error,
+-    LevelScene::ActiveOcclusionObservation* const activeOcclusionObservation = nullptr)
++    LevelScene::ActiveOcclusionObservation* const activeOcclusionObservation = nullptr,
++    const xray::metal::R4PortalMainPassContext* const portalContext = nullptr)
+ {
+     if (scene.textureMaterials.empty() &&
+         !backend.BindVertexBuffer(1, scene.uniforms, 0, error))
+@@ -4196,6 +4294,10 @@
+     std::size_t automaticLmhCulled = 0;
+     std::size_t automaticLmhArefSubmitted = 0;
+     std::size_t automaticLmhArefCulled = 0;
++    std::size_t portalLmhEligible = 0;
++    std::size_t portalLmhCameraSurvivors = 0;
++    std::size_t portalLmhWouldSkip = 0;
++    std::size_t portalLmhActualSkipped = 0;
+     for (const xray::metal::R4StaticVisual& visual : scene.geometry.visuals)
+     {
+         if (!visual.valid || !visual.referencedPositionBounds.available ||
+@@ -4222,6 +4324,10 @@
+                     return false;
+                 }
+             }
++            const bool portalLmhCandidate = portalContext && portalContext->requested &&
++                isPortalLmhVisual(scene, visual, binding);
++            if (portalLmhCandidate)
++                ++portalLmhEligible;
+             if (scene.automaticLmhFrustumCulling && conservativelyOutsideMetalFrustum(
+                     binding.localPositionBounds, binding.modelTransform,
+                     scene.uniformData.viewProjection, scene.liveViewProjectionValid))
+@@ -4230,6 +4336,19 @@
+                 if (alphaTested)
+                     ++automaticLmhArefCulled;
+                 continue;
++            }
++            if (portalLmhCandidate)
++            {
++                ++portalLmhCameraSurvivors;
++                if (portalOutsideEveryOwnerFrustum(*portalContext, scene, visual, binding))
++                {
++                    ++portalLmhWouldSkip;
++                    if (portalContext->suppress)
++                    {
++                        ++portalLmhActualSkipped;
++                        continue;
++                    }
++                }
+             }
+             if (activeOcclusionObservation && !activeOcclusionObservation->failed &&
+                 binding.shaderName == "default" && binding.visualType != 7u &&
+@@ -4424,6 +4543,14 @@
+                 scene.automaticLmhGameplayFrustumReported = true;
+         }
+     }
++    if (portalContext && portalContext->requested &&
++        (portalContext->frameID == 0u || portalContext->frameID % 120u == 0u))
++        std::fprintf(stderr,
++            "METAL_LMH_PORTAL frame=%u mode=%s eligible=%zu camera_survivors=%zu "
++            "would_skip=%zu actual_skipped=%zu source_order=preserved fail_open=unknown_kept\n",
++            portalContext->frameID, portalContext->suppress ? "on" : "observe",
++            portalLmhEligible, portalLmhCameraSurvivors, portalLmhWouldSkip,
++            portalLmhActualSkipped);
+     return true;
+ }
+ 

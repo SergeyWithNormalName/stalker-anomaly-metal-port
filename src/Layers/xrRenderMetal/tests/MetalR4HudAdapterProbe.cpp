@@ -19,3 +19,6 @@ int main(int argc, char** argv)
     }
     return 0;
 }
+
+// Standalone adapter probes have no Lua VM; Core diagnostics may ask for its stack.
+void printLuaStack() {}

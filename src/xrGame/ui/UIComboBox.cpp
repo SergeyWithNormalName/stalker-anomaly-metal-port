@@ -1,4 +1,5 @@
 #include "StdAfx.h"
+#include <dinput.h>
 #include "UIComboBox.h"
 #include "UITextureMaster.h"
 #include "UIScrollBar.h"
@@ -300,6 +301,83 @@ bool CUIComboBox::OnMouseAction(float x, float y, EUIMessages mouse_action)
 	return false;
 }
 
+bool CUIComboBox::OnKeyboardAction(int dik, EUIMessages keyboard_action)
+{
+	if (keyboard_action == WINDOW_KEY_PRESSED && IsShown() &&
+		(CursorOverWindow() || m_eState == LIST_EXPANDED))
+	{
+		if (m_eState == LIST_EXPANDED)
+		{
+			if (dik == DIK_UP)
+			{
+				u32 cur = m_list_box.GetSelectedIDX();
+				u32 total = m_list_box.GetSize();
+				if (total > 0)
+				{
+					if (cur == u32(-1) || cur == 0)
+						m_list_box.SetSelectedIDX(total - 1);
+					else
+						m_list_box.SetSelectedIDX(cur - 1);
+				}
+				return true;
+			}
+			else if (dik == DIK_DOWN)
+			{
+				u32 cur = m_list_box.GetSelectedIDX();
+				u32 total = m_list_box.GetSize();
+				if (total > 0)
+				{
+					if (cur == u32(-1) || cur + 1 >= total)
+						m_list_box.SetSelectedIDX(0);
+					else
+						m_list_box.SetSelectedIDX(cur + 1);
+				}
+				return true;
+			}
+			else if (dik == DIK_RETURN || dik == (0xed + 100) /* MOUSE_1 */)
+			{
+				OnListItemSelect();
+				return true;
+			}
+			else if (dik == DIK_ESCAPE)
+			{
+				ShowList(false);
+				return true;
+			}
+		}
+		else
+		{
+			if (dik == DIK_RETURN || dik == (0xed + 100) /* MOUSE_1 */)
+			{
+				OnBtnClicked();
+				return true;
+			}
+			else if (dik == DIK_LEFT)
+			{
+				u32 cur = m_list_box.GetSelectedIDX();
+				if (cur != u32(-1) && cur > 0)
+				{
+					SetItemIDX(cur - 1);
+					GetMessageTarget()->SendMessage(this, LIST_ITEM_SELECT, NULL);
+				}
+				return true;
+			}
+			else if (dik == DIK_RIGHT)
+			{
+				u32 cur = m_list_box.GetSelectedIDX();
+				if (cur != u32(-1) && cur + 1 < m_list_box.GetSize())
+				{
+					SetItemIDX(cur + 1);
+					GetMessageTarget()->SendMessage(this, LIST_ITEM_SELECT, NULL);
+				}
+				return true;
+			}
+		}
+	}
+
+	return CUIWindow::OnKeyboardAction(dik, keyboard_action);
+}
+
 void CUIComboBox::SendMessage(CUIWindow* pWnd, s16 msg, void* pData)
 {
 	CUIWindow::SendMessage(pWnd, msg, pData);
@@ -349,4 +427,39 @@ void CUIComboBox::SetSelectedIDX(u32 idx)
 u32 CUIComboBox::GetSelectedIDX()
 {
 	return m_list_box.GetSelectedIDX();
+}
+
+bool CUIComboBox::GetSelectedItemRect(Frect& rect)
+{
+	if (m_eState != LIST_EXPANDED || !m_list_frame.IsShown())
+		return false;
+
+	CUIListBoxItem* item = m_list_box.GetSelectedItem();
+	if (!item || !item->IsShown())
+		return false;
+
+	Frect viewport;
+	Frect item_rect;
+	m_list_box.GetAbsoluteRect(viewport);
+	item->GetAbsoluteRect(item_rect);
+
+	// Keyboard selection can advance beyond the current scroll window. Bring
+	// the selected row fully into the list viewport before exposing its rect to
+	// the gamepad focus overlay.
+	int scroll_pos = m_list_box.GetCurrentScrollPos();
+	if (item_rect.y1 < viewport.y1)
+		scroll_pos += iFloor(item_rect.y1 - viewport.y1);
+	else if (item_rect.y2 > viewport.y2)
+		scroll_pos += iCeil(item_rect.y2 - viewport.y2);
+	if (scroll_pos != m_list_box.GetCurrentScrollPos())
+	{
+		m_list_box.SetScrollPos(scroll_pos);
+		item->GetAbsoluteRect(item_rect);
+	}
+
+	// Keep the focus outline inside the same scissor region as the list rows.
+	// This also handles a list viewport shorter than one item.
+	rect.set(_max(item_rect.x1, viewport.x1), _max(item_rect.y1, viewport.y1),
+		_min(item_rect.x2, viewport.x2), _min(item_rect.y2, viewport.y2));
+	return rect.x1 < rect.x2 && rect.y1 < rect.y2;
 }

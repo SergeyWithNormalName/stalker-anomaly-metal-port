@@ -22,7 +22,11 @@
 #include "MetalR4RainAdapter.h"
 #include "MetalR4StaticForwardAdapter.h"
 #include "MetalR4SsfxAoAdapter.h"
+#include "MetalR4FogScatteringAdapter.h"
+#include "MetalR4VolumetricAdapter.h"
+#include "MetalR4BloomAdapter.h"
 #include "MetalR4WaterAdapter.h"
+#include "MetalR4SsrAdapter.h"
 #include "../xrRender/MetalLensFlareCapture.h"
 
 // A deliberately narrow bridge between the engine device lifecycle and the
@@ -106,10 +110,19 @@ public:
         // Exact SSFX AO temporal/bilateral family. It is intentionally
         // separate from water and IL, with an explicit receipted bundle.
         MetalR4SsfxAoAdapter::Options ssfxAo;
+        // Exact R4 SSFX fog-scattering quarter/half blur and full-resolution
+        // composite. Empty keeps this source-present feature disabled.
+        MetalR4FogScatteringAdapter::Options fogScattering;
+        MetalR4VolumetricAdapter::Options volumetric;
+        MetalR4BloomAdapter::Options bloom;
         // Full SSFX water graph. It is deliberately separate from
         // staticForward: its SSR/blur/wave dependencies own intermediate
         // targets and must not be encoded as an ordinary alpha draw.
         MetalR4WaterAdapter::Options water;
+        // General SSFX SSR runs from the combined scene color into a distinct
+        // snapshot before dedicated water. Its blue-noise DDS is shared with
+        // other screen-space effects even when the R4 SSR shader is absent.
+        MetalR4SsrAdapter::Options ssfxSsr;
         // Strict opt-in: only XRAY_METAL_MSC_DETAIL_DIR enables this path.
         MetalR4DetailGrassAdapter::Options detailGrass;
         // Non-MSAA point/spot volume accumulation. Empty disables it.
@@ -124,6 +137,9 @@ public:
         std::array<float, 16> previousView{};
         std::array<float, 16> previousProjection{};
         std::array<float, 3> eye{};
+        std::uint32_t engineFrame = 0;
+        std::uint32_t previousFrame = 0;
+        bool cameraCut = false;
         bool valid = false;
         bool previousValid = false;
     };
@@ -195,6 +211,9 @@ public:
     void SubmitParticleFrame(xray::metal::particles::FrameBatch frame);
     void SubmitRainFrame(xray::metal::rain::FrameBatch frame);
     void SubmitLensFlareFrame(xray::metal::lensflare::Frame frame);
+    // Exact live PDA binder value, owned by the same engine frame as geometry.
+    void SubmitEmissiveFactor(std::uint32_t engineFrame, float factor);
+    void SubmitLuminanceBloomThreshold(std::uint32_t engineFrame, float threshold);
 
     // Encodes the shadow, G-buffer, converted sun, combine and presentation
     // passes into the active backend frame.  It intentionally does not acquire
@@ -205,6 +224,10 @@ public:
         const R4EnvironmentSnapshot& environment,
         const R4GameplayVisionSnapshot& vision,
         std::string& error);
+    // Called only after the backend accepted this scene frame for submission.
+    void OnFrameSubmitted();
+    void DiscardUnsubmittedFrame();
+    void InvalidateHistory();
 
     bool IsPrepared() const;
     std::uint64_t DrawableVisualCount() const;

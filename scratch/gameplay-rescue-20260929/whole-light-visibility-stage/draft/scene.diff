@@ -1,0 +1,186 @@
+--- scratch/gameplay-rescue-20260929/whole-light-visibility-stage/prestate/scene/MetalR4EngineScene.mm	2026-09-29 13:31:27
++++ scratch/gameplay-rescue-20260929/whole-light-visibility-stage/draft/scene/MetalR4EngineScene.mm	2026-09-29 14:06:13
+@@ -1,6 +1,7 @@
+ #include "MetalR4EngineScene.h"
+ 
+ #include "IR4Backend.h"
++#include "R4WholeLightVisibilitySelection.h"
+ #include "MetalR4EngineFs.h"
+ #include "MetalR4LightHomDiagnostic.h"
+ #include "MetalR4FogScatteringAdapter.h"
+@@ -28,6 +29,7 @@
+ #include <iomanip>
+ #include <limits>
+ #include <mutex>
++#include <new>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -380,8 +382,32 @@
+         return false;
+     result = static_cast<std::uint32_t>(parsed);
+     return true;
++}
++
++bool wholeLightVisibilityEnabled()
++{
++    static const bool enabled = [] {
++        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
+ }
+ 
++std::uint32_t wholeLightVisibilityFirstFrame()
++{
++    static const std::uint32_t firstFrame = [] {
++        std::uint32_t parsedFrame = 300u;
++        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY_START_FRAME");
++        if (value && *value && !parseUnsigned(value, parsedFrame))
++        {
++            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=disabled reason=invalid_start_frame\n");
++            return UINT32_MAX;
++        }
++        return parsedFrame;
++    }();
++    return firstFrame;
++}
++
+ bool parseControlledMaterials(
+     const char* value,
+     std::vector<xray::metal::R4ControlledMaterial>& materials,
+@@ -2778,6 +2804,7 @@
+     MetalR4FloraAdapter* flora, const R4FloraViewState& floraView,
+     MetalR4DetailGrassAdapter* detail, const R4DetailGrassViewState& detailView,
+     const R4EnvironmentSnapshot& environment,
++    const std::vector<R4WholeLightVisibilitySample>* visibilitySamples,
+     const R4LightHomDiagnosticFrame* homDiagnostic,
+     std::string& error)
+ {
+@@ -3112,6 +3139,24 @@
+                 homPrepMs[tile],ms,materialEntries[tile].size(),shadows.mergedEncodedDraws-homStaticBefore,
+                 shadows.submittedDynamicCasters-homDynamicBefore,materialEntries[tile].size()*256u);
+         }
++        if (visibilitySamples && indices[tile] < snapshot->lights.size())
++        {
++            const auto& visibilityLight = snapshot->lights[indices[tile]];
++            const auto selected = std::find_if(visibilitySamples->begin(), visibilitySamples->end(),
++                [&](const auto& sample) {
++                    return sample.engineFrame == view.engineFrame && sample.batchId == static_cast<std::int32_t>(batchId) &&
++                        sample.lightId == visibilityLight.lightId && sample.parentLightId == visibilityLight.parentLightId &&
++                        sample.face == (visibilityLight.type == R4EngineLocalLightType::OmniFace ? visibilityLight.omniFace : 0u);
++                });
++            if (selected != visibilitySamples->end())
++                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_TILE frame=%u batch=%u light=%llu parent=%llu face=%u kind=%u static_rows=%zu static_encoded_draws=%zu dynamic_submitted_draws=%zu static_transform_bytes=%zu\n",
++                    view.engineFrame, batchId, (unsigned long long)visibilityLight.lightId,
++                    (unsigned long long)visibilityLight.parentLightId, selected->face,
++                    static_cast<unsigned>(selected->groupKind), materialEntries[tile].size(),
++                    shadows.mergedEncodedDraws - homStaticBefore,
++                    shadows.submittedDynamicCasters - homDynamicBefore,
++                    materialEntries[tile].size() * 256u);
++        }
+     }
+     if (std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR"))
+         for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
+@@ -4515,6 +4560,31 @@
+         const bool e08PlanTiming = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120u == 0u;
+         const auto e08PlanStart = e08PlanTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         if (!planLocalShadowBatches(view,snapshot,environment,batches,unshadowed,error)) return false;
++        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
++        xray::metal::R4WholeLightVisibilitySelectionStats visibilityStats;
++        const bool visibilityOptIn = wholeLightVisibilityEnabled();
++        const std::uint32_t visibilityFirstFrame = visibilityOptIn ?
++            wholeLightVisibilityFirstFrame() : UINT32_MAX;
++        const char* visibilityFailureReason = nullptr;
++        std::string visibilitySelectionError;
++        if (visibilityOptIn && snapshot)
++        {
++            try
++            {
++                if (visibilityFirstFrame != UINT32_MAX)
++                    xray::metal::SelectR4WholeLightVisibilitySamples(*snapshot, environment, batches,
++                        visibilityFirstFrame, view.engineFrame, visibilitySamples, visibilityStats,
++                        visibilitySelectionError);
++            }
++            catch (const std::bad_alloc&)
++            {
++                visibilityFailureReason = "selection-allocation-failed";
++                visibilitySamples.clear();
++                visibilityStats = {};
++            }
++            if (!visibilitySelectionError.empty())
++                visibilityFailureReason = "selection-invalid-input";
++        }
+         if (e08PlanTiming)
+             std::fprintf(stderr, "METAL_E08_LOCAL_PLAN frame=%u cpu_ms=%.6f batches=%zu\n", view.engineFrame,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08PlanStart).count(), batches.size());
+@@ -4522,6 +4592,39 @@
+             view.valid,view.engineFrame,snapshot.get(),environment,batches,unshadowed);
+         localLights->BeginFrame();
+         MetalR4LocalLightAdapter::DrawState drawState;
++        if (!visibilitySamples.empty())
++        {
++            try
++            {
++                drawState.visibilitySamples = visibilitySamples;
++            }
++            catch (const std::bad_alloc&)
++            {
++                visibilityFailureReason = "draw-state-allocation-failed";
++                visibilitySamples.clear();
++                drawState.visibilitySamples.clear();
++                visibilityStats = {};
++            }
++        }
++        if (visibilityFailureReason)
++        {
++            static bool loggedDiagnosticFailure = false;
++            if (!loggedDiagnosticFailure)
++            {
++                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=skipped reason=%s\n",
++                    visibilityFailureReason);
++                loggedDiagnosticFailure = true;
++            }
++        }
++        if (visibilityOptIn && visibilityFirstFrame != UINT32_MAX &&
++            view.engineFrame >= visibilityFirstFrame && view.engineFrame - visibilityFirstFrame < 12u)
++            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_FRAME frame=%u status=%s planned_groups=%zu eligible_groups=%zu selected_groups=%zu selected_records=%zu omitted_quota=%zu incomplete_or_collision=%zu hud_exempt_records=%zu volumetric_exempt_records=%zu invalid_exempt_records=%zu\n",
++                view.engineFrame, visibilityStats.eligibleGroups ? "selected" : "inconclusive_no_eligible_groups",
++                visibilityStats.plannedGroups, visibilityStats.eligibleGroups,
++                visibilityStats.selectedGroups, visibilityStats.selectedRecords,
++                visibilityStats.omittedByQuota, visibilityStats.incompleteOrCollision,
++                visibilityStats.hudExemptRecords, visibilityStats.volumetricExemptRecords,
++                visibilityStats.invalidExemptRecords);
+         if (localShadows)
+         {
+             auto& sh=*localShadows;
+@@ -4533,7 +4636,18 @@
+         const auto accumulate=[&](const std::vector<std::size_t>& indices, std::int64_t batchId) {
+             if (indices.empty()) return true;
+             const auto homAccumStart=homDiagnostic.enabled?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+-            if (!backend.BeginRenderPass(localLightPass,error)) return false;
++            const bool enableCounts = visibilityOptIn && batchId >= 0 &&
++                std::any_of(visibilitySamples.begin(), visibilitySamples.end(), [batchId](const auto& sample) {
++                    return sample.batchId == batchId;
++                });
++            drawState.activeVisibilityBatch = enableCounts ? batchId : -1;
++            if (enableCounts)
++            {
++                R4RenderPassDesc pass = localLightPass;
++                pass.enableVisibilityResultCounts = true;
++                if (!backend.BeginRenderPass(pass,error)) return false;
++            }
++            else if (!backend.BeginRenderPass(localLightPass,error)) return false;
+             const bool drawn=localLights->DrawBatchIntoActiveAccumulator(backend,inputs,localView,snapshot,indices,drawState,error);
+             std::string endError;
+             const bool ended=backend.EndRenderPass(endError);
+@@ -4555,7 +4669,8 @@
+             // overwrite it. The accumulator, depth and stencil all load/store.
+             if (!renderLocalShadowBatch(backend,scene,*localShadows,view,snapshot,batches[batchId],
+                 static_cast<std::uint32_t>(batchId),dynamicWorld,defVertex,defObjectsLod,
+-                flora,floraView,detail,detailView,environment,homDiagnostic.enabled?&homDiagnostic:nullptr,error) ||
++                flora,floraView,detail,detailView,environment,visibilitySamples.empty()?nullptr:&visibilitySamples,
++                homDiagnostic.enabled?&homDiagnostic:nullptr,error) ||
+                 !accumulate(batches[batchId],static_cast<std::int64_t>(batchId))) return false;
+             if (volumeFrame)
+             {

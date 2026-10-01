@@ -42,7 +42,11 @@ public:
         std::shared_ptr<IR4Buffer> staticGlobals;
         std::array<float, 16> view{};
         std::array<float, 16> projection{};
+        std::array<float, 16> previousView{};
+        std::array<float, 16> previousProjection{};
         R4EnvironmentSnapshot environment{};
+        bool cameraCut = false;
+        bool previousValid = false;
     };
 
     MetalR4WaterAdapter();
@@ -58,6 +62,8 @@ public:
     bool PrepareRenderTargets(IR4Backend& backend, std::uint32_t width, std::uint32_t height,
         R4PixelFormat sceneFormat, std::string& error);
     bool Draw(IR4Backend& backend, const FrameInputs& inputs, std::string& error);
+    void DiscardUnsubmittedFrame();
+    void CommitSubmittedFrame();
 
     bool IsReady() const { return m_ready; }
     const std::string& Status() const { return m_status; }

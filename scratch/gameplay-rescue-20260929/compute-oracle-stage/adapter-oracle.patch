@@ -1,0 +1,179 @@
+--- a/src/Layers/xrRenderMetal/MetalR4DynamicWorldAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4DynamicWorldAdapter.cpp
+@@ -1629,10 +1629,14 @@
+     std::unordered_set<std::string> reportedSkinSkips;
+     std::unordered_set<std::string> reportedCpuDrawDiagnostics;
+     bool computeSkinOptIn = false;
++    bool computeSkinOracleOptIn = false;
+     bool computeSkinBackendDisabled = false;
+     bool computeSkinCpuRetry = false;
+     bool computeSkinFallbackLogged = false;
+     bool computeSkinFailureLogged = false;
++    bool computeSkinOracleInconclusiveLogged = false;
++    std::array<std::uint32_t, 5> computeSkinOracleSubmittedSamples{};
++    std::vector<std::uint32_t> computeSkinOraclePendingInfluenceCounts;
+     xray::metal::R4ComputeSkinFrameJournal<IR4Buffer, R4ComputeSkinJob> computeSkinJournal;
+     DynamicShadowFrameIndex shadowFrameIndex;
+     bool shadowIndexEnabled = std::getenv("XRAY_METAL_DYNAMIC_SHADOW_INDEX") != nullptr;
+@@ -1722,6 +1726,8 @@
+     m_impl->options = options;
+     if (const char* computeFlag = std::getenv("XRAY_METAL_COMPUTE_SKIN"))
+         m_impl->computeSkinOptIn = std::strcmp(computeFlag, "1") == 0;
++    if (const char* oracleFlag = std::getenv("XRAY_METAL_COMPUTE_SKIN_ORACLE"))
++        m_impl->computeSkinOracleOptIn = std::strcmp(oracleFlag, "1") == 0;
+     if (const char* censusFlagPath = std::getenv("XRAY_METAL_E03_CENSUS_FLAG_PATH"))
+         m_impl->e03CensusFlagPath = censusFlagPath;
+     if (options.vertexMetallibPath.empty() && options.fragmentMetallibPath.empty())
+@@ -2137,6 +2143,7 @@
+     }
+     IR4Resources& resources = backend.Resources();
+     const std::array<float, 16> viewProjection = multiplyMatrix(view.projection, view.view);
++    std::string computeSkinOracleCandidateKey;
+     for (std::size_t renderableIndex = 0; renderableIndex < world->renderables.size(); ++renderableIndex)
+     {
+         const R4EngineWorldRenderable& renderable = world->renderables[renderableIndex];
+@@ -2469,6 +2476,8 @@
+                         continue;
+                     }
+                     m_impl->computeSkinJournal.Cancel(oldest->first);
++                    if (computeSkinOracleCandidateKey == oldest->first)
++                        computeSkinOracleCandidateKey.clear();
+                     m_impl->instances.erase(oldest);
+                     ++m_telemetry.instanceCachePruned;
+                 }
+@@ -2557,6 +2566,8 @@
+                             if (!instance.skinnedVertices || instance.skinnedVertices->Size() != outputBytes)
+                             {
+                                 m_impl->computeSkinJournal.Cancel(instanceKey);
++                                if (computeSkinOracleCandidateKey == instanceKey)
++                                    computeSkinOracleCandidateKey.clear();
+                                 R4BufferDesc outputDesc{outputBytes, R4ResourceStorage::Private,
+                                     R4BufferUsage::Vertex, "R4 dynamic OGF GPU-skinned SKIN_0 vertices"};
+                                 auto replacement = resources.CreateBuffer(outputDesc, nullptr, 0u, localComputeError);
+@@ -2584,9 +2595,55 @@
+                                 job.influenceCount = cached.computeSkinInfluenceCount;
+                                 job.boneCount = static_cast<std::uint32_t>(renderable.boneTransforms->size());
+                                 job.maxReferencedBoneIndex = cached.maxReferencedBoneIndex;
++                                bool attachedOracleRequest = false;
++                                constexpr std::size_t kOracleMaxExpectedBytes = 4u * 1024u * 1024u;
++                                const std::uint32_t influenceClass = job.influenceCount;
++                                const bool oracleCandidateAvailable =
++                                    m_impl->computeSkinOracleOptIn && influenceClass >= 1u &&
++                                    influenceClass <= 4u &&
++                                    m_impl->computeSkinOracleSubmittedSamples[influenceClass] < 2u &&
++                                    outputBytes <= kOracleMaxExpectedBytes &&
++                                    (computeSkinOracleCandidateKey.empty() ||
++                                        computeSkinOracleCandidateKey == instanceKey);
++                                if (oracleCandidateAvailable)
++                                {
++                                    std::vector<R4DynamicWorldSkinnedVertex> expectedVertices;
++                                    std::string oracleError;
++                                    if (RepackR4DynamicWorldSkinnedVertices(source,
++                                            renderable.boneTransforms, expectedVertices, oracleError) &&
++                                        expectedVertices.size() == cached.computeSkinVertices.size() &&
++                                        expectedVertices.size() <= std::numeric_limits<std::size_t>::max() /
++                                            sizeof(R4DynamicWorldSkinnedVertex) &&
++                                        expectedVertices.size() * sizeof(R4DynamicWorldSkinnedVertex) == outputBytes)
++                                    {
++                                        auto request = std::make_shared<R4ComputeSkinOracleRequest>();
++                                        request->stableKey = instanceKey;
++                                        request->expectedBytes.resize(outputBytes);
++                                        std::memcpy(request->expectedBytes.data(), expectedVertices.data(), outputBytes);
++                                        request->poseHash = poseHash;
++                                        request->outputWriteSerial = instance.outputWriteSerial;
++                                        request->prewarmEpoch = m_impl->prewarm.epoch;
++                                        request->engineFrame = world->engineFrame;
++                                        job.oracle = std::move(request);
++                                        attachedOracleRequest = true;
++                                    }
++                                    else if (!m_impl->computeSkinOracleInconclusiveLogged)
++                                    {
++                                        const char* reason = oracleError.empty() ?
++                                            "CPU reference size did not match the compute job" : oracleError.c_str();
++                                        std::fprintf(stderr,
++                                            "METAL_COMPUTE_SKIN_ORACLE_INCONCLUSIVE key=%s reason=\"%s\"\n",
++                                            instanceKey.c_str(), reason);
++                                        m_impl->computeSkinOracleInconclusiveLogged = true;
++                                    }
++                                }
+                                 queuedGpuSkin = m_impl->computeSkinJournal.Queue(instanceKey,
+                                     std::move(job), instance.skinnedVertices, m_impl->prewarm.epoch,
+                                     instance.outputWriteSerial, poseHash);
++                                if (queuedGpuSkin && attachedOracleRequest)
++                                    computeSkinOracleCandidateKey = instanceKey;
++                                else if (queuedGpuSkin && computeSkinOracleCandidateKey == instanceKey)
++                                    computeSkinOracleCandidateKey.clear();
+                             }
+                             if (!queuedGpuSkin && insertedForCompute)
+                             {
+@@ -2606,6 +2663,8 @@
+                 if (!canReuseSkinnedVertices && !queuedGpuSkin)
+                 {
+                     m_impl->computeSkinJournal.Cancel(instanceKey);
++                    if (computeSkinOracleCandidateKey == instanceKey)
++                        computeSkinOracleCandidateKey.clear();
+                     std::vector<R4DynamicWorldSkinnedVertex> repacked;
+                     PositionBounds sourceBounds;
+                     PositionBounds skinnedBounds;
+@@ -2729,6 +2788,8 @@
+                         // committed pose after an earlier same-key entry queued
+                         // a different provisional GPU pose.
+                         m_impl->computeSkinJournal.Cancel(instanceKey);
++                        if (computeSkinOracleCandidateKey == instanceKey)
++                            computeSkinOracleCandidateKey.clear();
+                         ++m_telemetry.skinnedVerticesReused;
+                     }
+                 }
+@@ -2752,6 +2813,8 @@
+                         key.c_str(), renderableIndex, localError.empty() ?
+                         "dynamic OGF instance uniform update failed" : localError.c_str());
+                     m_impl->computeSkinJournal.Cancel(instanceKey);
++                    if (computeSkinOracleCandidateKey == instanceKey)
++                        computeSkinOracleCandidateKey.clear();
+                     m_impl->instances.erase(existing);
+                     existing = m_impl->instances.end();
+                 }
+@@ -2786,6 +2849,8 @@
+                 std::fprintf(stderr, "METAL_DYNAMIC_OGF_SKIP key=%s reason=\"%s\"\n", key.c_str(),
+                     error.empty() ? "dynamic OGF uniform allocation failed" : error.c_str());
+                 m_impl->computeSkinJournal.Cancel(instanceKey);
++                if (computeSkinOracleCandidateKey == instanceKey)
++                    computeSkinOracleCandidateKey.clear();
+                 m_impl->instances.erase(instanceKey);
+                 error.clear();
+                 continue;
+@@ -2838,6 +2903,12 @@
+                 instance->second.outputWriteSerial == stamp.writeSerial)
+                 instance->second.prepared.PublishSkin(stamp.epoch);
+         }
++        m_impl->computeSkinOraclePendingInfluenceCounts.clear();
++        for (const R4ComputeSkinJob& job : jobs)
++        {
++            if (job.oracle && job.influenceCount >= 1u && job.influenceCount <= 4u)
++                m_impl->computeSkinOraclePendingInfluenceCounts.push_back(job.influenceCount);
++        }
+     }
+     // Publish the new immutable owner only after all Prewarm work succeeds.
+     m_telemetry.cachedGeometry = m_impl->geometry.size();
+@@ -2852,6 +2923,7 @@
+     if (!m_impl)
+         return;
+     m_impl->computeSkinJournal.Discard();
++    m_impl->computeSkinOraclePendingInfluenceCounts.clear();
+     m_impl->pendingObjectMotion.clear();
+     m_impl->pendingMotionFrame = false;
+     m_impl->pendingMotionReset = false;
+@@ -2866,6 +2938,13 @@
+             const auto instance = m_impl->instances.find(key);
+             return instance == m_impl->instances.end() ? nullptr : &instance->second;
+         });
++    for (const std::uint32_t influenceCount : m_impl->computeSkinOraclePendingInfluenceCounts)
++    {
++        if (influenceCount >= 1u && influenceCount <= 4u &&
++            m_impl->computeSkinOracleSubmittedSamples[influenceCount] < 2u)
++            ++m_impl->computeSkinOracleSubmittedSamples[influenceCount];
++    }
++    m_impl->computeSkinOraclePendingInfluenceCounts.clear();
+ }
+ 
+ void MetalR4DynamicWorldAdapter::CommitSubmittedFrame()

@@ -7,11 +7,13 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 class IR4Backend;
+struct R4FrameBufferSlice;
 
 // Owns the Direct Metal side of the CPU-expanded FVF::LIT particle stream.
 // The scene owns the load/store forward pass and attachments; this adapter
@@ -57,7 +59,6 @@ public:
         xray::metal::particles::DrawRecord state;
         std::shared_ptr<IR4Buffer> vertices;
         std::shared_ptr<IR4Buffer> indices;
-        std::shared_ptr<IR4Buffer> transforms;
         std::shared_ptr<IR4Texture> texture;
         std::shared_ptr<IR4Sampler> sampler;
         std::shared_ptr<IR4GraphicsPipeline> pipeline;
@@ -65,6 +66,10 @@ public:
         bool distortionPass = false;
         std::uint32_t vertexCount = 0;
         std::uint32_t indexCount = 0;
+        std::size_t vertexBufferOffset = 0;
+        std::size_t indexBufferOffset = 0;
+        std::size_t vertexByteSize = 0;
+        std::size_t indexByteSize = 0;
     };
 
     MetalR4ParticleAdapter();
@@ -79,11 +84,16 @@ public:
     // sampler state, including the soft position-G-buffer dependency.
     bool Configure(IR4Backend& backend, const Options& options, std::string& status);
 
-    // Repackages each captured draw into <=16383-sprite uint16-local batches
-    // and uploads private Metal vertex/index buffers. Bad captures are isolated
-    // per source draw; resource upload failure aborts this frame fail-closed.
+    // Repackages each captured draw into <=16383-sprite uint16-local batches.
+    // Supplying the active frame backend stores immutable arena slices;
+    // omitting it keeps the standalone Shared-buffer staging path. Bad captures
+    // are isolated per source draw; upload failure aborts the frame fail-closed.
     bool StageFrame(IR4Resources& resources, const xray::metal::particles::FrameBatch& frame,
-        std::string& error);
+        std::string& error, IR4Backend* frameBackend = nullptr);
+
+    // Drops per-frame prepared draws after an acquired frame is discarded.
+    // Pipeline, sampler, texture-cache, and readiness state remain intact.
+    void DiscardFrame();
 
     bool DrawIntoActiveForward(IR4Backend& backend,
         const std::array<float, 16>& viewProjection,
@@ -130,6 +140,14 @@ public:
     const std::vector<PreparedDraw>& PreparedDraws() const;
 
 private:
+    using FrameUploadFunction = std::function<bool(const void*, std::size_t, std::size_t,
+        R4FrameBufferSlice&, std::string&)>;
+    bool StageFrameImpl(IR4Resources& resources,
+        const xray::metal::particles::FrameBatch& frame, std::string& error,
+        const FrameUploadFunction* frameUpload);
+
+    friend bool RunMetalR4ParticleAdapterSelfTest(std::string& error);
+
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     bool m_ready = false;

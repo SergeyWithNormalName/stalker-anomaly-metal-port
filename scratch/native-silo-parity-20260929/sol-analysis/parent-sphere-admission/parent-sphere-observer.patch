@@ -1,0 +1,189 @@
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -44,6 +44,36 @@
+ 
+ namespace
+ {
++
++// One bounded source-policy census. No rendering or live-light state is changed.
++bool isR4ParentSphereObservationFrame(const std::uint32_t engineFrame)
++{
++    static const bool enabled = [] {
++        const char* value = std::getenv("XRAY_METAL_PARENT_SPHERE_OBSERVE");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    static const std::uint32_t frame = [] {
++        const char* value = std::getenv("XRAY_METAL_PARENT_SPHERE_OBSERVE_FRAME");
++        if (!value) return std::uint32_t(700u);
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(value, &end, 10);
++        return end && *end == '\0' && parsed > 0u && parsed < UINT32_MAX ?
++            static_cast<std::uint32_t>(parsed) : UINT32_MAX;
++    }();
++    return enabled && engineFrame == frame;
++}
++
++void printR4ParentSphereBits(const char* key, const void* values, const std::size_t count)
++{
++    std::fprintf(stderr, " %s=", key);
++    for (std::size_t index = 0; index < count; ++index)
++    {
++        std::uint32_t bits = 0u;
++        std::memcpy(&bits, static_cast<const unsigned char*>(values) + index * sizeof(float), sizeof(bits));
++        std::fprintf(stderr, "%s%08x", index ? "." : "", bits);
++    }
++}
++
+ // shared_str uses nullptr, rather than an empty character array, for an absent
+ // value.  The Direct Metal frame ABI owns std::string values, so every bridge
+ // conversion must normalize the engine's optional representation before a
+@@ -1225,6 +1255,66 @@
+             std::fprintf(stderr, "METAL_R1_STATIC_CAPTURE_DONE frame=%u parents=%zu records=%zu allow_r1=%u\n",
+                 lightingFrame.engineFrame, capturedRecords.size(), lightingFrame.lights.size(), unsigned(allowR1));
+         }
++
++        if (isR4ParentSphereObservationFrame(lightingFrame.engineFrame))
++        {
++            Fmatrix capturedVP; capturedVP.set(Device.mFullTransform);
++            Fmatrix cachedView, cachedProjection, cachedVP;
++            std::memcpy(&cachedView, viewState.view.data(), sizeof(cachedView));
++            std::memcpy(&cachedProjection, viewState.projection.data(), sizeof(cachedProjection));
++            const bool finiteInput = _valid(capturedVP) && _valid(cachedView) && _valid(cachedProjection);
++            bool sourceViewMatched = finiteInput && viewState.valid &&
++                viewState.engineFrame == lightingFrame.engineFrame && Device.dwFrame == lightingFrame.engineFrame &&
++                viewState.eye[0] == Device.vCameraPosition.x &&
++                viewState.eye[1] == Device.vCameraPosition.y && viewState.eye[2] == Device.vCameraPosition.z;
++            if (sourceViewMatched)
++            {
++                cachedVP.mul(cachedProjection, cachedView);
++                sourceViewMatched = std::memcmp(&cachedVP, &capturedVP, sizeof(cachedVP)) == 0;
++            }
++            CFrustum sourceFrustum;
++            if (sourceViewMatched)
++                sourceFrustum.CreateFromMatrix(capturedVP, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
++            std::fprintf(stderr,
++                "METAL_PARENT_SPHERE_CAPTURE frame=%u device_frame=%u cache_frame=%u source_view_matched=%u "
++                "allow_r1=%u r1_policy=%u",
++                lightingFrame.engineFrame, Device.dwFrame, viewState.engineFrame, unsigned(sourceViewMatched),
++                unsigned(ps_r2_ls_flags.test(R2FLAG_R1LIGHTS)), unsigned(r1StaticPolicy));
++            printR4ParentSphereBits("device_vp_bits", &capturedVP, 16u);
++            printR4ParentSphereBits("view_bits", viewState.view.data(), 16u);
++            printR4ParentSphereBits("projection_bits", viewState.projection.data(), 16u);
++            printR4ParentSphereBits("eye_bits", viewState.eye.data(), 3u);
++            std::fprintf(stderr, "\n");
++            std::unordered_map<std::uint64_t, std::size_t> recordsPerParent;
++            for (const auto& light : lightingFrame.lights) ++recordsPerParent[light.parentLightId];
++            std::unordered_set<std::uint64_t> reported;
++            for (const auto& light : lightingFrame.lights)
++            {
++                if (!reported.emplace(light.parentLightId).second) continue;
++                const auto owner = lightByParentIdentity.find(light.parentLightId);
++                const bool hasSphere = owner != lightByParentIdentity.end() && owner->second &&
++                    owner->second->SpatialComponent;
++                Fvector center{}; float radius = 0.f;
++                if (hasSphere)
++                {
++                    center.set(owner->second->SpatialComponent->spatial.sphere.P);
++                    radius = owner->second->SpatialComponent->spatial.sphere.R;
++                }
++                const bool sphereValid = hasSphere && _valid(center) && std::isfinite(radius) && radius > 0.f;
++                const int outside = sourceViewMatched && sphereValid ?
++                    int(!sourceFrustum.testSphere_dirty(center, radius)) : -1;
++                std::fprintf(stderr,
++                    "METAL_PARENT_SPHERE_PARENT frame=%u parent=%llu source_static=%u captured_records=%zu "
++                    "type=%u shadowed=%u hud=%u volumetric=%u sphere_valid=%u source_outside=%d "
++                    "sphere_x=%.9g sphere_y=%.9g sphere_z=%.9g sphere_radius=%.9g\n",
++                    lightingFrame.engineFrame, static_cast<unsigned long long>(light.parentLightId),
++                    unsigned(light.staticLight), recordsPerParent.at(light.parentLightId), unsigned(light.type),
++                    unsigned(light.shadowed), unsigned(light.hudMode), unsigned(light.volumetricEnabled),
++                    unsigned(sphereValid), outside, center.x, center.y, center.z, radius);
++            }
++            std::fprintf(stderr, "METAL_PARENT_SPHERE_CAPTURE_DONE frame=%u parents=%zu records=%zu\n",
++                lightingFrame.engineFrame, recordsPerParent.size(), lightingFrame.lights.size());
++        }
+ 		if (!backend->SubmitEngineLightingFrame(lightingFrame, error))
+ 		{
+ 			ReportFailure("Submit engine local lights", error);
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -47,6 +47,36 @@
+ namespace
+ {
+ constexpr R4ClearColor EngineSceneClearColor{0.025, 0.055, 0.105, 1.0};
++
++// One bounded source-policy census. No rendering or live-light state is changed.
++bool isR4ParentSphereObservationFrame(const std::uint32_t engineFrame)
++{
++    static const bool enabled = [] {
++        const char* value = std::getenv("XRAY_METAL_PARENT_SPHERE_OBSERVE");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    static const std::uint32_t frame = [] {
++        const char* value = std::getenv("XRAY_METAL_PARENT_SPHERE_OBSERVE_FRAME");
++        if (!value) return std::uint32_t(700u);
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(value, &end, 10);
++        return end && *end == '\0' && parsed > 0u && parsed < UINT32_MAX ?
++            static_cast<std::uint32_t>(parsed) : UINT32_MAX;
++    }();
++    return enabled && engineFrame == frame;
++}
++
++void printR4ParentSphereBits(const char* key, const void* values, const std::size_t count)
++{
++    std::fprintf(stderr, " %s=", key);
++    for (std::size_t index = 0; index < count; ++index)
++    {
++        std::uint32_t bits = 0u;
++        std::memcpy(&bits, static_cast<const unsigned char*>(values) + index * sizeof(float), sizeof(bits));
++        std::fprintf(stderr, "%s%08x", index ? "." : "", bits);
++    }
++}
++
+ 
+ bool qualifyActiveOcclusionLocalVolumeShader(const std::filesystem::path& directory,
+     const char*& reason)
+@@ -3567,6 +3597,21 @@
+             // Snapshot values and already-produced per-tile counters only; no clock/query/draw.
+             std::fprintf(stderr,
+                 "METAL_R1_STATIC_SHADOW_FACE frame=%u batch=%u tile=%zu parent=%llu light=%llu "
++                "face=%u type=%u source_static=%u material_rows=%zu static_geometry_draws=%zu "
++                "dynamic_geometry_casters=%zu flora_shadow_draws=%zu transform_bytes=%zu\n",
++                view.engineFrame, batchId, tile, static_cast<unsigned long long>(light.parentLightId),
++                static_cast<unsigned long long>(record.lightIdentity), record.face, unsigned(light.type),
++                unsigned(light.staticLight), materialEntries[tile].size(),
++                shadows.mergedEncodedDraws - homStaticBefore, shadows.submittedDynamicCasters - homDynamicBefore,
++                flora && flora->IsReady() ? flora->LastTelemetry().shadowDraws : 0u,
++                materialEntries[tile].size() * 256u);
++        }
++
++        if (isR4ParentSphereObservationFrame(view.engineFrame))
++        {
++            const auto& light = snapshot->lights[candidates[tile].lightIndex];
++            std::fprintf(stderr,
++                "METAL_PARENT_SPHERE_FACE frame=%u batch=%u tile=%zu parent=%llu light=%llu "
+                 "face=%u type=%u source_static=%u material_rows=%zu static_geometry_draws=%zu "
+                 "dynamic_geometry_casters=%zu flora_shadow_draws=%zu transform_bytes=%zu\n",
+                 view.engineFrame, batchId, tile, static_cast<unsigned long long>(light.parentLightId),
+@@ -5013,6 +5058,21 @@
+         const bool e08PlanTiming = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120u == 0u;
+         const auto e08PlanStart = e08PlanTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         if (!planLocalShadowBatches(view,snapshot,environment,batches,unshadowed,error)) return false;
++
++        if (isR4ParentSphereObservationFrame(view.engineFrame))
++        {
++            std::fprintf(stderr,
++                "METAL_PARENT_SPHERE_VIEW frame=%u valid=%u snapshot_frame=%u environment_frame=%u "
++                "environment_valid=%u scope_receivers=%u hud_receivers=%u volume_frame=%u",
++                view.engineFrame, unsigned(view.valid), snapshot ? snapshot->engineFrame : UINT32_MAX,
++                environment.engineFrame, unsigned(environment.valid), unsigned(hasScope),
++                unsigned(hasOpaqueHud), unsigned(volumeFrame));
++            printR4ParentSphereBits("view_bits", view.view.data(), 16u);
++            printR4ParentSphereBits("projection_bits", view.projection.data(), 16u);
++            printR4ParentSphereBits("eye_bits", view.eye.data(), 3u);
++            std::fprintf(stderr, "\n");
++        }
++
+         std::vector<R4WholeLightVisibilitySample> visibilitySamples;
+         xray::metal::R4WholeLightVisibilitySelectionStats visibilityStats;
+         const bool visibilityOptIn = wholeLightVisibilityEnabled();

@@ -1,0 +1,270 @@
+--- scratch/gameplay-rescue-20260929/prestate/MetalR4FloraAdapter.cpp	2026-09-28 02:29:40
++++ src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp	2026-09-29 10:15:11
+@@ -1253,6 +1253,37 @@
+     return true;
+ }
+ 
++bool MetalR4FloraAdapter::DrawShadowCastersForValidation(IR4Backend& backend,
++    const std::array<float, 16>& lightViewProjection,
++    const R4FloraViewState& view, const bool instanced,
++    Telemetry& sampledTelemetry, std::string& error)
++{
++    if (!m_ready || !m_impl || !view.valid)
++    {
++        error = "Flora pixel oracle requires a prepared adapter and valid scene view";
++        return false;
++    }
++    if (instanced && (!m_impl->trunkInstancedShadowPipeline ||
++        !m_impl->leafInstancedShadowPipeline || !m_impl->leafNoAlphaInstancedShadowPipeline))
++    {
++        error = "Flora pixel oracle requires the admitted instanced shadow shader directory";
++        return false;
++    }
++    struct Restore
++    {
++        bool& mode;
++        const bool savedMode;
++        Telemetry& telemetry;
++        const Telemetry savedTelemetry;
++        ~Restore() { mode = savedMode; telemetry = savedTelemetry; }
++    } restore{m_impl->shadowInstancing, m_impl->shadowInstancing, m_telemetry, m_telemetry};
++    m_telemetry = {};
++    m_impl->shadowInstancing = instanced;
++    const bool result = DrawShadowCasters(backend, lightViewProjection, view, error);
++    sampledTelemetry = m_telemetry;
++    return result;
++}
++
+ bool RunR4FloraAdapterSelfTest(std::string& error)
+ {
+     xray::metal::R4VertexBufferSummary buffer;
+--- scratch/gameplay-rescue-20260929/prestate/MetalR4FloraAdapter.h	2026-09-28 02:22:44
++++ src/Layers/xrRenderMetal/MetalR4FloraAdapter.h	2026-09-29 10:09:10
+@@ -135,6 +135,13 @@
+         const std::array<float, 16>& lightViewProjection,
+         const R4FloraViewState& view, std::string& error);
+ 
++    // Diagnostic-only draw into an isolated scene-owned pass. Selects one
++    // implementation for this call and restores configured mode/telemetry.
++    bool DrawShadowCastersForValidation(IR4Backend& backend,
++        const std::array<float, 16>& lightViewProjection,
++        const R4FloraViewState& view, bool instanced,
++        Telemetry& sampledTelemetry, std::string& error);
++
+     bool HasShadowCasters() const;
+ 
+     bool IsReady() const { return m_ready; }
+--- scratch/gameplay-rescue-20260929/prestate/MetalR4EngineScene-before-flora-oracle2.mm	2026-09-29 10:02:54
++++ src/Layers/xrRenderMetal/MetalR4EngineScene.mm	2026-09-29 10:16:03
+@@ -24,6 +24,8 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <cstdio>
++#include <fstream>
++#include <iomanip>
+ #include <limits>
+ #include <mutex>
+ #include <unordered_map>
+@@ -216,6 +218,17 @@
+ 
+ struct LocalShadowScene
+ {
++    struct FloraPixelOracle
++    {
++        std::array<std::shared_ptr<IR4Texture>, 2> maps;
++        std::shared_ptr<IR4Texture> depth;
++        std::size_t pairs = 0u;
++        std::size_t pairsThisFrame = 0u;
++        std::size_t viewsThisFrame = 0u;
++        std::size_t firstViewThisFrame = 0u;
++        std::uint32_t lastFrame = UINT32_MAX;
++        std::unordered_set<std::string> sampledViews;
++    } floraLocalOracle, floraSunOracle;
+     std::shared_ptr<IR4Texture> atlas;
+     std::shared_ptr<IR4Texture> depth;
+     std::vector<xray::metal::R4LocalShadowAtlasRecord> records;
+@@ -2609,6 +2622,152 @@
+     return cached;
+ }
+ 
++// Diagnostic pairs draw the same live Flora and wind twice in one acquired
++// frame. Independent attachments and completed readbacks preserve production.
++bool runFloraShadowPixelOracle(IR4Backend& backend, LevelScene& scene,
++    LocalShadowScene::FloraPixelOracle& oracle, MetalR4FloraAdapter* flora,
++    const R4FloraViewState& floraView, const MetalR4EngineScene::ViewState& view,
++    const std::array<float, 16>& lightViewProjection, std::uint32_t extent,
++    const std::string& family, std::size_t pairLimit, std::size_t framePairLimit,
++    std::string& error)
++{
++    const char* directory = std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR");
++    if (!directory || !*directory || !flora || !flora->IsReady() || !view.valid ||
++        oracle.pairs >= pairLimit)
++        return true;
++    const char* everyText = std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_EVERY");
++    const unsigned long every = everyText ?
++        std::max(1ul, std::strtoul(everyText, nullptr, 10)) : 240ul;
++    if (view.engineFrame % every != 0u)
++        return true;
++    if (oracle.lastFrame != view.engineFrame)
++    {
++        oracle.lastFrame = view.engineFrame;
++        oracle.pairsThisFrame = 0u;
++        oracle.viewsThisFrame = 0u;
++        oracle.firstViewThisFrame = family.rfind("gameplay-flora-local-", 0u) == 0u ?
++            oracle.pairs : 0u;
++        oracle.sampledViews.clear();
++    }
++    if (!oracle.sampledViews.emplace(family).second)
++        return true;
++    // Rotate local-light cases across sampled frames instead of consuming the
++    // cap on the first atlas batch/time. All three sun cascades sample together.
++    if (oracle.viewsThisFrame++ < oracle.firstViewThisFrame ||
++        oracle.pairsThisFrame >= framePairLimit)
++        return true;
++    if (!oracle.maps[0])
++    {
++        R4Texture2DDesc descriptor;
++        descriptor.width = descriptor.height = extent;
++        descriptor.format = R4PixelFormat::R32Float;
++        descriptor.storage = R4ResourceStorage::Private;
++        descriptor.usage = R4TextureUsage::RenderTarget | R4TextureUsage::ShaderRead;
++        descriptor.label = "R4 isolated live Flora legacy shadow oracle";
++        oracle.maps[0] = backend.Resources().CreateTexture2D(descriptor, error);
++        descriptor.label = "R4 isolated live Flora instanced shadow oracle";
++        oracle.maps[1] = backend.Resources().CreateTexture2D(descriptor, error);
++        descriptor.format = R4PixelFormat::Depth32Float;
++        descriptor.usage = R4TextureUsage::RenderTarget;
++        descriptor.label = "R4 isolated live Flora shadow oracle depth";
++        oracle.depth = backend.Resources().CreateTexture2D(descriptor, error);
++        if (!oracle.maps[0] || !oracle.maps[1] || !oracle.depth)
++            return false;
++    }
++    if (oracle.maps[0]->Descriptor().width != extent)
++    {
++        error = "Flora pixel oracle extent changed within its prepared scene";
++        return false;
++    }
++    std::array<MetalR4FloraAdapter::Telemetry, 2> sampled;
++    for (std::size_t mode = 0; mode < 2u; ++mode)
++    {
++        R4RenderPassDesc pass;
++        pass.label = "R4 isolated live Flora legacy/instanced shadow pair";
++        pass.useDrawable = false;
++        R4ColorAttachmentDesc color;
++        color.texture = oracle.maps[mode];
++        color.clearColor = {1.0, 1.0, 1.0, 1.0};
++        pass.colorAttachments = {color};
++        pass.depthStencilAttachment.texture = oracle.depth;
++        pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
++        pass.depthStencilAttachment.depthStoreAction = R4StoreAction::DontCare;
++        pass.hasViewport = true;
++        pass.viewport = {0.0, 0.0, double(extent), double(extent), 0.0, 1.0};
++        pass.hasScissor = true;
++        pass.scissor = {0u, 0u, extent, extent};
++        if (!backend.BeginRenderPass(pass, error) ||
++            !flora->DrawShadowCastersForValidation(backend, lightViewProjection,
++                floraView, mode == 1u, sampled[mode], error) ||
++            !backend.EndRenderPass(error))
++            return false;
++        R4SunShadowValidationDesc snapshot;
++        snapshot.shadowR32 = oracle.maps[mode];
++        snapshot.positionRGBA16F = scene.gBufferTargets[0];
++        snapshot.sceneDepthStencil = scene.depthTarget;
++        snapshot.accumulationRGBA16F = scene.lightingAccumulator;
++        snapshot.positionDecompressionParams = scene.positionDecompressionParams;
++        const Matrix4 inverse = inverseRigidTransform(scene.view);
++        std::memcpy(snapshot.inverseView.data(), inverse.elements, sizeof(inverse));
++        std::memcpy(snapshot.currentViewProjection.data(),
++            scene.uniformData.viewProjection.elements, sizeof(Matrix4));
++        snapshot.stageVolumeViewProjection = lightViewProjection;
++        snapshot.family = family + (mode == 0u ? "-legacy" : "-instanced");
++        snapshot.outputDirectory = directory;
++        snapshot.engineFrame = view.engineFrame;
++        snapshot.phase = R4SunShadowValidationPhase::OffCameraCasters;
++        snapshot.requireShadowedReceivers = false;
++        snapshot.exportShadowMap = true;
++        if (!backend.ValidateSunShadowCascade(snapshot, error))
++            return false;
++    }
++    if (sampled[0].shadowSubmittedVisuals != sampled[1].shadowSubmittedVisuals ||
++        sampled[0].shadowCulledVisuals != sampled[1].shadowCulledVisuals)
++    {
++        error = "Flora pixel oracle implementations selected different live casters";
++        return false;
++    }
++    std::error_code filesystemError;
++    std::filesystem::create_directories(directory, filesystemError);
++    std::ofstream manifest(std::filesystem::path(directory) / "flora-pairs.jsonl", std::ios::app);
++    if (filesystemError || !manifest)
++    {
++        error = "Flora pixel oracle could not record pair provenance";
++        return false;
++    }
++    manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
++        << "{\"family\":\"" << family << "\",\"engine_frame\":" << view.engineFrame
++        << ",\"extent\":" << extent << ",\"time_seconds\":" << floraView.timeSeconds
++        << ",\"wind_valid\":" << (floraView.windValid ? "true" : "false")
++        << ",\"instances\":" << sampled[0].shadowSubmittedVisuals
++        << ",\"legacy_draws\":" << sampled[0].shadowDraws
++        << ",\"instanced_draws\":" << sampled[1].shadowDraws;
++    const auto writeValues = [&manifest](const char* key, const auto& values) {
++        manifest << ",\"" << key << "\":[";
++        for (std::size_t index = 0; index < values.size(); ++index)
++            manifest << (index ? "," : "") << values[index];
++        manifest << "]";
++    };
++    writeValues("light_view_projection", lightViewProjection);
++    writeValues("wind_params", floraView.windParams);
++    writeValues("wind_animation", floraView.windAnimation);
++    writeValues("wind_setup_trees", floraView.windSetupTrees);
++    manifest << "}\n";
++    manifest.close();
++    if (!manifest)
++    {
++        error = "Flora pixel oracle failed to persist pair provenance";
++        return false;
++    }
++    ++oracle.pairs;
++    ++oracle.pairsThisFrame;
++    std::fprintf(stderr,
++        "METAL_FLORA_PIXEL_PAIR frame=%u family=%s instances=%zu legacy_draws=%zu instanced_draws=%zu extent=%u time=%.9g\n",
++        view.engineFrame, family.c_str(), sampled[0].shadowSubmittedVisuals,
++        sampled[0].shadowDraws, sampled[1].shadowDraws, extent, floraView.timeSeconds);
++    return true;
++}
++
+ bool renderLocalShadowBatch(IR4Backend& backend, LevelScene& scene,
+     LocalShadowScene& shadows, const MetalR4EngineScene::ViewState& view,
+     const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+@@ -2954,6 +3113,18 @@
+                 shadows.submittedDynamicCasters-homDynamicBefore,materialEntries[tile].size()*256u);
+         }
+     }
++    if (std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR"))
++        for (std::size_t tile = 0; tile < shadows.records.size(); ++tile)
++        {
++            std::array<float, 16> matrix{};
++            std::memcpy(matrix.data(), lightViewProjections[tile].elements, sizeof(Matrix4));
++            const auto& record = shadows.records[tile];
++            const std::string family = "gameplay-flora-local-b" + std::to_string(batchId) +
++                "-t" + std::to_string(tile) + "-light" + std::to_string(record.lightIdentity);
++            if (!runFloraShadowPixelOracle(backend, scene, shadows.floraLocalOracle,
++                    flora, floraView, view, matrix, record.atlasSize, family, 12u, 4u, error))
++                return false;
++        }
+     if (const std::shared_ptr<const R4EngineWorldSnapshot> world = backend.EngineWorldSnapshot())
+     {
+         if (dynamicWorld && dynamicWorld->IsEnabled())
+@@ -3901,6 +4072,12 @@
+                 if (!detail->DrawShadowCasters(backend,detailView,shadow,error)) return false;
+             }
+             if (!backend.EndRenderPass(error))
++                return false;
++            if (localShadows && std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR") &&
++                !runFloraShadowPixelOracle(backend, scene, localShadows->floraSunOracle,
++                    flora, floraView, view, lightVP,
++                    scene.sunCascades[cascade].shadow->Descriptor().width,
++                    "gameplay-flora-sun-c" + std::to_string(cascade), 6u, 3u, error))
+                 return false;
+             if (view.engineFrame % 120u == 0u)
+                 std::fprintf(stderr, "METAL_E08_STATIC_SUN frame=%u cascade=%u total=%zu candidates=%zu draws=%zu oracle=%u\n",

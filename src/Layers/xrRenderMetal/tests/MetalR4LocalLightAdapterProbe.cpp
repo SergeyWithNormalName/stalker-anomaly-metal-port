@@ -1,7 +1,25 @@
 #include "MetalR4LocalLightAdapter.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+
+class xrMemory
+{
+public:
+    xrMemory() {}
+    void mem_free(void* p);
+    void* mem_alloc(std::size_t size, bool);
+};
+xrMemory Memory;
+void xrMemory::mem_free(void* p)
+{
+    std::free(p);
+}
+void* xrMemory::mem_alloc(std::size_t size, bool)
+{
+    return std::malloc(size);
+}
 
 int main(int argc, char** argv)
 {

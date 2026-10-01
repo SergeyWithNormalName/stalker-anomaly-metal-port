@@ -184,6 +184,27 @@ bool finite3(const std::array<float, 3>& value)
     return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
 }
 
+float detailGrassShadowFadeScale(const R4DetailGrassInstance& instance,
+    const R4DetailGrassShadowState& shadow)
+{
+    if (shadow.fadeFromLight)
+    {
+        const float dx = instance.shadowFadePosition[0] - shadow.lightPosition[0];
+        const float dy = instance.shadowFadePosition[1] - shadow.lightPosition[1];
+        const float dz = instance.shadowFadePosition[2] - shadow.lightPosition[2];
+        const float lightDistanceSquared = dx * dx + dy * dy + dz * dz;
+        const float lightRangeSquared = shadow.lightRange * shadow.lightRange;
+        if (lightDistanceSquared >= lightRangeSquared)
+            return 0.0f;
+
+        const float dxzSquared = dx * dx + dz * dz;
+        return 1.0f - dxzSquared * 0.005f;
+    }
+    if (instance.shadowDistanceSquared > shadow.fadeDistance)
+        return 1.0f - std::abs(instance.shadowDistanceSquared - shadow.fadeDistance) * 0.005f;
+    return 1.0f;
+}
+
 bool readText(const std::filesystem::path& path, std::string& value)
 {
     std::ifstream input(path, std::ios::binary);
@@ -259,6 +280,47 @@ bool validateMscBundle(const MetalR4DetailGrassAdapter::Options& options, std::s
         ps.find("\"discards\":true") == std::string::npos)
     {
         error = "detail grass MSC reflection differs from the recorded details\\\\blend contract";
+        return false;
+    }
+    return true;
+}
+
+bool validateShadowMscBundle(const std::filesystem::path& directory, std::string& error)
+{
+    const std::filesystem::path vsPath = directory / "deffer_grass_shadow.vs.metallib";
+    const std::filesystem::path psPath = directory / "deffer_grass_shadow.ps.metallib";
+    if (!std::filesystem::is_regular_file(vsPath) || !std::filesystem::is_regular_file(psPath))
+    {
+        error = "detail grass shadow bundle is missing its dedicated VS or R32 PS wrapper";
+        return false;
+    }
+    std::filesystem::path vsReflection = vsPath;
+    std::filesystem::path psReflection = psPath;
+    vsReflection.replace_extension(".reflection.json");
+    psReflection.replace_extension(".reflection.json");
+    std::string vs;
+    std::string ps;
+    if (!readText(vsReflection, vs) || !readText(psReflection, ps))
+    {
+        error = "detail grass shadow reflection receipt is missing";
+        return false;
+    }
+    vs = compactJson(vs);
+    ps = compactJson(ps);
+    static constexpr const char* VertexTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":2,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":96,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    static constexpr const char* FragmentTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    if (vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+        vs.find("\"ResourceCount\":5") == std::string::npos ||
+        vs.find(VertexTlab) == std::string::npos ||
+        ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+        ps.find("\"ResourceCount\":3") == std::string::npos ||
+        ps.find(FragmentTlab) == std::string::npos ||
+        ps.find("\"discards\":true") == std::string::npos ||
+        ps.find("\"num_render_targets\":1") == std::string::npos)
+    {
+        error = "detail grass shadow reflection differs from the production wind/alpha wrapper ABI";
         return false;
     }
     return true;
@@ -521,12 +583,13 @@ bool RepackR4DetailGrassBatch(const R4DetailGrassModel& model,
     {
         const R4DetailGrassInstance& instance = instances[instanceIndex];
         if (!finite3(instance.terrainNormal) || !std::isfinite(instance.sun) || !std::isfinite(instance.hemi) ||
-            !std::isfinite(instance.alpha) ||
+            !std::isfinite(instance.alpha) || !instance.hasShadowFadePosition ||
+            !finite3(instance.shadowFadePosition) || !std::isfinite(instance.shadowDistanceSquared) ||
             !std::all_of(instance.transform.begin(), instance.transform.end(), [](const float value) {
                 return std::isfinite(value);
             }))
         {
-            error = "detail grass instance has non-finite transform, lighting, or terrain normal";
+            error = "detail grass instance has invalid transform, lighting, terrain normal, or source shadow-fade position";
             return false;
         }
         const std::size_t vertexBase = vertices.size();
@@ -565,10 +628,6 @@ struct MetalR4DetailGrassAdapter::Impl
     {
         std::shared_ptr<IR4Buffer> vertices;
         std::shared_ptr<IR4Buffer> indices;
-        std::shared_ptr<IR4Buffer> vertexGlobals;
-        std::shared_ptr<IR4Buffer> fragmentGlobals;
-        std::shared_ptr<IR4Buffer> transforms;
-        std::shared_ptr<IR4Buffer> staticGlobals;
         std::shared_ptr<IR4Texture> baseTexture;
         std::shared_ptr<IR4Texture> bumpTexture;
         std::size_t indexCount = 0;
@@ -576,6 +635,8 @@ struct MetalR4DetailGrassAdapter::Impl
         R4DetailGrassBatch bounds;
     };
     std::shared_ptr<IR4GraphicsPipeline> pipeline;
+    std::shared_ptr<IR4GraphicsPipeline> shadowPipeline;
+    std::string shadowError;
     std::shared_ptr<IR4Sampler> baseSampler;
     std::shared_ptr<IR4Sampler> wavesSampler;
     std::shared_ptr<IR4Texture> wavesTexture;
@@ -657,6 +718,42 @@ bool MetalR4DetailGrassAdapter::Configure(IR4Backend& backend, const Options& op
         status = m_status;
         return true;
     }
+    if (!options.shadowShaderDirectory.empty())
+    {
+        if (!validateShadowMscBundle(options.shadowShaderDirectory, m_impl->shadowError))
+        {
+            std::fprintf(stderr, "METAL_DETAIL_GRASS_SHADOW_UNAVAILABLE reason=\"%s\"\n",
+                m_impl->shadowError.c_str());
+        }
+        else
+        {
+            R4GraphicsPipelineDesc shadow;
+            shadow.label = "R4 details blend shadow alpha/dither";
+            shadow.shaderKey = "r4-details-blend-shadow-alpha-dither-v1";
+            const std::string shadowVs =
+                (options.shadowShaderDirectory / "deffer_grass_shadow.vs.metallib").string();
+            const std::string shadowPs =
+                (options.shadowShaderDirectory / "deffer_grass_shadow.ps.metallib").string();
+            shadow.vertexMetallibPath = shadowVs.c_str();
+            shadow.fragmentMetallibPath = shadowPs.c_str();
+            shadow.vertexAttributes = {{11u, 6u, 0u, R4VertexFormat::Float4},
+                {12u, 6u, 16u, R4VertexFormat::Int4}};
+            shadow.vertexLayouts = {{6u, sizeof(R4DetailGrassVertex)}};
+            shadow.colorFormats = {R4PixelFormat::R32Float};
+            shadow.depthFormat = R4PixelFormat::Depth32Float;
+            shadow.depthCompare = R4CompareFunction::Less;
+            shadow.depthWrite = true;
+            shadow.cullMode = R4CullMode::None;
+            shadow.frontFace = R4Winding::Clockwise;
+            m_impl->shadowPipeline = backend.CreateGraphicsPipeline(shadow, error);
+            if (!m_impl->shadowPipeline)
+            {
+                m_impl->shadowError = "detail grass shadow PSO creation failed: " + error;
+                std::fprintf(stderr, "METAL_DETAIL_GRASS_SHADOW_UNAVAILABLE reason=\"%s\"\n",
+                    m_impl->shadowError.c_str());
+            }
+        }
+    }
     m_ready = true;
     m_status = "details blend MSC foundation ready";
     status = m_status;
@@ -732,8 +829,9 @@ bool MetalR4DetailGrassAdapter::StageFrame(IR4Backend& backend,
     m_telemetry.admittedInstances = 0u;
     m_telemetry.rejectedBatches = 0u;
     m_telemetry.textureRejectedBatches = 0u;
-    m_telemetry.draws = 0u;
-    m_telemetry.frustumRejectedBatches = 0u;
+    m_telemetry.shadowDraws = 0u;
+    m_telemetry.shadowCulledBatches = 0u;
+    m_telemetry.shadowRejected = 0u;
     m_telemetry.distanceRejectedSlots = frame.distanceRejectedSlots;
     m_telemetry.stillInstances = frame.stillInstances;
     m_telemetry.cacheFadeDistance = frame.cacheFadeDistance;
@@ -793,16 +891,7 @@ bool MetalR4DetailGrassAdapter::StageFrame(IR4Backend& backend,
                 R4BufferUsage::Vertex, "R4 details blend repacked vertices");
             draw.indices = makeBuffer(indices.size() * sizeof(std::uint16_t),
                 R4BufferUsage::Index, "R4 details blend repacked indices");
-            draw.vertexGlobals = makeBuffer(kVertexGlobalsSize, R4BufferUsage::Uniform,
-                "R4 details blend VS globals");
-            draw.fragmentGlobals = makeBuffer(kFragmentGlobalsSize, R4BufferUsage::Uniform,
-                "R4 details blend PS globals");
-            draw.transforms = makeBuffer(kTransformsSize, R4BufferUsage::Uniform,
-                "R4 details blend transforms");
-            draw.staticGlobals = makeBuffer(kStaticGlobalsSize, R4BufferUsage::Uniform,
-                "R4 details blend static globals");
-            if (!draw.vertices || !draw.indices || !draw.vertexGlobals || !draw.fragmentGlobals ||
-                !draw.transforms || !draw.staticGlobals ||
+            if (!draw.vertices || !draw.indices ||
                 !resources.UpdateBuffer(draw.vertices, 0u, vertices.data(),
                     vertices.size() * sizeof(R4DetailGrassVertex), localError) ||
                 !resources.UpdateBuffer(draw.indices, 0u, indices.data(),
@@ -931,9 +1020,11 @@ bool MetalR4DetailGrassAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
             const float dz = instance.transform[14] - view.eye[2];
             const float distanceSquared = dx * dx + dy * dy + dz * dz;
             const float fadeLimit = m_impl->cacheFadeDistance * m_impl->cacheFadeDistance;
-            const float fadeRange = std::max(1.0f, fadeLimit - 1.0f);
-            const float distanceAlpha = std::clamp(
-                1.0f - (distanceSquared - 1.0f) / fadeRange, 0.0f, 1.0f);
+            const float fadeStartDistance = m_impl->cacheFadeDistance * 0.75f;
+            const float fadeStart = fadeStartDistance * fadeStartDistance;
+            const float fadeRange = std::max(1.0f, fadeLimit - fadeStart);
+            const float distanceAlpha = (distanceSquared <= fadeStart) ? 1.0f :
+                std::clamp(1.0f - (distanceSquared - fadeStart) / fadeRange, 0.0f, 1.0f);
             putFloat4(vs, exdata, instance.terrainNormal[0], instance.terrainNormal[1],
                 instance.terrainNormal[2], instance.alpha * distanceAlpha);
             putFloat4(vs, matrix, instance.transform[0], instance.transform[4],
@@ -967,22 +1058,26 @@ bool MetalR4DetailGrassAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
         putFloat4(statics, 384u, view.eye[0], view.eye[1], view.eye[2], 0.0f);
         putFloat4(statics, 416u, static_cast<float>(width), static_cast<float>(height),
             1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height));
-        if (!backend.Resources().UpdateBuffer(draw.vertexGlobals, 0u, vs.data(), vs.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.fragmentGlobals, 0u, ps.data(), ps.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.transforms, 0u, transforms.data(), transforms.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.staticGlobals, 0u, statics.data(), statics.size(), error))
+        R4FrameBufferSlice vertexGlobalsSlice;
+        R4FrameBufferSlice fragmentGlobalsSlice;
+        R4FrameBufferSlice transformsSlice;
+        R4FrameBufferSlice staticGlobalsSlice;
+        if (!backend.UploadFrameData(vs.data(), vs.size(), 256u, vertexGlobalsSlice, error) ||
+            !backend.UploadFrameData(ps.data(), ps.size(), 256u, fragmentGlobalsSlice, error) ||
+            !backend.UploadFrameData(transforms.data(), transforms.size(), 256u, transformsSlice, error) ||
+            !backend.UploadFrameData(statics.data(), statics.size(), 256u, staticGlobalsSlice, error))
             return false;
         R4MscStageBindings vertex{R4ShaderStage::Vertex, 120u, {{R4MscResourceType::Texture, 0u,
             {}, 0u, 0u, m_impl->wavesTexture}, {R4MscResourceType::ConstantBuffer, 24u,
-            draw.vertexGlobals, 0u, vs.size()}, {R4MscResourceType::ConstantBuffer, 48u,
-            draw.transforms, 0u, transforms.size()}, {R4MscResourceType::ConstantBuffer, 72u,
-            draw.staticGlobals, 0u, statics.size()}, {R4MscResourceType::Sampler, 96u,
+            vertexGlobalsSlice.buffer, vertexGlobalsSlice.offset, vertexGlobalsSlice.size}, {R4MscResourceType::ConstantBuffer, 48u,
+            transformsSlice.buffer, transformsSlice.offset, transformsSlice.size}, {R4MscResourceType::ConstantBuffer, 72u,
+            staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size}, {R4MscResourceType::Sampler, 96u,
             {}, 0u, 0u, {}, m_impl->wavesSampler}}};
         R4MscStageBindings fragment{R4ShaderStage::Fragment, 144u, {{R4MscResourceType::Texture, 0u,
             {}, 0u, 0u, draw.baseTexture}, {R4MscResourceType::Texture, 24u, {}, 0u, 0u, draw.bumpTexture},
-            {R4MscResourceType::ConstantBuffer, 48u, draw.fragmentGlobals, 0u, ps.size()},
-            {R4MscResourceType::ConstantBuffer, 72u, draw.transforms, 0u, transforms.size()},
-            {R4MscResourceType::ConstantBuffer, 96u, draw.staticGlobals, 0u, statics.size()},
+            {R4MscResourceType::ConstantBuffer, 48u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
+            {R4MscResourceType::ConstantBuffer, 72u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
+            {R4MscResourceType::ConstantBuffer, 96u, staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size},
             {R4MscResourceType::Sampler, 120u, {}, 0u, 0u, {}, m_impl->baseSampler}}};
         R4IndexedDrawDesc indexed;
         indexed.indexBuffer = draw.indices;
@@ -994,6 +1089,175 @@ bool MetalR4DetailGrassAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
             !backend.DrawIndexed(indexed, error))
             return false;
         ++m_telemetry.draws;
+    }
+    return true;
+}
+
+bool MetalR4DetailGrassAdapter::HasShadowCasters() const
+{
+    return m_ready && m_impl && m_impl->shadowPipeline;
+}
+
+bool MetalR4DetailGrassAdapter::DrawShadowCasters(IR4Backend& backend,
+    const R4DetailGrassViewState& view, const R4DetailGrassShadowState& shadow,
+    std::string& error)
+{
+    if (!m_ready || !m_impl || !view.valid)
+        return true;
+    if (!HasShadowCasters())
+    {
+        error = m_impl->shadowError.empty() ? "detail grass shadow bundle is not configured" : m_impl->shadowError;
+        return false;
+    }
+    Matrix4 lightView{};
+    Matrix4 lightProjection{};
+    Matrix4 lightViewProjection{};
+    std::memcpy(lightView.elements, shadow.lightView.data(), sizeof(lightView));
+    std::memcpy(lightProjection.elements, shadow.lightProjection.data(), sizeof(lightProjection));
+    std::memcpy(lightViewProjection.elements, shadow.lightViewProjection.data(), sizeof(lightViewProjection));
+    for (const float value : lightView.elements)
+        if (!std::isfinite(value)) { error = "detail grass shadow view matrix is non-finite"; return false; }
+    for (const float value : lightProjection.elements)
+        if (!std::isfinite(value)) { error = "detail grass shadow projection matrix is non-finite"; return false; }
+    for (const float value : lightViewProjection.elements)
+        if (!std::isfinite(value)) { error = "detail grass shadow view-projection matrix is non-finite"; return false; }
+    if (shadow.fadeFromLight && (!finite3(shadow.lightPosition) || !std::isfinite(shadow.lightRange) ||
+            shadow.lightRange <= 0.0f || !std::isfinite(shadow.lightRange * shadow.lightRange)))
+    {
+        error = "local detail-grass shadow needs a finite positive light position and range";
+        return false;
+    }
+
+    R4DetailGrassMotionSnapshot motion;
+    if (!CaptureMetalR4EngineDetailGrassMotion(motion, error) || !motion.valid)
+    {
+        if (error.empty()) error = "detail grass shadow motion snapshot is unavailable";
+        return false;
+    }
+    const Matrix4 inverseLightView = inverseRigidTransform(lightView);
+    std::uint32_t width = 0u, height = 0u;
+    backend.DrawableSize(width, height);
+    if (width == 0u || height == 0u)
+    {
+        error = "detail grass shadow draw rejected a zero-sized drawable";
+        return false;
+    }
+    m_telemetry.shadowDraws = 0u;
+    m_telemetry.shadowCulledBatches = 0u;
+    m_telemetry.shadowRejected = 0u;
+    // The shadow tile matrices and lighting/fog globals are invariant for
+    // every detail batch in this call. Upload these shared blocks only when
+    // the first batch survives culling; per-instance vertex globals remain
+    // unique to each draw below.
+    std::vector<std::uint8_t> transforms(kTransformsSize);
+    std::memcpy(transforms.data(), &lightViewProjection, sizeof(lightViewProjection));
+    std::memcpy(transforms.data() + 64u, &lightView, 48u);
+    std::memcpy(transforms.data() + 128u, &inverseLightView, 48u);
+    std::vector<std::uint8_t> statics(kStaticGlobalsSize);
+    std::memcpy(statics.data(), &lightView, 48u);
+    std::memcpy(statics.data() + 64u, &inverseLightView, 48u);
+    std::memcpy(statics.data() + 128u, &lightProjection, sizeof(lightProjection));
+    std::memcpy(statics.data() + 192u, &lightViewProjection, sizeof(lightViewProjection));
+    const float fogRange = view.fogFar - view.fogNear;
+    const float fogInverse = fogRange > 1.0e-5f ? 1.0f / fogRange : 0.0f;
+    putFloat4(statics, 256u, view.timeSeconds, view.timeSeconds * 10.0f,
+        view.timeSeconds / 10.0f, std::sin(view.timeSeconds));
+    putFloat4(statics, 288u, -view.fogNear * fogInverse, view.fogNear,
+        view.fogFar, fogInverse);
+    putFloat4(statics, 304u, view.fogColor[0], view.fogColor[1], view.fogColor[2], view.fogDensity);
+    putFloat4(statics, 320u, view.ambient[0], view.ambient[1], view.ambient[2], 0.0f);
+    putFloat4(statics, 336u, view.sunColor[0], view.sunColor[1], view.sunColor[2], 0.0f);
+    putFloat4(statics, 352u, view.sunDirection[0], view.sunDirection[1], view.sunDirection[2], 0.0f);
+    putFloat4(statics, 368u, view.hemiColor[0], view.hemiColor[1], view.hemiColor[2], view.hemiColor[3]);
+    putFloat4(statics, 384u, view.eye[0], view.eye[1], view.eye[2], 0.0f);
+    putFloat4(statics, 416u, static_cast<float>(width), static_cast<float>(height),
+        1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height));
+    R4FrameBufferSlice transformsSlice;
+    R4FrameBufferSlice staticGlobalsSlice;
+    bool sharedShadowGlobalsUploaded = false;
+    for (Impl::Draw& draw : m_impl->draws)
+    {
+        if (isOutsideMetalClipVolume(draw.bounds, lightViewProjection))
+        {
+            ++m_telemetry.shadowCulledBatches;
+            continue;
+        }
+        std::vector<std::uint8_t> vs(kVertexGlobalsSize);
+        std::memcpy(vs.data(), &lightViewProjection, sizeof(lightViewProjection));
+        std::memcpy(vs.data() + 64u, &lightViewProjection, sizeof(lightViewProjection));
+        putFloat4(vs, 2224u, 1.0f / 16384.0f, 1.0f / 16384.0f, 0.0f, 0.0f);
+        putFloat4(vs, 2240u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+        putFloat4(vs, 2256u, 0.0f, 0.0f, 0.0f, 0.0f);
+        std::memcpy(vs.data() + 192u, motion.previousBenders.data(), sizeof(motion.previousBenders));
+        std::memcpy(vs.data() + 704u, motion.currentBenders.data(), sizeof(motion.currentBenders));
+        putFloat4(vs, 1216u, motion.bendersSetup[0], motion.bendersSetup[1],
+            motion.bendersSetup[2], motion.bendersSetup[3]);
+        std::memcpy(vs.data() + 2208u, &motion.grassAlign, sizeof(motion.grassAlign));
+        putFloat4(vs, 6176u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+        putFloat4(vs, 6192u, motion.windParams[0], motion.windParams[1],
+            motion.windParams[2], motion.windParams[3]);
+        putFloat4(vs, 6208u, motion.windSetupGrass[0], motion.windSetupGrass[1],
+            motion.windSetupGrass[2], motion.windSetupGrass[3]);
+        putFloat4(vs, 6224u, motion.windSetupTrees[0], motion.windSetupTrees[1],
+            motion.windSetupTrees[2], motion.windSetupTrees[3]);
+        putFloat4(vs, 6240u, motion.windAnimation[0], motion.windAnimation[1],
+            motion.windAnimation[2], motion.windAnimation[3]);
+        putFloat4(vs, 6256u, motion.windAnimationPrevious[0], motion.windAnimationPrevious[1],
+            motion.windAnimationPrevious[2], motion.windAnimationPrevious[3]);
+        for (std::size_t instanceIndex = 0; instanceIndex < draw.instances.size(); ++instanceIndex)
+        {
+            const R4DetailGrassInstance& instance = draw.instances[instanceIndex];
+            const float fadeScale = detailGrassShadowFadeScale(instance, shadow);
+            // Windows stores the decompressed slot sphere center in both
+            // Item.position and the source Item.distance (squared). Local
+            // lights reject at full 3D light range, then fade by squared XZ
+            // distance from that same Item.position.
+            // Keep the source alpha for positive scales; at zero scale clear
+            // alpha so wind offsets cannot rasterize degenerate matrix pixels.
+            const float matrixScale = fadeScale > 0.0f ? fadeScale : 0.0f;
+            putFloat4(vs, 1232u + instanceIndex * 16u,
+                instance.terrainNormal[0], instance.terrainNormal[1], instance.terrainNormal[2],
+                matrixScale > 0.0f ? instance.alpha : 0.0f);
+            const std::size_t matrix = 2272u + instanceIndex * 64u;
+            putFloat4(vs, matrix, instance.transform[0] * matrixScale, instance.transform[4] * matrixScale,
+                instance.transform[8] * matrixScale, instance.transform[12]);
+            putFloat4(vs, matrix + 16u, instance.transform[1] * matrixScale,
+                instance.transform[5] * matrixScale, instance.transform[9] * matrixScale, instance.transform[13]);
+            putFloat4(vs, matrix + 32u, instance.transform[2] * matrixScale,
+                instance.transform[6] * matrixScale, instance.transform[10] * matrixScale, instance.transform[14]);
+            putFloat4(vs, matrix + 48u, instance.sun, instance.sun, instance.sun, instance.hemi);
+        }
+        R4FrameBufferSlice vertexGlobalsSlice;
+        if (!backend.UploadFrameData(vs.data(), vs.size(), 256u, vertexGlobalsSlice, error))
+            return false;
+        if (!sharedShadowGlobalsUploaded)
+        {
+            if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u, transformsSlice, error) ||
+                !backend.UploadFrameData(statics.data(), statics.size(), 256u, staticGlobalsSlice, error))
+                return false;
+            sharedShadowGlobalsUploaded = true;
+        }
+        R4MscStageBindings vertex{R4ShaderStage::Vertex, 120u, {{R4MscResourceType::Texture, 0u,
+            {}, 0u, 0u, m_impl->wavesTexture}, {R4MscResourceType::ConstantBuffer, 24u,
+            vertexGlobalsSlice.buffer, vertexGlobalsSlice.offset, vertexGlobalsSlice.size},
+            {R4MscResourceType::ConstantBuffer, 48u, transformsSlice.buffer,
+                transformsSlice.offset, transformsSlice.size}, {R4MscResourceType::ConstantBuffer, 72u,
+                staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size},
+            {R4MscResourceType::Sampler, 96u, {}, 0u, 0u, {}, m_impl->wavesSampler}}};
+        R4MscStageBindings fragment{R4ShaderStage::Fragment, 72u, {{R4MscResourceType::Texture, 0u,
+            {}, 0u, 0u, draw.baseTexture}, {R4MscResourceType::ConstantBuffer, 24u,
+            staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size},
+            {R4MscResourceType::Sampler, 48u, {}, 0u, 0u, {}, m_impl->baseSampler}}};
+        R4IndexedDrawDesc indexed;
+        indexed.indexBuffer = draw.indices;
+        indexed.indexCount = draw.indexCount;
+        indexed.indexType = R4IndexType::UInt16;
+        if (!backend.BindGraphicsPipeline(m_impl->shadowPipeline, error) ||
+            !backend.BindVertexBuffer(6u, draw.vertices, 0u, error) ||
+            !backend.BindMscResources(vertex, error) || !backend.BindMscResources(fragment, error) ||
+            !backend.DrawIndexed(indexed, error))
+            return false;
+        ++m_telemetry.shadowDraws;
     }
     return true;
 }
@@ -1083,8 +1347,16 @@ bool RunR4DetailGrassAdapterSelfTest(std::string& error)
     R4DetailGrassSnapshot snapshot;
     if (!LoadR4DetailGrassSnapshot(bytes, snapshot, error) || snapshot.models.size() != 1u ||
         snapshot.slots.size() != 1u || snapshot.slots[0].modelIds[0] != 0u ||
-        snapshot.slots[0].modelIds[1] != kEmptyModelId)
+        snapshot.slots[0].modelIds[1] != kEmptyModelId ||
+        std::abs(snapshot.slots[0].sun - 1.0f) > 1e-4f ||
+        std::abs(snapshot.slots[0].hemi - 1.0f) > 1e-4f ||
+        std::abs(snapshot.slots[0].yBase - 0.0f) > 1e-4f ||
+        std::abs(snapshot.slots[0].yHeight - 2.0f) > 1e-4f ||
+        snapshot.slots[0].palette[0][0] != 0x0fu)
+    {
+        if (error.empty()) error = "level.details v4 slot unpacking verification failed";
         return false;
+    }
     std::vector<std::uint8_t> v3Bytes;
     const auto appendV3U32 = [&v3Bytes](const std::uint32_t value) {
         const std::size_t offset = v3Bytes.size();
@@ -1120,7 +1392,11 @@ bool RunR4DetailGrassAdapterSelfTest(std::string& error)
     R4DetailGrassSnapshot v3Snapshot;
     if (!LoadR4DetailGrassSnapshot(v3Bytes, v3Snapshot, error) || v3Snapshot.version != kDetailVersion3 ||
         v3Snapshot.slots.size() != 1u || v3Snapshot.slots[0].modelIds[0] != 0u ||
-        v3Snapshot.slots[0].modelIds[1] != kEmptyModelId)
+        v3Snapshot.slots[0].modelIds[1] != kEmptyModelId ||
+        std::abs(v3Snapshot.slots[0].sun - 1.0f) > 1e-4f ||
+        std::abs(v3Snapshot.slots[0].hemi - 1.0f) > 1e-4f ||
+        std::abs(v3Snapshot.slots[0].yBase - 0.0f) > 1e-4f ||
+        std::abs(v3Snapshot.slots[0].yHeight - 2.0f) > 1e-4f)
     {
         if (error.empty()) error = "level.details v3 conversion self-test failed";
         return false;
@@ -1129,6 +1405,9 @@ bool RunR4DetailGrassAdapterSelfTest(std::string& error)
     for (R4DetailGrassInstance& instance : instances)
     {
         instance.transform[0] = instance.transform[5] = instance.transform[10] = instance.transform[15] = 1.0f;
+        instance.shadowFadePosition = {4.0f, 2.0f, 6.0f};
+        instance.shadowDistanceSquared = 56.0f;
+        instance.hasShadowFadePosition = true;
         instance.terrainNormal = {0.0f, 1.0f, 0.0f};
         instance.sun = 1.0f;
         instance.hemi = 1.0f;
@@ -1140,6 +1419,39 @@ bool RunR4DetailGrassAdapterSelfTest(std::string& error)
         vertices[3].misc[3] != 4 || vertices.back().misc[3] != 240 || indices.back() != 182u)
     {
         if (error.empty()) error = "detail grass batch self-test produced an unexpected ABI";
+        return false;
+    }
+    std::vector<R4DetailGrassInstance> missingFadePosition = instances;
+    missingFadePosition[0].hasShadowFadePosition = false;
+    if (RepackR4DetailGrassBatch(snapshot.models[0], missingFadePosition, vertices, indices, error))
+    {
+        error = "detail grass repack accepted an instance without the Windows slot-center fade metadata";
+        return false;
+    }
+    R4DetailGrassShadowState localShadow;
+    localShadow.fadeFromLight = true;
+    localShadow.lightPosition = {0.0f, 0.0f, 0.0f};
+    localShadow.lightRange = 4.0f;
+    R4DetailGrassInstance inRange = instances[0];
+    inRange.shadowFadePosition = {2.0f, 1.0f, 2.0f};
+    R4DetailGrassInstance atRange = inRange;
+    atRange.shadowFadePosition = {0.0f, 4.0f, 0.0f};
+    R4DetailGrassInstance outsideRange = inRange;
+    outsideRange.shadowFadePosition = {0.0f, 4.1f, 0.0f};
+    if (std::abs(detailGrassShadowFadeScale(inRange, localShadow) - 0.96f) > 1e-5f ||
+        detailGrassShadowFadeScale(atRange, localShadow) != 0.0f ||
+        detailGrassShadowFadeScale(outsideRange, localShadow) != 0.0f)
+    {
+        error = "detail grass local shadow did not apply Windows full-3D range before XZ fade";
+        return false;
+    }
+    R4DetailGrassShadowState sunShadow;
+    sunShadow.fadeDistance = 100.0f;
+    R4DetailGrassInstance sunFade = inRange;
+    sunFade.shadowDistanceSquared = 110.0f;
+    if (std::abs(detailGrassShadowFadeScale(sunFade, sunShadow) - 0.95f) > 1e-5f)
+    {
+        error = "detail grass sun fade did not use squared source camera distance";
         return false;
     }
     instances.emplace_back();

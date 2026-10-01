@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -629,7 +631,10 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
         return static_cast<std::uint32_t>((9199940308585234877ull * value +
             9199940308585234877ull) >> 32u);
     };
-    std::unordered_map<std::uint16_t, std::vector<R4DetailGrassInstance>> instances;
+    // Key: (modelId, chunkZ, chunkX)
+    // Grouping instances into spatial chunks (4x4 slots = 8x8m) provides tight bounding boxes
+    // and eliminates cross-batch reshuffling when the camera crosses slot boundaries.
+    std::map<std::tuple<std::uint16_t, int, int>, std::vector<R4DetailGrassInstance>> chunkInstances;
     const int eyeX = iFloor(eye[0] / dm_slot_size + .5f);
     const int eyeZ = iFloor(eye[2] / dm_slot_size + .5f);
     // Keep the exact active CDetailManager cache footprint: cg2w_X/Z maps
@@ -661,7 +666,8 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
                 static_cast<std::size_t>(localZ) * snapshot.sizeX + static_cast<std::size_t>(localX)];
             Fvector center; center.set((sx + 0.5f) * dm_slot_size,
                 slot.yBase + slot.yHeight * 0.5f, (sz + 0.5f) * dm_slot_size);
-            Fvector half; half.set(dm_slot_size * 0.5f, slot.yHeight * 0.5f, dm_slot_size * 0.5f);
+            Fvector half; half.set(dm_slot_size * 0.5f + EPS_L,
+                slot.yHeight * 0.5f + EPS_L, dm_slot_size * 0.5f + EPS_L);
             // UpdateVisibleM ultimately tests the decompressed slot sphere
             // against dm_fade.  We only reject when this conservative raw
             // slot sphere is wholly outside the same active distance, so an
@@ -686,6 +692,17 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
             const std::uint32_t seed = hash2(static_cast<std::uint32_t>(sx), static_cast<std::uint32_t>(sz));
             CRandom selection(0x12071980u ^ seed), randomJitter(0x12071980u ^ seed),
                 yaw(0x12071980u ^ seed), scale(0x12071980u ^ seed);
+            struct PendingSlotInstance
+            {
+                std::uint16_t modelId = 0;
+                int chunkX = 0;
+                int chunkZ = 0;
+                R4DetailGrassInstance instance;
+            };
+            std::vector<PendingSlotInstance> pendingSlotInstances;
+            Fbox slotBounds;
+            slotBounds.invalidate();
+            bool hasSlotBounds = false;
             for (std::uint32_t z = 0; z <= size; ++z)
             {
                 for (std::uint32_t x = 0; x <= size; ++x)
@@ -711,18 +728,30 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
                     const std::uint16_t modelId = selectedCount == 1u ? selected[0] :
                         selected[selection.randI(static_cast<u32>(selectedCount))];
                     const R4DetailGrassModel& model = snapshot.models[modelId];
-                    Fvector position; position.set((static_cast<float>(x) / size) * dm_slot_size + sx * dm_slot_size +
-                        randomJitter.randFs(jitter), slot.yBase + slot.yHeight,
-                        (static_cast<float>(z) / size) * dm_slot_size + sz * dm_slot_size + randomJitter.randFs(jitter));
+                    Fvector position; position.set((static_cast<float>(x) / size) * dm_slot_size +
+                        sx * dm_slot_size - EPS_L + randomJitter.randFs(jitter),
+                        slot.yBase + slot.yHeight + EPS_L,
+                        (static_cast<float>(z) / size) * dm_slot_size +
+                        sz * dm_slot_size - EPS_L + randomJitter.randFs(jitter));
                     Fvector direction; direction.set(0.0f, -1.0f, 0.0f);
                     float groundY = slot.yBase - 5.0f;
                     Fvector normal; normal.set(0.0f, 0.0f, 0.0f);
+                    bool noPush = false;
                     for (u32 triangleIndex = 0u; triangleIndex < xrc.r_count(); ++triangleIndex)
                     {
                         CDB::TRI& triangle = triangles[xrc.r_begin()[triangleIndex].id];
                         SGameMtl* material = GMLib.GetMaterialByIdx(triangle.material);
                         if (material && material->Flags.test(SGameMtl::flPassable))
                             continue;
+                        if (RImplementation.pOutdoorSector)
+                        {
+                            CSector* sector = static_cast<CSector*>(RImplementation.getSector(triangle.sector));
+                            if (sector != RImplementation.pOutdoorSector)
+                            {
+                                noPush = true;
+                                break;
+                            }
+                        }
                         Fvector triangleVertices[3] = {vertices[triangle.verts[0]], vertices[triangle.verts[1]],
                             vertices[triangle.verts[2]]};
                         float u = 0.0f, v = 0.0f, range = 0.0f;
@@ -740,7 +769,7 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
                     }
                     const float slope = scale.randF(ps_ssfx_terrain_grass_slope * .8f,
                         ps_ssfx_terrain_grass_slope);
-                    if (groundY < slot.yBase || normal.dotproduct(direction) > -(1.0f - slope))
+                    if (noPush || groundY < slot.yBase || normal.dotproduct(direction) > -(1.0f - slope))
                     {
                         ++frame.rejectedInstances;
                         continue;
@@ -773,18 +802,55 @@ bool BuildMetalR4EngineGroundedDetailGrassFrame(
                     instance.terrainNormal = {normal.x, normal.y, normal.z};
                     instance.sun = slot.sun;
                     instance.hemi = slot.hemi;
+                    // cache_Decompress merges each accepted transformed detail
+                    // model AABB into D.vis.box, then getsphere stores this
+                    // center in Item.position. Reconstruct that same source
+                    // center from the accepted grounded instances before
+                    // splitting them into Metal batches.
+                    Fbox modelBounds;
+                    modelBounds.min.set(model.boundsMinimum[0], model.boundsMinimum[1], model.boundsMinimum[2]);
+                    modelBounds.max.set(model.boundsMaximum[0], model.boundsMaximum[1], model.boundsMaximum[2]);
+                    Fbox transformedModelBounds;
+                    transformedModelBounds.xform(modelBounds, transform);
+                    if (!hasSlotBounds)
+                    {
+                        slotBounds = transformedModelBounds;
+                        hasSlotBounds = true;
+                    }
+                    else
+                        slotBounds.merge(transformedModelBounds);
                     if ((model.flags & DO_NO_WAVING) != 0u)
                         ++frame.stillInstances;
-                    instances[modelId].push_back(instance);
+                    const int chunkX = sx >= 0 ? (sx / 4) : ((sx - 3) / 4);
+                    const int chunkZ = sz >= 0 ? (sz / 4) : ((sz - 3) / 4);
+                    pendingSlotInstances.push_back({modelId, chunkX, chunkZ, instance});
                     ++frame.groundedInstances;
+                }
+            }
+            if (hasSlotBounds)
+            {
+                Fvector shadowFadePosition;
+                slotBounds.getcenter(shadowFadePosition);
+                const float fadeDx = shadowFadePosition.x - eye[0];
+                const float fadeDy = shadowFadePosition.y - eye[1];
+                const float fadeDz = shadowFadePosition.z - eye[2];
+                const float shadowDistanceSquared = fadeDx * fadeDx + fadeDy * fadeDy + fadeDz * fadeDz;
+                for (PendingSlotInstance& pending : pendingSlotInstances)
+                {
+                    pending.instance.shadowFadePosition = {shadowFadePosition.x,
+                        shadowFadePosition.y, shadowFadePosition.z};
+                    pending.instance.shadowDistanceSquared = shadowDistanceSquared;
+                    pending.instance.hasShadowFadePosition = true;
+                    chunkInstances[std::make_tuple(pending.modelId, pending.chunkZ, pending.chunkX)]
+                        .push_back(pending.instance);
                 }
             }
         }
     }
-    for (auto& entry : instances)
+    for (auto& entry : chunkInstances)
     {
         std::vector<R4DetailGrassInstance>& source = entry.second;
-        const std::uint16_t modelId = entry.first;
+        const std::uint16_t modelId = std::get<0>(entry.first);
         for (std::size_t first = 0; first < source.size(); first += kR4DetailGrassBatchSize)
         {
             const std::size_t count = std::min(kR4DetailGrassBatchSize, source.size() - first);

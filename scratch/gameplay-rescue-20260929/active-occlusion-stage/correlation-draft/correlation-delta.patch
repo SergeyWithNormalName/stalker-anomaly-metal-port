@@ -1,0 +1,133 @@
+--- scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/prestate/IR4Backend.h	2026-09-29 15:31:52
++++ scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/draft/IR4Backend.h	2026-09-29 15:33:22
+@@ -186,6 +186,9 @@
+ struct R4WholeLightVisibilitySample
+ {
+     std::uint32_t engineFrame = 0u;
++    // Optional CPU-prediction provenance. Zero preserves GPU-only observations.
++    // Nonzero values identify one CPU observation scope within the acquired frame.
++    std::uint64_t cpuObservationScopeId = 0u;
+     std::int32_t batchId = -1;
+     std::uint64_t lightId = 0u;
+     std::uint64_t parentLightId = 0u;
+--- scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/prestate/MetalR4Backend.mm	2026-09-29 15:31:52
++++ scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/draft/MetalR4Backend.mm	2026-09-29 15:33:22
+@@ -197,10 +197,10 @@
+             const bool zero = group.passedSamples == 0u;
+             std::fprintf(stderr,
+                 "METAL_WHOLE_LIGHT_VISIBILITY status=complete submitted_serial=%llu acquire_epoch=%llu "
+-                "engine_frame=%u group_kind=%s group_id=%llu expected_faces=%u "
++                "engine_frame=%u cpu_observation_scope=%llu group_kind=%s group_id=%llu expected_faces=%u "
+                 "deferred_receiver_samples=%llu zero_deferred_receiver_samples=%s\n",
+                 static_cast<unsigned long long>(serial), static_cast<unsigned long long>(acquireEpoch),
+-                group.engineFrame,
++                group.engineFrame, static_cast<unsigned long long>(group.cpuObservationScopeId),
+                 group.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
+                 static_cast<unsigned long long>(group.groupId), group.expectedFaceCount,
+                 static_cast<unsigned long long>(group.passedSamples), zero ? "true" : "false");
+@@ -209,10 +209,10 @@
+         {
+             std::fprintf(stderr,
+                 "METAL_WHOLE_LIGHT_VISIBILITY status=invalid submitted_serial=%llu acquire_epoch=%llu "
+-                "engine_frame=%u group_kind=%s group_id=%llu expected_faces=%u "
++                "engine_frame=%u cpu_observation_scope=%llu group_kind=%s group_id=%llu expected_faces=%u "
+                 "deferred_receiver_samples=NA zero_deferred_receiver_samples=NA reason=%s\n",
+                 static_cast<unsigned long long>(serial), static_cast<unsigned long long>(acquireEpoch),
+-                group.engineFrame,
++                group.engineFrame, static_cast<unsigned long long>(group.cpuObservationScopeId),
+                 group.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
+                 static_cast<unsigned long long>(group.groupId), group.expectedFaceCount,
+                 status != MTLCommandBufferStatusCompleted ? "command-buffer-not-completed" :
+@@ -229,10 +229,11 @@
+         const std::string sampleValue = hasValue ? std::to_string(values[record.slot]) : "NA";
+         std::fprintf(stderr,
+             "METAL_WHOLE_LIGHT_VISIBILITY_FACE status=%s submitted_serial=%llu acquire_epoch=%llu "
+-            "engine_frame=%u batch_id=%d light_id=%llu parent_light_id=%llu face=%u "
++            "engine_frame=%u cpu_observation_scope=%llu batch_id=%d light_id=%llu parent_light_id=%llu face=%u "
+             "group_kind=%s expected_faces=%u deferred_receiver_samples=%s\n",
+             hasValue ? "VALID" : "INVALID", static_cast<unsigned long long>(serial),
+-            static_cast<unsigned long long>(acquireEpoch), sample.engineFrame, sample.batchId,
++            static_cast<unsigned long long>(acquireEpoch), sample.engineFrame,
++            static_cast<unsigned long long>(sample.cpuObservationScopeId), sample.batchId,
+             static_cast<unsigned long long>(sample.lightId),
+             static_cast<unsigned long long>(sample.parentLightId), sample.face,
+             sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
+--- scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/prestate/R4WholeLightVisibilityLedger.h	2026-09-29 15:31:52
++++ scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/draft/R4WholeLightVisibilityLedger.h	2026-09-29 15:33:22
+@@ -22,6 +22,7 @@
+ struct R4WholeLightVisibilityGroupResult
+ {
+     std::uint32_t engineFrame = 0u;
++    std::uint64_t cpuObservationScopeId = 0u;
+     std::int32_t batchId = -1;
+     std::uint64_t lightId = 0u;
+     std::uint64_t groupId = 0u;
+@@ -57,7 +58,8 @@
+         });
+         if (found == groups.end())
+         {
+-            groups.push_back({sample.engineFrame, sample.batchId, sample.lightId, groupKey,
++            groups.push_back({sample.engineFrame, sample.cpuObservationScopeId,
++                sample.batchId, sample.lightId, groupKey,
+                 sample.groupKind, sample.expectedFaceCount, false, 0u});
+         }
+     }
+@@ -104,6 +106,7 @@
+             ++rowCount;
+             const bool faceInMaskRange = sample.face < 6u;
+             valid = valid && sample.engineFrame == group.engineFrame &&
++                sample.cpuObservationScopeId == group.cpuObservationScopeId &&
+                 sample.expectedFaceCount == group.expectedFaceCount && record.encoded &&
+                 R4WholeLightVisibilitySampleValid(sample) && faceInMaskRange &&
+                 record.slot < valueCount && record.slot < R4WholeLightVisibilityMaxSlots;
+--- scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/prestate/R4WholeLightVisibilityLedgerProbe.cpp	2026-09-29 15:32:33
++++ scratch/gameplay-rescue-20260929/active-occlusion-stage/correlation-draft/draft/tests/R4WholeLightVisibilityLedgerProbe.cpp	2026-09-29 15:33:22
+@@ -8,10 +8,12 @@
+ {
+ using namespace xray::metal;
+ 
+-R4WholeLightVisibilityRecord face(std::uint32_t index, std::int32_t batch, std::uint32_t slot)
++R4WholeLightVisibilityRecord face(std::uint32_t index, std::int32_t batch,
++    std::uint32_t slot, std::uint64_t cpuScope = 0u)
+ {
+     R4WholeLightVisibilitySample sample;
+     sample.engineFrame = 7u;
++    sample.cpuObservationScopeId = cpuScope;
+     sample.batchId = batch;
+     sample.lightId = 900u + index;
+     sample.parentLightId = 42u;
+@@ -32,6 +34,24 @@
+         groups[0].batchId == -1;
+ }
+ 
++bool cpuObservationScopeCorrelation()
++{
++    constexpr std::uint64_t scope = 0x4350554f42530017ull;
++    std::vector<R4WholeLightVisibilityRecord> consistent;
++    for (std::uint32_t i = 0; i < 6u; ++i)
++        consistent.push_back(face(i, i < 3u ? 21 : 22, i, scope));
++    const std::array<std::uint64_t, 6> values{{1, 2, 3, 4, 5, 6}};
++    auto groups = R4ClassifyWholeLightVisibility(consistent, values.data(), values.size(), true);
++    if (groups.size() != 1u || !groups[0].complete ||
++        groups[0].cpuObservationScopeId != scope)
++        return false;
++
++    consistent[4].sample.cpuObservationScopeId = scope + 1u;
++    groups = R4ClassifyWholeLightVisibility(consistent, values.data(), values.size(), true);
++    return groups.size() == 1u && !groups[0].complete &&
++        groups[0].cpuObservationScopeId == scope && groups[0].passedSamples == 0u;
++}
++
+ bool invalidCases()
+ {
+     std::vector<R4WholeLightVisibilityRecord> first, second;
+@@ -139,7 +159,8 @@
+ 
+ int main()
+ {
+-    if (!omniAcrossBatches() || !invalidCases() || !singleSpot())
++    if (!omniAcrossBatches() || !cpuObservationScopeCorrelation() ||
++        !invalidCases() || !singleSpot())
+     {
+         std::fprintf(stderr, "WHOLE_LIGHT_VISIBILITY_LEDGER status=FAIL\n");
+         return 1;

@@ -34,6 +34,7 @@
 #include <luabind/detail/class_registry.hpp>
 #include <luabind/detail/class_cache.hpp>
 #include <luabind/detail/implicit_cast.hpp>
+#include <luabind/detail/narrow_numeric_cast.hpp>
 
 #include <sm_boost/typelist.hpp>
 
@@ -353,7 +354,7 @@ namespace luabind { namespace detail
 			{
 				return 0;
 			}
-			return static_cast<char>(lua_tonumber(L, index));
+			return detail::narrow_numeric_cast<char>(lua_tonumber(L, index));
 		}
 		PRIMITIVE_MATCHER(char)
 		{
@@ -373,7 +374,7 @@ namespace luabind { namespace detail
 			{
 				return 0;
 			}
-			return static_cast<char>(lua_tonumber(L, index));
+			return detail::narrow_numeric_cast<signed char>(lua_tonumber(L, index));
 		}
 		PRIMITIVE_MATCHER(signed char)
 		{
@@ -393,7 +394,7 @@ namespace luabind { namespace detail
 			{
 				return 0;
 			}
-			return static_cast<unsigned char>(lua_tonumber(L, index));
+			return detail::narrow_numeric_cast<unsigned char>(lua_tonumber(L, index));
 		}
 		PRIMITIVE_MATCHER(unsigned char)
 		{
@@ -414,7 +415,7 @@ namespace luabind { namespace detail
 				return 0;
 			}
 
-			return static_cast<short>(lua_tonumber(L, index));
+			return detail::narrow_numeric_cast<short>(lua_tonumber(L, index));
 		}
 		PRIMITIVE_MATCHER(short)
 		{
@@ -433,7 +434,7 @@ namespace luabind { namespace detail
 			{
 				return 0;
 			}
-			return static_cast<unsigned short>(lua_tonumber(L, index));
+			return detail::narrow_numeric_cast<unsigned short>(lua_tonumber(L, index));
 		}
 		PRIMITIVE_MATCHER(unsigned short)
 		{

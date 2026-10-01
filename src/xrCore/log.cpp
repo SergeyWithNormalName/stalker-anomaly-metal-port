@@ -304,12 +304,19 @@ void xrLogger::InternalCloseLog()
 	if (tempCopy != nullptr)
 		FS.w_close(tempCopy);
 
-	UnpauseLogging();
+	// The worker owns this object's guards until it has drained the final wake.
+	// A detached worker must therefore acknowledge exit before the logger (and
+	// its mutex-backed POSIX event shim) can be destroyed.
+	SetEvent(hLogThread);
+	while (!bWorkerExited.load(std::memory_order_acquire))
+		Sleep(1);
+	CloseHandle(hLogThread);
 }
 
 xrLogger::xrLogger()
 	: logFile(nullptr), bFastDebugLog(false), 
 	bIsAlive(true),
+	bWorkerExited(false),
 	bFlushRequested(false),
 	bImmediateMode(false)
 {
@@ -438,7 +445,7 @@ void xrLogger::LogThreadEntry()
 	{
 		if (!bIsAlive)
 		{
-			CloseHandle(hLogThread);
+			bWorkerExited.store(true, std::memory_order_release);
 			return;
 		}
 		

@@ -462,9 +462,34 @@ typedef struct POINT {
 
 #include <SDL.h>
 
+#if defined(__cplusplus)
+extern "C" {
+#endif
+extern SDL_Window* g_mainSdlWindow;
+#if defined(__cplusplus)
+}
+#endif
+
+inline SDL_Window* GetPlatformSdlWindow(HWND hWnd = nullptr) {
+    if (hWnd) return (SDL_Window*)hWnd;
+    SDL_Window* wnd = SDL_GetMouseFocus();
+    if (!wnd) wnd = SDL_GetKeyboardFocus();
+    if (!wnd) wnd = g_mainSdlWindow;
+    return wnd;
+}
+
 inline BOOL GetCursorPos(LPPOINT lpPoint) {
     if (!lpPoint) return FALSE;
     int x = 0, y = 0;
+    SDL_Window* wnd = GetPlatformSdlWindow();
+    if (wnd) {
+        SDL_GetMouseState(&x, &y);
+        int wx = 0, wy = 0;
+        SDL_GetWindowPosition(wnd, &wx, &wy);
+        lpPoint->x = x + wx;
+        lpPoint->y = y + wy;
+        return TRUE;
+    }
     SDL_GetGlobalMouseState(&x, &y);
     lpPoint->x = x;
     lpPoint->y = y;
@@ -472,6 +497,13 @@ inline BOOL GetCursorPos(LPPOINT lpPoint) {
 }
 
 inline BOOL SetCursorPos(int X, int Y) {
+    SDL_Window* wnd = GetPlatformSdlWindow();
+    if (wnd) {
+        int wx = 0, wy = 0;
+        SDL_GetWindowPosition(wnd, &wx, &wy);
+        SDL_WarpMouseInWindow(wnd, X - wx, Y - wy);
+        return TRUE;
+    }
     SDL_WarpMouseGlobal(X, Y);
     return TRUE;
 }
@@ -517,9 +549,10 @@ inline int MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cP
 
 inline BOOL ClientToScreen(HWND hWnd, LPPOINT lpPoint) {
     if (!lpPoint) return FALSE;
-    if (hWnd) {
+    SDL_Window* wnd = GetPlatformSdlWindow(hWnd);
+    if (wnd) {
         int wx = 0, wy = 0;
-        SDL_GetWindowPosition((SDL_Window*)hWnd, &wx, &wy);
+        SDL_GetWindowPosition(wnd, &wx, &wy);
         lpPoint->x += wx;
         lpPoint->y += wy;
     }
@@ -528,9 +561,10 @@ inline BOOL ClientToScreen(HWND hWnd, LPPOINT lpPoint) {
 
 inline BOOL ScreenToClient(HWND hWnd, LPPOINT lpPoint) {
     if (!lpPoint) return FALSE;
-    if (hWnd) {
+    SDL_Window* wnd = GetPlatformSdlWindow(hWnd);
+    if (wnd) {
         int wx = 0, wy = 0;
-        SDL_GetWindowPosition((SDL_Window*)hWnd, &wx, &wy);
+        SDL_GetWindowPosition(wnd, &wx, &wy);
         lpPoint->x -= wx;
         lpPoint->y -= wy;
     }
@@ -1045,6 +1079,13 @@ inline int ToUnicodeEx(UINT wVirtKey, UINT wScanCode, const BYTE *lpKeyState, LP
 #endif
 
 inline LRESULT SendMessage(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (Msg == WM_SYSCOMMAND && wParam == SC_MINIMIZE) {
+        SDL_Window* wnd = GetPlatformSdlWindow(hWnd);
+        if (wnd) {
+            SDL_MinimizeWindow(wnd);
+            return 0;
+        }
+    }
     return 0;
 }
 
@@ -1115,7 +1156,24 @@ inline LRESULT DefWindowProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) 
 #endif
 
 inline int GetSystemMetrics(int nIndex) {
-    return 0;
+    switch (nIndex) {
+    case SM_CXSCREEN: {
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(0, &dm) == 0)
+            return dm.w;
+        return 1920;
+    }
+    case SM_CYSCREEN: {
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(0, &dm) == 0)
+            return dm.h;
+        return 1080;
+    }
+    case SM_SWAPBUTTON:
+        return 0;
+    default:
+        return 0;
+    }
 }
 
 #ifndef GUID_DEFINED

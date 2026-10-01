@@ -14,7 +14,6 @@ protected:
 	ref_sound m_global_sound;
 	xr_deque<CUISequenceItem*> m_sequencer_items;
 
-	bool GrabInput();
 	CUISequenceItem* GetNextItem();
 	shared_str m_start_lua_function;
 	shared_str m_stop_lua_function;
@@ -32,6 +31,8 @@ public:
 	virtual void OnRender();
 	CUIWindow* MainWnd() { return m_UIWindow; }
 	bool IsActive() { return !!m_flags.test(etsActive); }
+	// Whether the current item consumes input or forwards it to the stored receiver.
+	bool GrabInput();
 
 
 	LPCSTR m_name;

@@ -1,0 +1,132 @@
+--- a/src/Layers/xrRenderMetal/IR4Resources.h
++++ b/src/Layers/xrRenderMetal/IR4Resources.h
+@@ -25,6 +25,9 @@
+     R4ResourceStorage storage = R4ResourceStorage::Private;
+     R4BufferUsage usage = R4BufferUsage::Generic;
+     const char* label = nullptr;
++    // Opt-in Shared constants bind their pinned NativeVersion directly; later
++    // CPU updates use the backend's existing copy-on-write versioning.
++    bool versionedConstant = false;
+ };
+ 
+ class IR4Buffer
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -879,6 +879,12 @@
+     R4ResourceStorage Storage() const override { return m_descriptor.storage; }
+     id<MTLBuffer> Native() const { return m_version->buffer; }
+     bool IsFrameUpload() const { return m_frameUpload; }
++    bool IsVersionedConstant() const
++    {
++        return m_descriptor.versionedConstant &&
++            m_descriptor.storage == R4ResourceStorage::Shared &&
++            m_descriptor.usage == R4BufferUsage::Uniform;
++    }
+     std::shared_ptr<void> VersionHandle() const { return m_version; }
+     bool IsVersionInUse() const { return m_version.use_count() > 1; }
+     void ReplaceNative(id<MTLBuffer> buffer)
+@@ -2940,10 +2946,19 @@
+                 if (buffer->Storage() == R4ResourceStorage::Shared &&
+                     !buffer->IsFrameUpload())
+                 {
+-                    const auto* source = static_cast<const std::uint8_t*>(
+-                        buffer->Native().contents) + binding.bufferOffset;
+-                    if (!UploadFrameData(source, size, 256, slice, error))
+-                        return false;
++                    if (buffer->IsVersionedConstant())
++                    {
++                        // Pin this allocation through frame completion. A later
++                        // UpdateShared then clones before mutating the live version.
++                        retainFrameResource(*context, buffer->VersionHandle());
++                    }
++                    else
++                    {
++                        const auto* source = static_cast<const std::uint8_t*>(
++                            buffer->Native().contents) + binding.bufferOffset;
++                        if (!UploadFrameData(source, size, 256, slice, error))
++                            return false;
++                    }
+                 }
+                 constantSlices[entryIndex] = slice;
+                 const std::shared_ptr<MetalBuffer> boundBuffer =
+@@ -6074,13 +6089,20 @@
+                 }
+             }
+         }
+-        for (R4BufferUsage usage : {R4BufferUsage::Vertex, R4BufferUsage::Index})
++        for (R4BufferUsage usage : {R4BufferUsage::Vertex, R4BufferUsage::Index,
++                R4BufferUsage::Uniform})
+         {
+             id<MTLBuffer> native = [device newBufferWithLength:PatternSize
+                 options:MTLResourceStorageModeShared];
++            const bool versionedConstant = usage == R4BufferUsage::Uniform;
+             R4BufferDesc descriptor{PatternSize, R4ResourceStorage::Shared, usage,
+-                "E02 Shared version probe"};
++                "E02 Shared version probe", versionedConstant};
+             MetalBuffer legacy(native, descriptor, PatternSize);
++            if (legacy.IsVersionedConstant() != versionedConstant)
++            {
++                error = "Shared versioned-constant descriptor flag was not preserved";
++                return false;
++            }
+             std::array<std::uint8_t, PatternSize> first{};
+             std::array<std::uint8_t, PatternSize> second{};
+             first.fill(0x51);
+@@ -6100,7 +6122,7 @@
+             const std::shared_ptr<void> secondVersion = legacy.VersionHandle();
+             if (legacy.Native() == firstNative)
+             {
+-                error = "bound Shared vertex/index buffer was not versioned";
++                error = "bound Shared buffer was not versioned";
+                 return false;
+             }
+             [blit copyFromBuffer:legacy.Native() sourceOffset:0 toBuffer:readback
+@@ -6119,7 +6141,7 @@
+                 !std::all_of(result + PatternSize, result + 2 * PatternSize,
+                     [](std::uint8_t value) { return value == 0xa6; }))
+             {
+-                error = "Shared vertex/index native versions changed before completion";
++                error = "Shared native versions changed before completion";
+                 return false;
+             }
+         }
+--- a/src/Layers/xrRenderMetal/MetalBootstrap.mm
++++ b/src/Layers/xrRenderMetal/MetalBootstrap.mm
+@@ -924,6 +924,12 @@
+     return value && std::strcmp(value, "1") == 0;
+ }
+ 
++bool versionedStaticGlobalsOptedIn()
++{
++    const char* value = std::getenv("XRAY_METAL_VERSIONED_STATIC_GLOBALS");
++    return value && std::strcmp(value, "1") == 0;
++}
++
+ bool activeOcclusionFrameInWindow(const std::uint32_t engineFrame)
+ {
+     return engineFrame >= LevelScene::ActiveOcclusionFirstFrame &&
+@@ -2451,12 +2457,14 @@
+         if (scene.productionMsc)
+         {
+             auto createConstantBuffer = [&resources, &error](
+-                const void* bytes, std::size_t size, const char* label) {
++                const void* bytes, std::size_t size, const char* label,
++                bool versionedConstant = false) {
+                 R4BufferDesc descriptor;
+                 descriptor.size = size;
+                 descriptor.storage = R4ResourceStorage::Shared;
+                 descriptor.usage = R4BufferUsage::Uniform;
+                 descriptor.label = label;
++                descriptor.versionedConstant = versionedConstant;
+                 return resources.CreateBuffer(descriptor, bytes, size, error);
+             };
+ 
+@@ -2666,7 +2674,7 @@
+                     "R4 combine_1 globals b0");
+                 scene.baseLightingStaticGlobals = createConstantBuffer(
+                     lightingStaticGlobals.data(), lightingStaticGlobals.size(),
+-                    "R4 combine_1 static globals b1");
++                    "R4 combine_1 static globals b1", versionedStaticGlobalsOptedIn());
+                 scene.baseLightingDynamicLight = createConstantBuffer(
+                     lightingDynamic.data(), lightingDynamic.size(),
+                     "R4 combine_1 dynamic light b2");

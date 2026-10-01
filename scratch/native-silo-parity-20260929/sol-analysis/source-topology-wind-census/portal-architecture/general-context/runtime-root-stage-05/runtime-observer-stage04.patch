@@ -1,0 +1,60 @@
+diff --git a/src/Layers/xrRender/R_calculate.cpp b/src/Layers/xrRender/R_calculate.cpp
+--- a/src/Layers/xrRender/R_calculate.cpp
++++ b/src/Layers/xrRender/R_calculate.cpp
+@@ -1,4 +1,5 @@
+ #include "stdafx.h"
++#include "../xrRenderMetal/R4PortalGenerationContext.h"
+ #include "../../xrEngine/customhud.h"
+ #include "../../Include/xrRender/R4BackendSelection.h"
+ #if defined(XR_PLATFORM_APPLE)
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -20,10 +20,17 @@
+ // Cocoa owns Objective-C BOOL. Load it before the legacy Windows compatibility
+ // header, whose integer BOOL and interface macro must stay inside this boundary.
+ #import <Cocoa/Cocoa.h>
++// Cocoa exposes BSD and Carbon's ThreadID before the legacy engine headers.
++// Hide those names only while xrCore selects the Apple platform and declares
++// its HANDLE-based thread ID. BOOL/interface/TRUE/FALSE are similarly scoped.
++#pragma push_macro("BSD")
++#pragma push_macro("ThreadID")
+ #pragma push_macro("BOOL")
+ #pragma push_macro("interface")
+ #pragma push_macro("TRUE")
+ #pragma push_macro("FALSE")
++#undef BSD
++#define ThreadID XRAYPortalLegacyThreadID
+ #define BOOL XRAYPortalLegacyBOOL
+ #include "xrCore/xrCore.h"
+ #include "R4PortalGenerationContext.h"
+@@ -31,6 +38,8 @@
+ #pragma pop_macro("TRUE")
+ #pragma pop_macro("interface")
+ #pragma pop_macro("BOOL")
++#pragma pop_macro("ThreadID")
++#pragma pop_macro("BSD")
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <ImageIO/ImageIO.h>
+ 
+diff --git a/src/Layers/xrRenderMetal/R4PortalGenerationContext.h b/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
+--- a/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
++++ b/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
+@@ -49,6 +49,17 @@
+     u32 frameID = 0;
+     Fvector currentEye;
+     Fvector savedEye;
++    std::array<float, 16> currentView{};
++    std::array<float, 16> currentProjection{};
++    u32 width = 0;
++    u32 height = 0;
++    float fovDegrees = 0.f;
++    float geometryLod = 0.f;
++    float discardPixels = 0.f;
++    float discardExponent = 0.f;
++    float discardFadeK = 0.f;
++    float screenFactor = 0.f;
++    float effectiveDiscard = 0.f;
+     Fmatrix fullTransform;
+     float viewportNear = 0.f;
+     float ssaDiscard = 0.f;

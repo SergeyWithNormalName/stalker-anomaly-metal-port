@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-VERSION = 3
+VERSION = 4
 TREE_NAMES = ("gamedata", "db")
 
 
@@ -172,6 +172,42 @@ def add_compatibility_pda_overlay(
     return True
 
 
+def add_compatibility_fix_relations_overlay(
+    winners: dict[str, Candidate],
+    priority: int,
+) -> bool:
+    compat_script = Path(__file__).resolve().parent.parent / "gamedata" / "scripts" / "zzz_fix_relations.script"
+    if not compat_script.is_file():
+        return False
+    relative = "scripts/zzz_fix_relations.script"
+    key = relative.casefold()
+    winners[key] = Candidate(
+        relative,
+        str(compat_script.absolute()),
+        "macOS/xray-monolith compatibility overlay: zzz_fix_relations.script",
+        priority,
+    )
+    return True
+
+
+def add_compatibility_gamepad_overlay(
+    winners: dict[str, Candidate],
+    priority: int,
+) -> bool:
+    compat_script = Path(__file__).resolve().parent.parent / "gamedata" / "scripts" / "gamepad_ui_compat.script"
+    if not compat_script.is_file():
+        return False
+    relative = "scripts/gamepad_ui_compat.script"
+    key = relative.casefold()
+    winners[key] = Candidate(
+        relative,
+        str(compat_script.absolute()),
+        "macOS/xray-monolith compatibility overlay: gamepad_ui_compat.script",
+        priority,
+    )
+    return True
+
+
 def write_symlink_tree(destination: Path, winners: dict[str, Candidate]) -> None:
     for index, candidate in enumerate(sorted(winners.values(), key=lambda item: item.relative_path.casefold()), 1):
         target = destination / candidate.relative_path
@@ -231,6 +267,7 @@ def report(
     case_variants_by_tree: dict[str, dict[str, list[Candidate]]],
     hidden_entries_by_tree: dict[str, list[Candidate]],
     compatibility_overlay_applied: bool,
+    gamepad_compatibility_overlay_applied: bool,
 ) -> dict:
     enabled = [entry for entry in entries if entry.enabled]
     disabled = [entry for entry in entries if not entry.enabled]
@@ -282,12 +319,13 @@ def report(
         "",
         "The active GAMMA profile does not provide `gamedata/scripts/pda_dynamic_tabs.script`, while the native "
         "xray-monolith UI calls `pda_dynamic_tabs.build_extra_tabs`. "
+        + ("The PDA compatibility script was layered after MO2. " if compatibility_overlay_applied else "")
         + (
-            "The one-file macOS/xray-monolith compatibility overlay was therefore layered after MO2."
-            if compatibility_overlay_applied
-            else "No compatibility file was added because GAMMA already supplied it or the source file was absent."
+            "The gamepad UI compatibility script was layered after MO2."
+            if gamepad_compatibility_overlay_applied
+            else "The gamepad UI compatibility source file was absent."
         ),
-        "The previous hand-written script overlay is not used by this profile.",
+        "The gamepad compatibility layer uses a separate script and leaves MO2-provided GAMMA scripts intact.",
         "",
         "## Representative winning paths",
         "",
@@ -365,7 +403,9 @@ def report(
         },
         "compatibility_overlay": {
             "pda_dynamic_tabs_script": compatibility_overlay_applied,
-            "reason": "Native UI invokes it and active GAMMA profile does not provide it.",
+            "gamepad_ui_compat_script": gamepad_compatibility_overlay_applied,
+            "pda_reason": "Native UI invokes it and the active GAMMA profile does not provide it.",
+            "gamepad_reason": "Native gamepad navigation needs semantic callbacks for GAMMA's Lua cell widgets.",
         },
     }
     (stage / "profile-manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -489,6 +529,14 @@ def main() -> int:
             args.compat_pda_script.resolve() if args.compat_pda_script else None,
             len(layers) + 2,
         )
+        add_compatibility_fix_relations_overlay(
+            winners_by_tree["gamedata"],
+            len(layers) + 2,
+        )
+        gamepad_compatibility_overlay_applied = add_compatibility_gamepad_overlay(
+            winners_by_tree["gamedata"],
+            len(layers) + 3,
+        )
 
         for name in TREE_NAMES:
             print(f"Writing {name}: {len(winners_by_tree[name]):,} symlinks…", flush=True)
@@ -509,6 +557,7 @@ def main() -> int:
             case_variants_by_tree,
             hidden_entries_by_tree,
             compatibility_overlay_applied,
+            gamepad_compatibility_overlay_applied,
         )
 
         previous = output.with_name(output.name + ".previous")

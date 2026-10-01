@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 
@@ -117,7 +118,7 @@ void putFloat4(std::array<std::uint8_t, AoGlobalsSize>& bytes, const std::size_t
     std::memcpy(bytes.data() + offset, value.data(), sizeof(float) * value.size());
 }
 
-bool updateFullscreenVertices(IR4Resources& resources, const std::shared_ptr<IR4Buffer>& buffer,
+bool uploadFullscreenVertices(IR4Backend& backend, R4FrameBufferSlice& slice,
     const std::uint32_t width, const std::uint32_t height, const float texcoordExtent,
     std::string& error)
 {
@@ -127,7 +128,32 @@ bool updateFullscreenVertices(IR4Resources& resources, const std::shared_ptr<IR4
         {{texcoordExtent, texcoordExtent}, {static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f}},
         {{texcoordExtent, 0.0f}, {static_cast<float>(width), 0.0f, 0.0f, 1.0f}},
     }};
-    return resources.UpdateBuffer(buffer, 0u, vertices.data(), sizeof(vertices), error);
+    return backend.UploadFrameData(vertices.data(), sizeof(vertices), 16u, slice, error);
+}
+
+bool captureColorProbe(IR4Backend& backend, const std::shared_ptr<IR4Texture>& texture,
+    const char* phase, const R4EnvironmentSnapshot& environment,
+    const std::uint32_t previousFrame, const bool cameraCut, const bool forceSample,
+    std::string& error)
+{
+    const char* directory = std::getenv("XRAY_METAL_COLOR_PROBE_DIR");
+    if (!directory || !*directory)
+        return true;
+    const char* intervalText = std::getenv("XRAY_METAL_COLOR_PROBE_EVERY");
+    const unsigned long interval = intervalText ?
+        std::max(1ul, std::strtoul(intervalText, nullptr, 10)) : 20ul;
+    if (environment.engineFrame % interval != 0ul && !cameraCut && !forceSample)
+        return true;
+    R4TemporalTextureValidationDesc witness;
+    witness.textures = {texture};
+    witness.labels = {phase};
+    witness.engineFrame = environment.engineFrame;
+    witness.previousFrame = previousFrame;
+    witness.phase = phase;
+    witness.outputDirectory = directory;
+    witness.expectFinite = true;
+    witness.writeImages = true;
+    return backend.ValidateTemporalTextures(witness, error);
 }
 } // namespace
 
@@ -138,13 +164,11 @@ struct MetalR4SsfxAoAdapter::Impl
     std::shared_ptr<IR4GraphicsPipeline> blurPipeline;
     std::shared_ptr<IR4GraphicsPipeline> ilPipeline;
     std::shared_ptr<IR4GraphicsPipeline> ilBlurPipeline;
-    std::shared_ptr<IR4Buffer> vertices;
     std::shared_ptr<IR4Buffer> indices;
-    std::shared_ptr<IR4Buffer> aoGlobals;
-    std::shared_ptr<IR4Buffer> blurGlobals;
     std::shared_ptr<IR4Texture> jitter;
     std::shared_ptr<IR4Texture> history;
     std::shared_ptr<IR4Texture> previousPosition;
+    std::shared_ptr<IR4Texture> coldPosition;
     std::shared_ptr<IR4Texture> temp;
     std::shared_ptr<IR4Texture> temp3;
     std::shared_ptr<IR4Texture> ilHistory;
@@ -157,6 +181,19 @@ struct MetalR4SsfxAoAdapter::Impl
     bool previousViewProjectionValid = false;
     bool clearHistory = true;
     bool jitterUploaded = false;
+    bool pendingFrame = false;
+    bool aoHistoryValid = false, ilHistoryValid = false;
+    bool pendingAoEnabled = false, pendingIlEnabled = false;
+    bool pendingClearedHistory = false;
+    bool pendingUploadedJitter = false;
+    Matrix4 pendingViewProjection{};
+    std::uint32_t submittedFrame = 0, pendingEngineFrame = 0;
+    float aoScale = 0, ilScale = 0, pendingAoScale = 0, pendingIlScale = 0;
+    bool controlsValid = false, pendingControlsValid = false;
+    bool submittedAoAvailable = false, submittedIlAvailable = false;
+    bool pendingAoAvailable = false, pendingIlAvailable = false;
+    std::array<float, 4> submittedAo{}, submittedAoSetup1{}, submittedIl{}, submittedIlSetup1{};
+    std::array<float, 4> pendingAo{}, pendingAoSetup1{}, pendingIl{}, pendingIlSetup1{};
 };
 
 MetalR4SsfxAoAdapter::MetalR4SsfxAoAdapter() = default;
@@ -196,14 +233,8 @@ bool MetalR4SsfxAoAdapter::Prepare(IR4Backend& backend, const Options& options, 
         return true;
     }
     static constexpr std::array<std::uint16_t, 6> indices = {{0u, 1u, 2u, 2u, 1u, 3u}};
-    if (!makeBuffer(backend.Resources(), sizeof(ScreenVertex) * 4u, R4BufferUsage::Vertex,
-            "R4 SSFX AO fullscreen vertices", m_impl->vertices, error) ||
-        !makeBuffer(backend.Resources(), sizeof(indices), R4BufferUsage::Index,
+    if (!makeBuffer(backend.Resources(), sizeof(indices), R4BufferUsage::Index,
             "R4 SSFX AO fullscreen indices", m_impl->indices, error) ||
-        !makeBuffer(backend.Resources(), AoGlobalsSize, R4BufferUsage::Uniform,
-            "R4 SSFX AO globals", m_impl->aoGlobals, error) ||
-        !makeBuffer(backend.Resources(), BlurGlobalsSize, R4BufferUsage::Uniform,
-            "R4 SSFX AO blur globals", m_impl->blurGlobals, error) ||
         !backend.Resources().UpdateBuffer(m_impl->indices, 0u, indices.data(), sizeof(indices), error))
     {
         m_status = "SSFX AO buffer admission failed: " + error;
@@ -300,6 +331,7 @@ bool MetalR4SsfxAoAdapter::PrepareRenderTargets(IR4Backend& backend, const std::
     };
     if (!makeTarget("R4 SSFX AO temporal history", R4PixelFormat::RGBA8Unorm, m_impl->history) ||
         !makeTarget("R4 SSFX AO previous position", R4PixelFormat::RGBA16Float, m_impl->previousPosition) ||
+        !makeTarget("R4 SSFX cold previous position", R4PixelFormat::RGBA16Float, m_impl->coldPosition) ||
         !makeTarget("R4 SSFX AO temporary", R4PixelFormat::RGBA8Unorm, m_impl->temp) ||
         !makeTarget("R4 SSFX AO blur temporary", R4PixelFormat::RGBA8Unorm, m_impl->temp3) ||
         !makeTarget("R4 SSFX IL temporal history", R4PixelFormat::RGBA8Unorm, m_impl->ilHistory) ||
@@ -307,15 +339,20 @@ bool MetalR4SsfxAoAdapter::PrepareRenderTargets(IR4Backend& backend, const std::
         !makeTarget("R4 SSFX IL blur temporary", R4PixelFormat::RGBA8Unorm, m_impl->ilTemp3))
         return false;
     m_impl->clearHistory = true;
+    m_impl->aoHistoryValid = m_impl->ilHistoryValid = false;
     m_impl->previousViewProjectionValid = false;
+    m_impl->pendingFrame = false;
     return true;
 }
 
 bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, std::string& error)
 {
+    m_telemetry = {};
+    const bool aoEnabled = inputs.environment.ssfxAoAvailable && inputs.environment.ssfxAo[1] > 0.0f;
+    const bool ilEnabled = inputs.environment.ssfxIlAvailable && inputs.environment.ssfxIl[1] > 0.0f;
     if (!m_ready || !m_impl || !inputs.position || !inputs.motionVectors || !inputs.accumulator || !inputs.staticGlobals ||
         inputs.staticGlobals->Size() < StaticGlobalsSize || !m_impl->history ||
-        !m_impl->previousPosition || !m_impl->temp || !m_impl->temp3 || !m_impl->ilHistory ||
+        !m_impl->previousPosition || !m_impl->coldPosition || !m_impl->temp || !m_impl->temp3 || !m_impl->ilHistory ||
         !m_impl->ilTemp || !m_impl->ilTemp3)
     {
         error = "SSFX AO frame has incomplete G-buffer, temporal, or static-global inputs";
@@ -331,7 +368,8 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         error = "SSFX AO requires matched RGBA16Float position and motion-vector G-buffer targets";
         return false;
     }
-    if (!m_impl->jitterUploaded)
+    bool uploadedJitter = false;
+    if ((aoEnabled || ilEnabled) && !m_impl->jitterUploaded)
     {
         std::array<std::uint8_t, JitterExtent * JitterExtent * 4u> bytes{};
         std::minstd_rand random(0x4f1bbcd3u);
@@ -345,25 +383,57 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         if (!backend.Resources().UploadTexture2D(m_impl->jitter, 0u, 0u, bytes.data(), bytes.size(),
                 JitterExtent * 4u, bytes.size(), error))
             return false;
-        m_impl->jitterUploaded = true;
+        uploadedJitter = true;
     }
-    if (m_impl->clearHistory)
+    const float scale = std::clamp(inputs.environment.ssfxAo[0], 1.0f, 8.0f);
+    const float ilScale = std::clamp(inputs.environment.ssfxIl[0], 1.0f, 8.0f);
+    const bool commonHistory = !m_impl->clearHistory && m_impl->previousViewProjectionValid &&
+        inputs.previousValid && !inputs.cameraCut && inputs.previousFrame == m_impl->submittedFrame;
+    const bool aoHistory = commonHistory && aoEnabled && m_impl->aoHistoryValid && scale == m_impl->aoScale;
+    const bool ilHistory = commonHistory && ilEnabled && m_impl->ilHistoryValid && ilScale == m_impl->ilScale;
+    const bool aoControlsChanged = !m_impl->controlsValid ||
+        inputs.environment.ssfxAoAvailable != m_impl->submittedAoAvailable ||
+        inputs.environment.ssfxAo != m_impl->submittedAo ||
+        inputs.environment.ssfxAoSetup1 != m_impl->submittedAoSetup1;
+    const bool ilControlsChanged = !m_impl->controlsValid ||
+        inputs.environment.ssfxIlAvailable != m_impl->submittedIlAvailable ||
+        inputs.environment.ssfxIl != m_impl->submittedIl ||
+        inputs.environment.ssfxIlSetup1 != m_impl->submittedIlSetup1;
+    const bool historyUsable = aoHistory || ilHistory;
+    const auto clear = [&](const char* label, const std::shared_ptr<IR4Texture>& target,
+        const R4ClearColor& color = R4ClearColor{0.0, 0.0, 0.0, 0.0}) {
+        R4RenderPassDesc pass;
+        pass.label = label;
+        pass.useDrawable = false;
+        R4ColorAttachmentDesc attachment;
+        attachment.texture = target;
+        attachment.clearColor = color;
+        pass.colorAttachments = {attachment};
+        return backend.BeginRenderPass(pass, error) && backend.EndRenderPass(error);
+    };
+    const bool clearedHistory = !aoHistory || !ilHistory;
+    if ((!aoHistory && !clear("R4 SSFX AO clear history", m_impl->history)) ||
+        (!ilHistory && !clear("R4 SSFX IL clear history", m_impl->ilHistory)) ||
+        (!commonHistory && !clear("R4 SSFX clear previous position", m_impl->previousPosition)) ||
+        (clearedHistory && !clear("R4 SSFX cold reprojection position", m_impl->coldPosition)))
+        return false;
+    // A disabled producer never runs its trace or blurs. Keep the actual combine
+    // inputs neutral, including the unused part of the reduced IL viewport.
+    if ((!aoEnabled && !clear("R4 SSFX AO disabled neutral", m_impl->temp, {0.0, 0.0, 0.0, 1.0})) ||
+        (!ilEnabled && !clear("R4 SSFX IL disabled neutral", m_impl->ilTemp, {0.0, 0.0, 0.0, 1.0})))
+        return false;
+    if (const char* directory = std::getenv("XRAY_METAL_MOTION_PROBE_DIR"))
     {
-        const auto clear = [&](const char* label, const std::shared_ptr<IR4Texture>& target) {
-            R4RenderPassDesc pass;
-            pass.label = label;
-            pass.useDrawable = false;
-            R4ColorAttachmentDesc attachment;
-            attachment.texture = target;
-            attachment.clearColor = {0.0, 0.0, 0.0, 0.0};
-            pass.colorAttachments = {attachment};
-            return backend.BeginRenderPass(pass, error) && backend.EndRenderPass(error);
-        };
-        if (!clear("R4 SSFX AO clear history", m_impl->history) ||
-            !clear("R4 SSFX AO clear previous position", m_impl->previousPosition) ||
-            !clear("R4 SSFX IL clear history", m_impl->ilHistory))
-            return false;
-        m_impl->clearHistory = false;
+        R4TemporalTextureValidationDesc witness;
+        if (!aoHistory) { witness.textures.push_back(m_impl->history); witness.labels.push_back("AO-history"); }
+        if (!ilHistory) { witness.textures.push_back(m_impl->ilHistory); witness.labels.push_back("IL-history"); }
+        if (!commonHistory) { witness.textures.push_back(m_impl->previousPosition); witness.labels.push_back("previous-position"); }
+        if (!witness.textures.empty())
+        {
+            witness.engineFrame = inputs.environment.engineFrame; witness.previousFrame = inputs.previousFrame;
+            witness.outputDirectory = directory; witness.phase = "clear"; witness.expectZero = true;
+            if (!backend.ValidateTemporalTextures(witness, error)) return false;
+        }
     }
 
     Matrix4 view{};
@@ -371,22 +441,34 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
     std::memcpy(view.values, inputs.view.data(), sizeof(view.values));
     std::memcpy(projection.values, inputs.projection.data(), sizeof(projection.values));
     const Matrix4 currentViewProjection = multiply(projection, view);
-    const Matrix4 previous = m_impl->previousViewProjectionValid ?
-        multiply(m_impl->previousViewProjection, inverseRigidTransform(view)) : projection;
+    Matrix4 previous = projection;
+    if (historyUsable)
+    {
+        Matrix4 prevView{}, prevProj{};
+        std::memcpy(prevView.values, inputs.previousView.data(), sizeof(prevView.values));
+        std::memcpy(prevProj.values, inputs.previousProjection.data(), sizeof(prevProj.values));
+        const Matrix4 prevVp = multiply(prevProj, prevView);
+        previous = multiply(prevVp, inverseRigidTransform(view));
+    }
+    const Matrix4& aoPrevious = aoHistory ? previous : projection;
+    const Matrix4& ilPrevious = ilHistory ? previous : projection;
     std::array<std::uint8_t, AoGlobalsSize> aoGlobals{};
     putFloat4(aoGlobals, 256u, inputs.environment.ssfxAo);
     putFloat4(aoGlobals, 272u, inputs.environment.ssfxAoSetup1);
     std::memcpy(aoGlobals.data() + 288u, projection.values, sizeof(projection.values));
-    std::memcpy(aoGlobals.data() + 352u, previous.values, sizeof(previous.values));
-    if (!backend.Resources().UpdateBuffer(m_impl->aoGlobals, 0u, aoGlobals.data(), aoGlobals.size(), error))
+    std::memcpy(aoGlobals.data() + 352u, aoPrevious.values, sizeof(aoPrevious.values));
+    R4FrameBufferSlice aoSlice;
+    if (aoEnabled && !backend.UploadFrameData(aoGlobals.data(), aoGlobals.size(), 256u, aoSlice, error))
         return false;
 
-    const float scale = std::clamp(inputs.environment.ssfxAo[0], 1.0f, 8.0f);
     const auto render = [&](const char* label, const std::shared_ptr<IR4Texture>& target,
         const std::shared_ptr<IR4GraphicsPipeline>& pipeline, const float viewportScale,
-        const float texcoordExtent, const std::shared_ptr<IR4Texture>& source,
-        const bool aoPass, const float blurStrength) {
-        if (!updateFullscreenVertices(backend.Resources(), m_impl->vertices, position.width,
+        const float texcoordExtent, const float blurSamplingScale,
+        const std::shared_ptr<IR4Texture>& source,
+        const bool aoPass, const float blurStrength, const char* colorProbePhase,
+        const bool forceColorProbeSample) {
+        R4FrameBufferSlice vertexSlice;
+        if (!uploadFullscreenVertices(backend, vertexSlice, position.width,
                 position.height, texcoordExtent, error))
             return false;
         R4RenderPassDesc pass;
@@ -397,12 +479,10 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         attachment.clearColor = {0.0, 0.0, 0.0, 1.0};
         pass.colorAttachments = {attachment};
         pass.hasViewport = true;
-        pass.viewport.width = std::max(1.0, std::floor(
-            static_cast<double>(position.width) / static_cast<double>(viewportScale)));
-        pass.viewport.height = std::max(1.0, std::floor(
-            static_cast<double>(position.height) / static_cast<double>(viewportScale)));
+        pass.viewport.width = static_cast<double>(static_cast<float>(position.width) / viewportScale);
+        pass.viewport.height = static_cast<double>(static_cast<float>(position.height) / viewportScale);
         if (!backend.BeginRenderPass(pass, error) || !backend.BindGraphicsPipeline(pipeline, error) ||
-            !backend.BindVertexBuffer(6u, m_impl->vertices, 0u, error))
+            !backend.BindVertexBuffer(6u, vertexSlice.buffer, vertexSlice.offset, error))
             return false;
         R4MscStageBindings vertex;
         vertex.stage = R4ShaderStage::Vertex;
@@ -418,71 +498,82 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
             fragment.tlabSize = 240u;
             fragment.resources = {
                 {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, inputs.position, nullptr},
-                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, inputs.motionVectors, nullptr},
-                {R4MscResourceType::Texture, 48u, nullptr, 0u, 0u, m_impl->history, nullptr},
-                {R4MscResourceType::Texture, 72u, nullptr, 0u, 0u, m_impl->previousPosition, nullptr},
+                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, m_impl->history, nullptr},
+                {R4MscResourceType::Texture, 48u, nullptr, 0u, 0u, inputs.motionVectors, nullptr},
+                {R4MscResourceType::Texture, 72u, nullptr, 0u, 0u, aoHistory ? m_impl->previousPosition : m_impl->coldPosition, nullptr},
                 {R4MscResourceType::Texture, 96u, nullptr, 0u, 0u, m_impl->jitter, nullptr},
-                {R4MscResourceType::ConstantBuffer, 120u, m_impl->aoGlobals, 0u, AoGlobalsSize, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 120u, aoSlice.buffer, aoSlice.offset, aoSlice.size, nullptr, nullptr},
                 {R4MscResourceType::ConstantBuffer, 144u, inputs.staticGlobals, 0u, StaticGlobalsSize, nullptr, nullptr},
-                {R4MscResourceType::Sampler, 168u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
-                {R4MscResourceType::Sampler, 192u, nullptr, 0u, 0u, nullptr, m_impl->noFilterSampler},
+                {R4MscResourceType::Sampler, 168u, nullptr, 0u, 0u, nullptr, m_impl->noFilterSampler},
+                {R4MscResourceType::Sampler, 192u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
                 {R4MscResourceType::Sampler, 216u, nullptr, 0u, 0u, nullptr, m_impl->jitterSampler},
             };
         }
         else
         {
             std::array<std::uint8_t, BlurGlobalsSize> blurGlobals{};
-            const std::array<float, 4> setup = {viewportScale, blurStrength,
+            const std::array<float, 4> setup = {blurSamplingScale, blurStrength,
                 position.width / scale, position.height / scale};
             std::memcpy(blurGlobals.data() + 256u, setup.data(), sizeof(setup));
             std::memcpy(blurGlobals.data() + 272u, inputs.environment.ssfxAo.data(),
                 sizeof(float) * inputs.environment.ssfxAo.size());
-            if (!backend.Resources().UpdateBuffer(m_impl->blurGlobals, 0u, blurGlobals.data(),
-                    blurGlobals.size(), error))
+            R4FrameBufferSlice blurSlice;
+            if (!backend.UploadFrameData(blurGlobals.data(), blurGlobals.size(), 256u,
+                    blurSlice, error))
                 return false;
             fragment.tlabSize = 120u;
             fragment.resources = {
-                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, source, nullptr},
-                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, inputs.position, nullptr},
-                {R4MscResourceType::ConstantBuffer, 48u, m_impl->blurGlobals, 0u, BlurGlobalsSize, nullptr, nullptr},
-                {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
-                {R4MscResourceType::Sampler, 96u, nullptr, 0u, 0u, nullptr, m_impl->noFilterSampler},
+                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, inputs.position, nullptr},
+                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, source, nullptr},
+                {R4MscResourceType::ConstantBuffer, 48u, blurSlice.buffer, blurSlice.offset, blurSlice.size, nullptr, nullptr},
+                {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, m_impl->noFilterSampler},
+                {R4MscResourceType::Sampler, 96u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
             };
         }
         R4IndexedDrawDesc draw;
         draw.indexBuffer = m_impl->indices;
         draw.indexCount = 6u;
         draw.indexType = R4IndexType::UInt16;
-        return backend.BindMscResources(fragment, error) && backend.DrawIndexed(draw, error) &&
-            backend.EndRenderPass(error);
+        if (!backend.BindMscResources(fragment, error) || !backend.DrawIndexed(draw, error) ||
+            !backend.EndRenderPass(error))
+            return false;
+        return captureColorProbe(backend, target, colorProbePhase, inputs.environment,
+            inputs.previousFrame, inputs.cameraCut, forceColorProbeSample, error);
     };
 
-    if (!render("R4 SSFX AO temporal base", m_impl->temp, m_impl->aoPipeline, scale,
-            1.0f / scale, nullptr, true, 0.0f) ||
+    if (aoEnabled && (!render("R4 SSFX AO temporal base", m_impl->temp, m_impl->aoPipeline, scale,
+            1.0f / scale, scale, nullptr, true, 0.0f, "ao_trace",
+            !aoHistory || aoControlsChanged) ||
         !backend.CopyTexture2D(m_impl->temp, m_impl->history, error) ||
         !render("R4 SSFX AO bilateral blur 1", m_impl->temp3, m_impl->blurPipeline, 1.0f,
-            1.0f, m_impl->temp, false, 0.25f) ||
+            1.0f, scale, m_impl->temp, false, 0.25f, "ao_blur0",
+            !aoHistory || aoControlsChanged) ||
         !render("R4 SSFX AO bilateral blur 2", m_impl->temp, m_impl->blurPipeline, 1.0f,
-            1.0f, m_impl->temp3, false, 0.50f) ||
+            1.0f, 1.0f, m_impl->temp3, false, 0.50f, "ao_blur1",
+            !aoHistory || aoControlsChanged) ||
         !render("R4 SSFX AO bilateral blur 3", m_impl->temp3, m_impl->blurPipeline, 1.0f,
-            1.0f, m_impl->temp, false, 0.75f) ||
+            1.0f, 1.0f, m_impl->temp, false, 0.75f, "ao_blur2",
+            !aoHistory || aoControlsChanged) ||
         !render("R4 SSFX AO bilateral blur 4", m_impl->temp, m_impl->blurPipeline, 1.0f,
-            1.0f, m_impl->temp3, false, 1.0f))
+            1.0f, 1.0f, m_impl->temp3, false, 1.0f, "ao_blur3",
+            !aoHistory || aoControlsChanged)))
         return false;
 
     std::array<std::uint8_t, AoGlobalsSize> ilGlobals{};
     putFloat4(ilGlobals, 256u, inputs.environment.ssfxIl);
     putFloat4(ilGlobals, 272u, inputs.environment.ssfxIlSetup1);
     std::memcpy(ilGlobals.data() + 288u, projection.values, sizeof(projection.values));
-    std::memcpy(ilGlobals.data() + 352u, previous.values, sizeof(previous.values));
-    if (!backend.Resources().UpdateBuffer(m_impl->aoGlobals, 0u, ilGlobals.data(), ilGlobals.size(), error))
+    std::memcpy(ilGlobals.data() + 352u, ilPrevious.values, sizeof(ilPrevious.values));
+    R4FrameBufferSlice ilSlice;
+    if (ilEnabled && !backend.UploadFrameData(ilGlobals.data(), ilGlobals.size(), 256u, ilSlice, error))
         return false;
-    const float ilScale = std::clamp(inputs.environment.ssfxIl[0], 1.0f, 8.0f);
     const auto renderIl = [&](const char* label, const std::shared_ptr<IR4Texture>& target,
         const std::shared_ptr<IR4GraphicsPipeline>& pipeline, const float viewportScale,
-        const float texcoordExtent, const std::shared_ptr<IR4Texture>& source,
-        const bool basePass, const float blurStrength) {
-        if (!updateFullscreenVertices(backend.Resources(), m_impl->vertices, position.width,
+        const float texcoordExtent, const float blurSamplingScale,
+        const std::shared_ptr<IR4Texture>& source,
+        const bool basePass, const float blurStrength, const char* colorProbePhase) {
+        R4FrameBufferSlice vertexSlice;
+        if (!uploadFullscreenVertices(backend, vertexSlice, position.width,
                 position.height, texcoordExtent, error))
             return false;
         R4RenderPassDesc pass;
@@ -493,12 +584,10 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         attachment.clearColor = {0.0, 0.0, 0.0, 1.0};
         pass.colorAttachments = {attachment};
         pass.hasViewport = true;
-        pass.viewport.width = std::max(1.0, std::floor(
-            static_cast<double>(position.width) / static_cast<double>(viewportScale)));
-        pass.viewport.height = std::max(1.0, std::floor(
-            static_cast<double>(position.height) / static_cast<double>(viewportScale)));
+        pass.viewport.width = static_cast<double>(static_cast<float>(position.width) / viewportScale);
+        pass.viewport.height = static_cast<double>(static_cast<float>(position.height) / viewportScale);
         if (!backend.BeginRenderPass(pass, error) || !backend.BindGraphicsPipeline(pipeline, error) ||
-            !backend.BindVertexBuffer(6u, m_impl->vertices, 0u, error))
+            !backend.BindVertexBuffer(6u, vertexSlice.buffer, vertexSlice.offset, error))
             return false;
         R4MscStageBindings vertex;
         vertex.stage = R4ShaderStage::Vertex;
@@ -513,13 +602,13 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         {
             fragment.tlabSize = 264u;
             fragment.resources = {
-                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, inputs.accumulator, nullptr},
-                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, inputs.position, nullptr},
-                {R4MscResourceType::Texture, 48u, nullptr, 0u, 0u, inputs.motionVectors, nullptr},
-                {R4MscResourceType::Texture, 72u, nullptr, 0u, 0u, m_impl->ilHistory, nullptr},
-                {R4MscResourceType::Texture, 96u, nullptr, 0u, 0u, m_impl->previousPosition, nullptr},
+                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, inputs.position, nullptr},
+                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, inputs.accumulator, nullptr},
+                {R4MscResourceType::Texture, 48u, nullptr, 0u, 0u, m_impl->ilHistory, nullptr},
+                {R4MscResourceType::Texture, 72u, nullptr, 0u, 0u, inputs.motionVectors, nullptr},
+                {R4MscResourceType::Texture, 96u, nullptr, 0u, 0u, ilHistory ? m_impl->previousPosition : m_impl->coldPosition, nullptr},
                 {R4MscResourceType::Texture, 120u, nullptr, 0u, 0u, m_impl->jitter, nullptr},
-                {R4MscResourceType::ConstantBuffer, 144u, m_impl->aoGlobals, 0u, AoGlobalsSize, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 144u, ilSlice.buffer, ilSlice.offset, ilSlice.size, nullptr, nullptr},
                 {R4MscResourceType::ConstantBuffer, 168u, inputs.staticGlobals, 0u, StaticGlobalsSize, nullptr, nullptr},
                 {R4MscResourceType::Sampler, 192u, nullptr, 0u, 0u, nullptr, m_impl->noFilterSampler},
                 {R4MscResourceType::Sampler, 216u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
@@ -529,18 +618,19 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         else
         {
             std::array<std::uint8_t, BlurGlobalsSize> blurGlobals{};
-            const std::array<float, 4> setup = {viewportScale, blurStrength,
+            const std::array<float, 4> setup = {blurSamplingScale, blurStrength,
                 position.width / ilScale, position.height / ilScale};
             std::memcpy(blurGlobals.data() + 256u, setup.data(), sizeof(setup));
             std::memcpy(blurGlobals.data() + 272u, inputs.environment.ssfxIl.data(),
                 sizeof(float) * inputs.environment.ssfxIl.size());
-            if (!backend.Resources().UpdateBuffer(m_impl->blurGlobals, 0u, blurGlobals.data(),
-                    blurGlobals.size(), error))
+            R4FrameBufferSlice blurSlice;
+            if (!backend.UploadFrameData(blurGlobals.data(), blurGlobals.size(), 256u,
+                    blurSlice, error))
                 return false;
             fragment.tlabSize = 72u;
             fragment.resources = {
                 {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, source, nullptr},
-                {R4MscResourceType::ConstantBuffer, 24u, m_impl->blurGlobals, 0u, BlurGlobalsSize, nullptr, nullptr},
+                {R4MscResourceType::ConstantBuffer, 24u, blurSlice.buffer, blurSlice.offset, blurSlice.size, nullptr, nullptr},
                 {R4MscResourceType::Sampler, 48u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
             };
         }
@@ -548,32 +638,126 @@ bool MetalR4SsfxAoAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, 
         draw.indexBuffer = m_impl->indices;
         draw.indexCount = 6u;
         draw.indexType = R4IndexType::UInt16;
-        return backend.BindMscResources(fragment, error) && backend.DrawIndexed(draw, error) &&
-            backend.EndRenderPass(error);
+        if (!backend.BindMscResources(fragment, error) || !backend.DrawIndexed(draw, error) ||
+            !backend.EndRenderPass(error))
+            return false;
+        return captureColorProbe(backend, target, colorProbePhase, inputs.environment,
+            inputs.previousFrame, inputs.cameraCut,
+            !ilHistory || ilControlsChanged, error);
     };
-    if (!renderIl("R4 SSFX IL temporal base", m_impl->ilTemp, m_impl->ilPipeline, ilScale,
-            1.0f / ilScale, nullptr, true, 0.0f) ||
+    if (ilEnabled && (!renderIl("R4 SSFX IL temporal base", m_impl->ilTemp, m_impl->ilPipeline, ilScale,
+            1.0f / ilScale, 1.0f, nullptr, true, 0.0f, "il_trace") ||
         !backend.CopyTexture2D(m_impl->ilTemp, m_impl->ilHistory, error) ||
-        !renderIl("R4 SSFX IL bilateral blur 1", m_impl->ilTemp3, m_impl->ilBlurPipeline, 1.0f,
-            1.0f, m_impl->ilTemp, false, 0.25f) ||
-        !renderIl("R4 SSFX IL bilateral blur 2", m_impl->ilTemp, m_impl->ilBlurPipeline, 1.0f,
-            1.0f, m_impl->ilTemp3, false, 0.50f) ||
-        !renderIl("R4 SSFX IL bilateral blur 3", m_impl->ilTemp3, m_impl->ilBlurPipeline, 1.0f,
-            1.0f, m_impl->ilTemp, false, 0.75f) ||
-        !renderIl("R4 SSFX IL bilateral blur 4", m_impl->ilTemp, m_impl->ilBlurPipeline, 1.0f,
-            1.0f, m_impl->ilTemp3, false, 1.0f) ||
-        !backend.CopyTexture2D(inputs.position, m_impl->previousPosition, error))
+        !renderIl("R4 SSFX IL bilateral blur 1", m_impl->ilTemp3, m_impl->ilBlurPipeline, ilScale,
+            1.0f / ilScale, 1.0f, m_impl->ilTemp, false, 0.25f, "il_blur0") ||
+        !renderIl("R4 SSFX IL bilateral blur 2", m_impl->ilTemp, m_impl->ilBlurPipeline, ilScale,
+            1.0f / ilScale, 1.0f, m_impl->ilTemp3, false, 0.50f, "il_blur1") ||
+        !renderIl("R4 SSFX IL bilateral blur 3", m_impl->ilTemp3, m_impl->ilBlurPipeline, ilScale,
+            1.0f / ilScale, 1.0f, m_impl->ilTemp, false, 0.75f, "il_blur2") ||
+        !renderIl("R4 SSFX IL bilateral blur 4", m_impl->ilTemp, m_impl->ilBlurPipeline, ilScale,
+            1.0f / ilScale, 1.0f, m_impl->ilTemp3, false, 1.0f, "il_blur3")))
         return false;
 
-    m_impl->previousViewProjection = currentViewProjection;
-    m_impl->previousViewProjectionValid = true;
+    if ((aoEnabled || ilEnabled) && !backend.CopyTexture2D(inputs.position, m_impl->previousPosition, error))
+        return false;
+    if (const char* directory = std::getenv("XRAY_METAL_MOTION_PROBE_DIR"))
+    {
+        if (clearedHistory || inputs.environment.engineFrame % 20u == 0u ||
+            inputs.environment.engineFrame > inputs.previousFrame + 1u)
+        {
+            R4TemporalTextureValidationDesc witness;
+            witness.engineFrame = inputs.environment.engineFrame;
+            witness.previousFrame = inputs.previousFrame;
+            witness.outputDirectory = directory;
+            witness.phase = "position-copy";
+            witness.textures = {inputs.position, m_impl->previousPosition};
+            witness.labels = {"current-position", "previous-position"};
+            witness.expectEqualPair = true;
+            if ((aoEnabled || ilEnabled) && !backend.ValidateTemporalTextures(witness, error)) return false;
+            witness.phase = "output";
+            witness.textures = {m_impl->temp, m_impl->ilTemp};
+            witness.labels = {"AO", "IL"};
+            witness.expectEqualPair = false;
+            if (!backend.ValidateTemporalTextures(witness, error)) return false;
+        }
+    }
+    m_impl->pendingAoEnabled = aoEnabled; m_impl->pendingIlEnabled = ilEnabled;
+    m_impl->pendingViewProjection = currentViewProjection;
+    m_impl->pendingEngineFrame = inputs.environment.engineFrame;
+    m_impl->pendingAoScale = scale;
+    m_impl->pendingIlScale = ilScale;
+    m_impl->pendingAo = inputs.environment.ssfxAo;
+    m_impl->pendingAoSetup1 = inputs.environment.ssfxAoSetup1;
+    m_impl->pendingIl = inputs.environment.ssfxIl;
+    m_impl->pendingIlSetup1 = inputs.environment.ssfxIlSetup1;
+    m_impl->pendingAoAvailable = inputs.environment.ssfxAoAvailable;
+    m_impl->pendingIlAvailable = inputs.environment.ssfxIlAvailable;
+    m_impl->pendingControlsValid = true;
+    if (std::getenv("XRAY_METAL_TEMPORAL_DIAGNOSTICS"))
+        std::fprintf(stderr, "METAL_AO_IL_HISTORY frame=%u source_frame=%u camera_source=%u reuse=%d cleared=%d scales=%.1f,%.1f\n",
+            inputs.environment.engineFrame, m_impl->submittedFrame, inputs.previousFrame,
+            historyUsable, clearedHistory, scale, ilScale);
+    if (std::getenv("XRAY_METAL_TEMPORAL_DIAGNOSTICS"))
+        std::fprintf(stderr, "METAL_AO_IL_GATES frame=%u available=%d,%d enabled=%d,%d reuse=%d,%d intensity=%.6f,%.6f\n", inputs.environment.engineFrame, inputs.environment.ssfxAoAvailable, inputs.environment.ssfxIlAvailable, aoEnabled, ilEnabled, aoHistory, ilHistory, inputs.environment.ssfxAo[1], inputs.environment.ssfxIl[1]);
+    m_impl->pendingClearedHistory = clearedHistory;
+    m_impl->pendingUploadedJitter = uploadedJitter;
+    m_impl->pendingFrame = true;
     m_telemetry.width = position.width;
     m_telemetry.height = position.height;
     m_telemetry.frame = inputs.environment.engineFrame;
-    m_telemetry.passes = 5u;
-    m_telemetry.indirectLightPasses = 5u;
-    m_telemetry.temporalHistory = true;
+    m_telemetry.passes = aoEnabled ? 5u : 0u;
+    m_telemetry.indirectLightPasses = ilEnabled ? 5u : 0u;
+    m_telemetry.aoEnabled = aoEnabled; m_telemetry.ilEnabled = ilEnabled;
+    m_telemetry.aoHistory = aoHistory; m_telemetry.ilHistory = ilHistory;
+    m_telemetry.temporalHistory = historyUsable;
     return true;
+}
+
+void MetalR4SsfxAoAdapter::DiscardUnsubmittedFrame()
+{
+    if (m_impl)
+    {
+        m_impl->pendingFrame = false;
+        m_impl->pendingControlsValid = false;
+    }
+}
+
+void MetalR4SsfxAoAdapter::CommitSubmittedFrame()
+{
+    if (!m_impl || !m_impl->pendingFrame)
+        return;
+    m_impl->previousViewProjection = m_impl->pendingViewProjection;
+    m_impl->previousViewProjectionValid = m_impl->pendingAoEnabled || m_impl->pendingIlEnabled;
+    m_impl->aoHistoryValid = m_impl->pendingAoEnabled; m_impl->ilHistoryValid = m_impl->pendingIlEnabled;
+    m_impl->submittedFrame = m_impl->pendingEngineFrame;
+    m_impl->aoScale = m_impl->pendingAoScale;
+    m_impl->ilScale = m_impl->pendingIlScale;
+    if (m_impl->pendingControlsValid)
+    {
+        m_impl->submittedAo = m_impl->pendingAo;
+        m_impl->submittedAoSetup1 = m_impl->pendingAoSetup1;
+        m_impl->submittedIl = m_impl->pendingIl;
+        m_impl->submittedIlSetup1 = m_impl->pendingIlSetup1;
+        m_impl->submittedAoAvailable = m_impl->pendingAoAvailable;
+        m_impl->submittedIlAvailable = m_impl->pendingIlAvailable;
+        m_impl->controlsValid = true;
+    }
+    if (m_impl->pendingClearedHistory)
+        m_impl->clearHistory = false;
+    if (m_impl->pendingUploadedJitter)
+        m_impl->jitterUploaded = true;
+    m_impl->pendingFrame = false;
+    m_impl->pendingControlsValid = false;
+}
+
+void MetalR4SsfxAoAdapter::InvalidateHistory()
+{
+    if (!m_impl) return;
+    m_impl->pendingFrame = false;
+    m_impl->pendingControlsValid = false;
+    m_impl->previousViewProjectionValid = false;
+    m_impl->aoHistoryValid = m_impl->ilHistoryValid = false;
+    m_impl->clearHistory = true;
 }
 
 const std::shared_ptr<IR4Texture>& MetalR4SsfxAoAdapter::Output() const

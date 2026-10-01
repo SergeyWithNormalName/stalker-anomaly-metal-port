@@ -34,7 +34,7 @@ public:
 	virtual void rewind();
 	virtual void stop();
 	virtual void update();
-	virtual void fill_parameters();
-	void source_changed();
+	virtual void fill_parameters() override;
+	virtual void source_changed() override;
 };
 #endif

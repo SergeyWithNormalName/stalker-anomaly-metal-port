@@ -104,6 +104,7 @@ public:
 	void set_listener(const CSoundRender_Environment& env);
 	void get_listener(CSoundRender_Environment& env);
 	void commit();
+	virtual void start_deferred_target(CSoundRender_Target* target) override;
 };
 
 extern CSoundRender_CoreA* SoundRenderA;

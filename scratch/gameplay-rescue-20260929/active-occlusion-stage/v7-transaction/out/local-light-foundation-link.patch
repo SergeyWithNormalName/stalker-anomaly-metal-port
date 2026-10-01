@@ -1,0 +1,11 @@
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -454,7 +454,7 @@
+   tests/R4LocalLightFoundationProbe.cpp
+ )
+ target_compile_features(XRay.Metal.LocalLightFoundationProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.LocalLightFoundationProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.LocalLightFoundationProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.LocalLightFoundation.SelfTest
+   COMMAND XRay.Metal.LocalLightFoundationProbe --self-test

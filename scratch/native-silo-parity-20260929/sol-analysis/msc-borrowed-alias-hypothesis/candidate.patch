@@ -1,0 +1,97 @@
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -2924,8 +2924,11 @@
+ 
+             if (binding.type == R4MscResourceType::ConstantBuffer)
+             {
+-                const std::shared_ptr<MetalBuffer> buffer =
++                const std::shared_ptr<MetalBuffer> ownedBuffer = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalBuffer>{} :
+                     std::dynamic_pointer_cast<MetalBuffer>(binding.buffer);
++                MetalBuffer* buffer = m_e08BorrowMscTypes ?
++                    dynamic_cast<MetalBuffer*>(binding.buffer.get()) : ownedBuffer.get();
+                 const std::size_t size = binding.bufferSize == 0 ?
+                     (buffer && binding.bufferOffset <= buffer->Size() ?
+                         buffer->Size() - binding.bufferOffset : 0) : binding.bufferSize;
+@@ -2946,15 +2949,21 @@
+                         return false;
+                 }
+                 constantSlices[entryIndex] = slice;
+-                const std::shared_ptr<MetalBuffer> boundBuffer =
++                const std::shared_ptr<MetalBuffer> ownedBoundBuffer = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalBuffer>{} :
+                     std::static_pointer_cast<MetalBuffer>(slice.buffer);
++                MetalBuffer* boundBuffer = m_e08BorrowMscTypes ?
++                    static_cast<MetalBuffer*>(slice.buffer.get()) : ownedBoundBuffer.get();
+                 declareIndirectRead(*context, boundBuffer->Native(), stages);
+                 retainFrameResource(*context, slice.buffer);
+             }
+             else if (binding.type == R4MscResourceType::Texture)
+             {
+-                const std::shared_ptr<MetalTexture> texture =
++                const std::shared_ptr<MetalTexture> ownedTexture = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalTexture>{} :
+                     std::dynamic_pointer_cast<MetalTexture>(binding.texture);
++                MetalTexture* texture = m_e08BorrowMscTypes ?
++                    dynamic_cast<MetalTexture*>(binding.texture.get()) : ownedTexture.get();
+                 if (!texture)
+                 {
+                     error = "invalid Metal Shader Converter texture binding";
+@@ -2965,8 +2974,11 @@
+             }
+             else if (binding.type == R4MscResourceType::Sampler)
+             {
+-                const std::shared_ptr<MetalSampler> sampler =
++                const std::shared_ptr<MetalSampler> ownedSampler = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalSampler>{} :
+                     std::dynamic_pointer_cast<MetalSampler>(binding.sampler);
++                MetalSampler* sampler = m_e08BorrowMscTypes ?
++                    dynamic_cast<MetalSampler*>(binding.sampler.get()) : ownedSampler.get();
+                 if (!sampler)
+                 {
+                     error = "invalid Metal Shader Converter sampler binding";
+@@ -3045,21 +3057,30 @@
+             {
+                 const R4FrameBufferSlice& slice =
+                     constantSlices[binding.tlabOffset / EntrySize];
+-                const std::shared_ptr<MetalBuffer> buffer =
++                const std::shared_ptr<MetalBuffer> ownedBuffer = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalBuffer>{} :
+                     std::static_pointer_cast<MetalBuffer>(slice.buffer);
++                MetalBuffer* buffer = m_e08BorrowMscTypes ?
++                    static_cast<MetalBuffer*>(slice.buffer.get()) : ownedBuffer.get();
+                 IRDescriptorTableSetBuffer(
+                     entry, buffer->Native().gpuAddress + slice.offset, slice.size);
+             }
+             else if (binding.type == R4MscResourceType::Texture)
+             {
+-                const std::shared_ptr<MetalTexture> texture =
++                const std::shared_ptr<MetalTexture> ownedTexture = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalTexture>{} :
+                     std::dynamic_pointer_cast<MetalTexture>(binding.texture);
++                MetalTexture* texture = m_e08BorrowMscTypes ?
++                    dynamic_cast<MetalTexture*>(binding.texture.get()) : ownedTexture.get();
+                 IRDescriptorTableSetTexture(entry, texture->Native(), 0.0f, 0);
+             }
+             else
+             {
+-                const std::shared_ptr<MetalSampler> sampler =
++                const std::shared_ptr<MetalSampler> ownedSampler = m_e08BorrowMscTypes ?
++                    std::shared_ptr<MetalSampler>{} :
+                     std::dynamic_pointer_cast<MetalSampler>(binding.sampler);
++                MetalSampler* sampler = m_e08BorrowMscTypes ?
++                    dynamic_cast<MetalSampler*>(binding.sampler.get()) : ownedSampler.get();
+                 IRDescriptorTableSetSampler(entry, sampler->Native(), 0.0f);
+             }
+         }
+@@ -4897,6 +4918,10 @@
+     bool m_e08BatchUploads = std::getenv("XRAY_METAL_E08_UPLOAD_BATCH") != nullptr;
+     bool m_e08DedupResources = std::getenv("XRAY_METAL_E08_DEDUP_RESOURCES") != nullptr;
+     bool m_e08HeapBindings = std::getenv("XRAY_METAL_E08_HEAP_BINDINGS") != nullptr;
++    bool m_e08BorrowMscTypes = [] {
++        const char* value = std::getenv("XRAY_METAL_E08_BORROW_MSC_TYPES");
++        return value && std::strcmp(value, "1") == 0;
++    }();
+     FILE* m_e08GpuPasses = nullptr;
+     FILE* m_e08CpuBindings = nullptr;
+     id<MTLCounterSet> m_e08CounterSet = nil;

@@ -17,6 +17,10 @@ struct R4DefVertexViewState
 {
     std::array<float, 16> view{};
     std::array<float, 16> projection{};
+    std::array<float, 16> previousView{};
+    std::array<float, 16> previousProjection{};
+    bool previousValid = false;
+    bool cameraCut = false;
     bool valid = false;
 };
 
@@ -41,6 +45,9 @@ public:
         std::size_t alphaTestedSubmittedVisuals = 0;
         std::size_t culledVisuals = 0;
         std::size_t draws = 0;
+        std::size_t shadowSubmittedVisuals = 0;
+        std::size_t shadowCulledVisuals = 0;
+        std::size_t shadowDraws = 0;
     };
 
     MetalR4DefVertexAdapter();
@@ -55,11 +62,20 @@ public:
         const std::vector<std::shared_ptr<IR4Buffer>>& indexBuffers,
         const Options& options, std::string& status);
 
-    // Must run before the G-buffer pass: uploads private texture resources
-    // once and releases retained CPU DDS bytes after success.
+    // Must run before the G-buffer pass. Private texture blits are staged in
+    // the active frame; retained CPU DDS bytes are released on commit only.
     bool Upload(IR4Backend& backend, std::string& error);
+    void CommitSubmittedFrame();
+    void DiscardUnsubmittedFrame();
 
     bool DrawIntoActiveGBuffer(IR4Backend& backend, const R4DefVertexViewState& view,
+        std::string& error);
+
+    bool DrawShadowCasters(IR4Backend& backend,
+        const std::array<float, 16>& lightViewProjection,
+        const std::shared_ptr<IR4GraphicsPipeline>& opaquePipeline,
+        const std::shared_ptr<IR4GraphicsPipeline>& arefPipeline,
+        const std::shared_ptr<IR4Sampler>& sampler,
         std::string& error);
 
     bool IsReady() const { return m_ready; }

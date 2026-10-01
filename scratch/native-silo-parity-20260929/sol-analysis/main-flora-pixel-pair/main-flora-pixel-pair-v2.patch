@@ -1,0 +1,639 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -22,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cerrno>
+ #include <chrono>
+ #include <cctype>
+ #include <cmath>
+@@ -4343,6 +4344,271 @@
+     return true;
+ }
+ 
++struct MainFloraPixelPairTargets
++{
++    std::array<std::shared_ptr<IR4Texture>, 4> offColor, onColor;
++    std::shared_ptr<IR4Texture> offDepthStencil, onDepthStencil;
++};
++
++bool ensureMainFloraPixelPairTargets(IR4Backend& backend, LevelScene& scene,
++    MainFloraPixelPairTargets& targets, std::string& error)
++{
++    if (scene.gBufferTargets.size() != 4u || !scene.depthTarget)
++    { error = "main Flora pixel pair requires four G-buffer targets and D32S8"; return false; }
++    bool reusable = static_cast<bool>(targets.offDepthStencil) && static_cast<bool>(targets.onDepthStencil);
++    for (std::size_t i = 0u; reusable && i < 4u; ++i)
++        reusable = targets.offColor[i] && targets.onColor[i] &&
++            sameTextureDescriptor(targets.offColor[i]->Descriptor(), scene.gBufferTargets[i]->Descriptor()) &&
++            sameTextureDescriptor(targets.onColor[i]->Descriptor(), scene.gBufferTargets[i]->Descriptor());
++    reusable = reusable && sameTextureDescriptor(targets.offDepthStencil->Descriptor(), scene.depthTarget->Descriptor()) &&
++        sameTextureDescriptor(targets.onDepthStencil->Descriptor(), scene.depthTarget->Descriptor());
++    if (reusable) return true;
++
++    MainFloraPixelPairTargets replacement;
++    for (std::size_t i = 0u; i < 4u; ++i)
++    {
++        R4Texture2DDesc desc = scene.gBufferTargets[i]->Descriptor();
++        static const char* offLabels[4] = {"R4 main Flora OFF G-buffer 0", "R4 main Flora OFF G-buffer 1",
++            "R4 main Flora OFF G-buffer 2", "R4 main Flora OFF G-buffer 3"};
++        static const char* onLabels[4] = {"R4 main Flora ON G-buffer 0", "R4 main Flora ON G-buffer 1",
++            "R4 main Flora ON G-buffer 2", "R4 main Flora ON G-buffer 3"};
++        desc.label = offLabels[i];
++        replacement.offColor[i] = backend.Resources().CreateTexture2D(desc, error);
++        if (!replacement.offColor[i]) return false;
++        desc.label = onLabels[i];
++        replacement.onColor[i] = backend.Resources().CreateTexture2D(desc, error);
++        if (!replacement.onColor[i]) return false;
++    }
++    R4Texture2DDesc depthDesc = scene.depthTarget->Descriptor();
++    depthDesc.label = "R4 main Flora OFF pixel-pair depth stencil";
++    replacement.offDepthStencil = backend.Resources().CreateTexture2D(depthDesc, error);
++    if (!replacement.offDepthStencil) return false;
++    depthDesc.label = "R4 main Flora ON pixel-pair depth stencil";
++    replacement.onDepthStencil = backend.Resources().CreateTexture2D(depthDesc, error);
++    if (!replacement.onDepthStencil) return false;
++    targets = std::move(replacement);
++    return true;
++}
++
++bool validateMainFloraColorPair(IR4Backend& backend,
++    const std::shared_ptr<IR4Texture>& first, const std::shared_ptr<IR4Texture>& second,
++    const char* firstLabel, const char* secondLabel, const char* phase,
++    std::uint32_t frame, const std::string& outputDirectory,
++    bool expectEqual, bool expectDifferent, bool writeImages, std::string& error)
++{
++    R4TemporalTextureValidationDesc desc;
++    desc.textures = {first, second}; desc.labels = {firstLabel, secondLabel};
++    desc.engineFrame = frame; desc.phase = phase; desc.outputDirectory = outputDirectory;
++    desc.expectFinite = true; desc.expectEqualPair = expectEqual;
++    desc.expectDifferentPair = expectDifferent; desc.writeImages = writeImages;
++    return backend.ValidateTemporalTextures(desc, error);
++}
++
++bool validateMainFloraDepthPair(IR4Backend& backend,
++    const std::shared_ptr<IR4Texture>& first, const std::shared_ptr<IR4Texture>& second,
++    const char* phase, std::uint32_t frame, const std::string& outputDirectory,
++    bool expectEqual, bool expectDifferent, std::string& error)
++{
++    R4DepthStencilPairValidationDesc desc;
++    desc.engineFrame = frame; desc.phase = phase; desc.outputDirectory = outputDirectory;
++    desc.expectEqual = expectEqual; desc.expectDifferent = expectDifferent;
++    return backend.ValidateDepthStencilPair(first, second, desc, error);
++}
++
++bool runMainFloraPixelPairOracle(IR4Backend& backend, LevelScene& scene,
++    const MetalR4EngineScene::ViewState& view,
++    const std::shared_ptr<const R4EngineWorldSnapshot>& world,
++    const R4RenderPassDesc& productionPass,
++    const std::shared_ptr<const MetalR4EngineScene::MainFloraOraclePrepareCallback>& prepare,
++    const std::shared_ptr<const MetalR4EngineScene::MainFloraOracleDrawCallback>& draw,
++    std::string& error)
++{
++    const char* directory = std::getenv("XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_DIR");
++    const char* frameText = std::getenv("XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_FRAME");
++    if (!directory || !*directory || !frameText || !prepare || !draw || !view.valid)
++        return true;
++    if (!*frameText || !std::all_of(frameText, frameText + std::strlen(frameText),
++            [](unsigned char ch) { return ch >= '0' && ch <= '9'; }))
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=frame reason=frame-must-be-decimal-uint32\n");
++        return true;
++    }
++    char* frameEnd = nullptr;
++    errno = 0;
++    const unsigned long requestedFrame = std::strtoul(frameText, &frameEnd, 10);
++    if (errno == ERANGE || !frameEnd || *frameEnd || requestedFrame > UINT32_MAX ||
++        requestedFrame != view.engineFrame)
++        return true;
++    if (!prepare || !*prepare || !draw || !*draw)
++        return true;
++
++    MainFloraPixelPairTargets localTargets;
++    MainFloraPixelPairTargets* targets = &localTargets;
++    if (!ensureMainFloraPixelPairTargets(backend, scene, *targets, error))
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=targets error=%s\n", error.c_str());
++        error.clear();
++        return true;
++    }
++    R4FloraViewState frozenFloraView;
++    if (!(*prepare)(view, world, frozenFloraView, error) || !frozenFloraView.valid)
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=prepare error=%s\n", error.c_str());
++        error.clear();
++        return true;
++    }
++    std::error_code filesystemError;
++    std::filesystem::create_directories(directory, filesystemError);
++    if (filesystemError)
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=output error=%s\n",
++            filesystemError.message().c_str());
++        return true;
++    }
++
++    bool passActive = true;
++    const auto resumeProductionPass = [&]() {
++        R4RenderPassDesc resume = productionPass;
++        resume.label = "R4 engine scene G-buffer after Flora pixel-pair diagnostic";
++        for (R4ColorAttachmentDesc& attachment : resume.colorAttachments)
++        { attachment.loadAction = R4LoadAction::Load; attachment.storeAction = R4StoreAction::Store; }
++        resume.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
++        resume.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
++        resume.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
++        resume.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
++        if (!backend.BeginRenderPass(resume, error) || !backend.SetStencilReference(1u, error))
++            return false;
++        passActive = true;
++        return true;
++    };
++    const auto failOpen = [&](const char* phase, const std::string& reason) {
++        const std::string reasonCopy = reason;
++        if (passActive)
++        {
++            std::string ignored;
++            backend.EndRenderPass(ignored);
++            passActive = false;
++        }
++        error.clear();
++        if (!resumeProductionPass())
++            return false;
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=%s error=%s\n",
++            phase, reasonCopy.c_str());
++        error.clear();
++        return true;
++    };
++
++    if (!backend.EndRenderPass(error))
++    { std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=end-base error=%s\n", error.c_str()); return false; }
++    passActive = false;
++    for (std::size_t i = 0u; i < 4u; ++i)
++    {
++        if (!backend.CopyTexture2D(scene.gBufferTargets[i], targets->offColor[i], error) ||
++            !backend.CopyTexture2D(targets->offColor[i], targets->onColor[i], error))
++            return failOpen("copy-mrt", error);
++    }
++    if (!backend.CopyTexture2D(scene.depthTarget, targets->offDepthStencil, error) ||
++        !backend.CopyTexture2D(targets->offDepthStencil, targets->onDepthStencil, error))
++        return failOpen("copy-depth-stencil", error);
++
++    static const char* labels[4] = {"position", "diffuse", "auxiliary", "motion"};
++    for (std::size_t i = 0u; i < 4u; ++i)
++    {
++        const std::string phase = "main-flora-copy-identity-mrt-" + std::to_string(i);
++        if (!validateMainFloraColorPair(backend, scene.gBufferTargets[i], targets->offColor[i],
++                "base", "off-copy", phase.c_str(), view.engineFrame, directory,
++                true, false, false, error))
++            return failOpen("verify-copy-mrt", error);
++    }
++    if (!validateMainFloraDepthPair(backend, scene.depthTarget, targets->offDepthStencil,
++            "main-flora-copy-identity-depth-stencil", view.engineFrame, directory, true, false, error))
++        return failOpen("verify-copy-depth-stencil", error);
++
++    const auto drawBranch = [&](const char* label,
++        const std::array<std::shared_ptr<IR4Texture>, 4>& colors,
++        const std::shared_ptr<IR4Texture>& depthStencil) {
++        R4RenderPassDesc branch = productionPass;
++        branch.label = label; branch.useDrawable = false;
++        for (std::size_t i = 0u; i < branch.colorAttachments.size(); ++i)
++        {
++            branch.colorAttachments[i].texture = colors[i];
++            branch.colorAttachments[i].loadAction = R4LoadAction::Load;
++            branch.colorAttachments[i].storeAction = R4StoreAction::Store;
++        }
++        branch.depthStencilAttachment.texture = depthStencil;
++        branch.depthStencilAttachment.depthLoadAction = R4LoadAction::Load;
++        branch.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
++        branch.depthStencilAttachment.stencilLoadAction = R4LoadAction::Load;
++        branch.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
++        if (!backend.BeginRenderPass(branch, error)) return false;
++        passActive = true;
++        const bool drawn = backend.SetStencilReference(1u, error) &&
++            (*draw)(backend, frozenFloraView, error);
++        std::string endError;
++        const bool ended = backend.EndRenderPass(endError);
++        passActive = false;
++        if (!drawn) return false;
++        if (!ended) { error = endError; return false; }
++        return true;
++    };
++    if (!drawBranch("R4 main Flora pixel-pair OFF control", targets->offColor, targets->offDepthStencil))
++        return failOpen("draw-off", error);
++    if (!drawBranch("R4 main Flora pixel-pair ON control", targets->onColor, targets->onDepthStencil))
++        return failOpen("draw-on", error);
++
++    for (std::size_t i = 0u; i < 4u; ++i)
++    {
++        const std::string phase = "main-flora-off-off-mrt-" + std::to_string(i);
++        if (!validateMainFloraColorPair(backend, targets->offColor[i], targets->onColor[i],
++                "off", "on-control", phase.c_str(), view.engineFrame, directory,
++                true, false, true, error))
++            return failOpen("compare-mrt", error);
++    }
++    if (!validateMainFloraColorPair(backend, scene.gBufferTargets[0], targets->offColor[0],
++            "base", "flora-off", "main-flora-nonblank-position-delta", view.engineFrame,
++            directory, false, true, true, error) ||
++        !validateMainFloraDepthPair(backend, targets->offDepthStencil, targets->onDepthStencil,
++            "main-flora-off-off-depth-stencil", view.engineFrame, directory, true, false, error) ||
++        !validateMainFloraDepthPair(backend, scene.depthTarget, targets->offDepthStencil,
++            "main-flora-nonblank-depth-stencil-delta", view.engineFrame, directory, false, true, error))
++        return failOpen("compare-depth-or-delta", error);
++
++    std::ofstream manifest(std::filesystem::path(directory) /
++        ("main-flora-off-off-frame-" + std::to_string(view.engineFrame) + ".json"));
++    if (manifest)
++    {
++        manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
++            << "{\n  \"schema\": \"main-flora-off-off-pixel-pair/v1\",\n"
++            << "  \"frame\": " << view.engineFrame << ",\n"
++            << "  \"control\": \"same callback and frozen R4FloraViewState in both branches\",\n"
++            << "  \"time_seconds\": " << frozenFloraView.timeSeconds << ",\n"
++            << "  \"wind_valid\": " << (frozenFloraView.windValid ? "true" : "false") << ",\n"
++            << "  \"static_globals_present\": " << (frozenFloraView.staticGlobals ? "true" : "false") << ",\n";
++        const auto writeFloatArray = [&manifest](const char* key, const auto& values) {
++            manifest << "  \"" << key << "\": [";
++            for (std::size_t i = 0u; i < values.size(); ++i)
++                manifest << (i ? "," : "") << values[i];
++            manifest << "],\n";
++        };
++        writeFloatArray("view", frozenFloraView.view);
++        writeFloatArray("projection", frozenFloraView.projection);
++        writeFloatArray("previous_view", frozenFloraView.previousView);
++        writeFloatArray("previous_projection", frozenFloraView.previousProjection);
++        writeFloatArray("wind_params", frozenFloraView.windParams);
++        writeFloatArray("wind_setup_trees", frozenFloraView.windSetupTrees);
++        writeFloatArray("wind_animation", frozenFloraView.windAnimation);
++        writeFloatArray("wind_animation_previous", frozenFloraView.windAnimationPrevious);
++        manifest
++            << "  \"mrt_count\": 4,\n  \"depth_stencil_format\": \"D32S8\",\n"
++            << "  \"production_flora_draws\": \"still executed once by unchanged world callback after this control\"\n}\n";
++    }
++    std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR frame=%u mode=off-off submitted=1 output=%s\n",
++        view.engineFrame, directory);
++    if (!resumeProductionPass())
++        return false;
++    return true;
++}
++
+ bool renderProductionScene(
+     IR4Backend& backend,
+     LevelScene& scene,
+@@ -4379,6 +4645,8 @@
+     const R4EnvironmentSnapshot& environment,
+     const R4GameplayVisionSnapshot& vision,
+     const std::shared_ptr<const MetalR4EngineScene::GBufferWorldDrawCallback>& worldDraw,
++    const std::shared_ptr<const MetalR4EngineScene::MainFloraOraclePrepareCallback>& floraOraclePrepare,
++    const std::shared_ptr<const MetalR4EngineScene::MainFloraOracleDrawCallback>& floraOracleDraw,
+     MetalR4FogScatteringAdapter* fogScattering,
+     std::string& error)
+ {
+@@ -4620,6 +4888,13 @@
+         terrain.ready = false;
+         error.clear();
+     }
++    if (floraOraclePrepare && floraOracleDraw && *floraOraclePrepare && *floraOracleDraw)
++    {
++        const auto oracleWorld = backend.EngineWorldSnapshot();
++        if (!runMainFloraPixelPairOracle(backend, scene, view, oracleWorld, gBufferPass,
++                floraOraclePrepare, floraOracleDraw, error))
++            return false;
++    }
+     if (worldDraw)
+     {
+         const std::shared_ptr<const R4EngineWorldSnapshot> world =
+@@ -6314,6 +6589,8 @@
+     bool prepared = false;
+     mutable std::mutex worldDrawMutex;
+     std::shared_ptr<const GBufferWorldDrawCallback> worldDraw;
++    std::shared_ptr<const MainFloraOraclePrepareCallback> floraOraclePrepare;
++    std::shared_ptr<const MainFloraOracleDrawCallback> floraOracleDraw;
+     std::unique_ptr<MetalR4FloraAdapter> flora;
+     std::unique_ptr<MetalR4DefVertexAdapter> defVertex;
+     std::unique_ptr<MetalR4DefObjectsLodAdapter> defObjectsLod;
+@@ -7317,20 +7594,44 @@
+             return drawn;
+         });
+     }
++    if (impl->flora && impl->flora->IsReady())
++    {
++        SetMainFloraPixelOracleCallbacks(
++            [this](const ViewState& callbackView,
++                const std::shared_ptr<const R4EngineWorldSnapshot>&,
++                R4FloraViewState& frozenView, std::string&) {
++                if (!impl || !impl->flora || !impl->flora->IsReady())
++                { frozenView = {}; return true; }
++                frozenView = makeFloraView(callbackView, impl->floraEnvironment,
++                    impl->floraMotion, impl->scene.baseLightingStaticGlobals);
++                return true;
++            },
++            [this](IR4Backend& callbackBackend, const R4FloraViewState& frozenView,
++                std::string& callbackError) {
++                return impl && impl->flora && impl->flora->IsReady() &&
++                    impl->flora->DrawIntoActiveGBuffer(callbackBackend, frozenView, callbackError);
++            });
++    }
+     return true;
+ }
+ 
+ void MetalR4EngineScene::Reset()
+ {
+     std::shared_ptr<const GBufferWorldDrawCallback> worldDraw;
++    std::shared_ptr<const MainFloraOraclePrepareCallback> floraOraclePrepare;
++    std::shared_ptr<const MainFloraOracleDrawCallback> floraOracleDraw;
+     if (impl)
+     {
+         std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
+         worldDraw = impl->worldDraw;
++        floraOraclePrepare = impl->floraOraclePrepare;
++        floraOracleDraw = impl->floraOracleDraw;
+     }
+     impl = std::make_unique<Impl>();
+     std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
+     impl->worldDraw = std::move(worldDraw);
++    impl->floraOraclePrepare = std::move(floraOraclePrepare);
++    impl->floraOracleDraw = std::move(floraOracleDraw);
+ }
+ 
+ void MetalR4EngineScene::SetGBufferWorldDrawCallback(GBufferWorldDrawCallback callback)
+@@ -7350,6 +7651,19 @@
+         return false;
+     std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
+     return static_cast<bool>(impl->worldDraw);
++}
++
++void MetalR4EngineScene::SetMainFloraPixelOracleCallbacks(
++    MainFloraOraclePrepareCallback prepare, MainFloraOracleDrawCallback draw)
++{
++    if (!impl) impl = std::make_unique<Impl>();
++    std::shared_ptr<const MainFloraOraclePrepareCallback> prepareValue;
++    std::shared_ptr<const MainFloraOracleDrawCallback> drawValue;
++    if (prepare) prepareValue = std::make_shared<MainFloraOraclePrepareCallback>(std::move(prepare));
++    if (draw) drawValue = std::make_shared<MainFloraOracleDrawCallback>(std::move(draw));
++    std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
++    impl->floraOraclePrepare = std::move(prepareValue);
++    impl->floraOracleDraw = std::move(drawValue);
+ }
+ 
+ void MetalR4EngineScene::SubmitParticleFrame(xray::metal::particles::FrameBatch frame)
+@@ -7622,9 +7936,13 @@
+             return false;
+     }
+     std::shared_ptr<const GBufferWorldDrawCallback> worldDraw;
++    std::shared_ptr<const MainFloraOraclePrepareCallback> floraOraclePrepare;
++    std::shared_ptr<const MainFloraOracleDrawCallback> floraOracleDraw;
+     {
+         std::lock_guard<std::mutex> lock(impl->worldDrawMutex);
+         worldDraw = impl->worldDraw;
++        floraOraclePrepare = impl->floraOraclePrepare;
++        floraOracleDraw = impl->floraOracleDraw;
+     }
+     if (impl->emissiveFactorFrame != view.engineFrame &&
+         (view.engineFrame == 0u || view.engineFrame % 300u == 0u))
+@@ -7652,7 +7970,7 @@
+         impl->particles.get(), impl->bloom.get(), impl->emissiveTarget,
+         impl->emissiveFactorFrame == view.engineFrame ? impl->emissiveFactor : 0.0f,
+         &impl->nightVision, view, environment, vision,
+-        worldDraw, impl->fogScattering.get(), error);
++        worldDraw, floraOraclePrepare, floraOracleDraw, impl->fogScattering.get(), error);
+     if (rendered && impl->hud && impl->hud->IsReady())
+     {
+         const MetalR4HudAdapter::Telemetry& hud = impl->hud->LastTelemetry();
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.h
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+@@ -154,6 +154,14 @@
+         const std::shared_ptr<const R4EngineWorldSnapshot>& world,
+         std::string& error)>;
+ 
++    using MainFloraOraclePrepareCallback = std::function<bool(
++        const ViewState& view,
++        const std::shared_ptr<const R4EngineWorldSnapshot>& world,
++        R4FloraViewState& frozenView,
++        std::string& error)>;
++    using MainFloraOracleDrawCallback = std::function<bool(
++        IR4Backend& backend, const R4FloraViewState& frozenView, std::string& error)>;
++
+     MetalR4EngineScene();
+     ~MetalR4EngineScene();
+     MetalR4EngineScene(const MetalR4EngineScene&) = delete;
+@@ -203,6 +211,8 @@
+     // rendering: Render captures an immutable callback handle for that frame.
+     // An empty callback is the default and is a no-op.
+     void SetGBufferWorldDrawCallback(GBufferWorldDrawCallback callback);
++    void SetMainFloraPixelOracleCallbacks(MainFloraOraclePrepareCallback prepare,
++        MainFloraOracleDrawCallback draw);
+     bool HasGBufferWorldDrawCallback() const;
+ 
+     // Takes ownership of the CPU-expanded particle batch for the current
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -2306,6 +2306,31 @@
+         finishPrivateUploads(m_frames[m_activeFrameIndex]);
+         return EncodeMetalR4TemporalTextureValidation(
+             (__bridge void*)m_frames[m_activeFrameIndex].commandBuffer, nativeTextures, descriptor, error);
++    }
++
++    bool ValidateDepthStencilPair(const std::shared_ptr<IR4Texture>& firstTexture,
++        const std::shared_ptr<IR4Texture>& secondTexture,
++        const R4DepthStencilPairValidationDesc& descriptor, std::string& error) override
++    {
++        if (!m_frameActive || m_frames[m_activeFrameIndex].encoder)
++        { error = "depth/stencil pair validation requires an acquired frame outside an encoder"; return false; }
++        const auto first = std::dynamic_pointer_cast<MetalTexture>(firstTexture);
++        const auto second = std::dynamic_pointer_cast<MetalTexture>(secondTexture);
++        if (!first || !second || firstTexture == secondTexture ||
++            first->Descriptor().format != R4PixelFormat::Depth32FloatStencil8 ||
++            second->Descriptor().format != R4PixelFormat::Depth32FloatStencil8 ||
++            first->Descriptor().width != second->Descriptor().width ||
++            first->Descriptor().height != second->Descriptor().height)
++        { error = "depth/stencil pair validation requires distinct matching D32S8 textures"; return false; }
++        FrameContext& context = m_frames[m_activeFrameIndex];
++        finishPrivateUploads(context);
++        if (!EncodeMetalR4DepthStencilPairValidation(
++                (__bridge void*)context.commandBuffer,
++                (__bridge void*)first->Native(), (__bridge void*)second->Native(), descriptor, error))
++            return false;
++        retainFrameResource(context, firstTexture);
++        retainFrameResource(context, secondTexture);
++        return true;
+     }
+ 
+     bool LastFrameSubmitWasRetry() const override { return m_e08SubmitRetry; }
+--- a/src/Layers/xrRenderMetal/IR4Backend.h
++++ b/src/Layers/xrRenderMetal/IR4Backend.h
+@@ -644,6 +644,10 @@
+         const std::shared_ptr<IR4Texture>&, const std::shared_ptr<IR4Texture>&, std::string& error)
+     { error="local shadow batch validation is unsupported by this backend"; return false; }
+     virtual bool ValidateTemporalTextures(const R4TemporalTextureValidationDesc&, std::string&) = 0;
++    virtual bool ValidateDepthStencilPair(const std::shared_ptr<IR4Texture>& first,
++        const std::shared_ptr<IR4Texture>& second,
++        const R4DepthStencilPairValidationDesc&, std::string& error)
++    { error = "depth/stencil pair validation is unsupported by this backend"; return false; }
+     virtual bool ValidateStaticMotionVectors(const R4StaticMotionValidationDesc& descriptor,
+         std::string& error) = 0;
+     virtual bool CopyLatestCompletedSaveThumbnail(R4SaveThumbnailSnapshot& snapshot) const = 0;
+--- a/src/Layers/xrRenderMetal/MetalR4MotionValidation.mm
++++ b/src/Layers/xrRenderMetal/MetalR4MotionValidation.mm
+@@ -1005,3 +1005,142 @@
+     }];
+     return true;
+ }
++
++bool EncodeMetalR4DepthStencilPairValidation(void* commandBufferHandle,
++    void* firstDepthStencilHandle, void* secondDepthStencilHandle,
++    const R4DepthStencilPairValidationDesc& descriptor, std::string& error)
++{
++    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)commandBufferHandle;
++    id<MTLTexture> first = (__bridge id<MTLTexture>)firstDepthStencilHandle;
++    id<MTLTexture> second = (__bridge id<MTLTexture>)secondDepthStencilHandle;
++    if (!commandBuffer || !first || !second || first == second || descriptor.phase.empty() ||
++        descriptor.outputDirectory.empty() || (descriptor.expectEqual && descriptor.expectDifferent) ||
++        first.textureType != MTLTextureType2D || second.textureType != MTLTextureType2D ||
++        first.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 ||
++        second.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 ||
++        first.width == 0u || first.height == 0u || first.width != second.width ||
++        first.height != second.height)
++    {
++        error = "R4 depth/stencil pair validation requires matching non-empty D32S8 textures, phase, and output directory";
++        return false;
++    }
++
++    const NSUInteger width = first.width, height = first.height;
++    if (width > std::numeric_limits<NSUInteger>::max() / sizeof(float))
++    { error = "R4 depth/stencil pair row size overflow"; return false; }
++    const NSUInteger depthRow = alignedRowBytes(width * sizeof(float));
++    const NSUInteger stencilRow = alignedRowBytes(width);
++    if (height > std::numeric_limits<NSUInteger>::max() / depthRow ||
++        height > std::numeric_limits<NSUInteger>::max() / stencilRow)
++    { error = "R4 depth/stencil pair readback size overflow"; return false; }
++    const NSUInteger depthPlane = depthRow * height;
++    const NSUInteger stencilPlane = stencilRow * height;
++    if (depthPlane > std::numeric_limits<NSUInteger>::max() - stencilPlane ||
++        depthPlane + stencilPlane > std::numeric_limits<NSUInteger>::max() / 2u)
++    { error = "R4 depth/stencil pair total size overflow"; return false; }
++    const NSUInteger oneTextureBytes = depthPlane + stencilPlane;
++    const NSUInteger totalBytes = oneTextureBytes * 2u;
++    id<MTLBuffer> readback = [commandBuffer.device newBufferWithLength:totalBytes
++        options:MTLResourceStorageModeShared];
++    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
++    if (!readback || !blit)
++    {
++        if (blit) [blit endEncoding];
++        error = "Metal could not allocate depth/stencil pair readback";
++        return false;
++    }
++    readback.label = @"R4 main Flora exact depth-stencil pair readback";
++    const MTLOrigin origin = MTLOriginMake(0u, 0u, 0u);
++    const MTLSize extent = MTLSizeMake(width, height, 1u);
++    const auto encodeOne = [&](id<MTLTexture> texture, const NSUInteger base) {
++        [blit copyFromTexture:texture sourceSlice:0u sourceLevel:0u sourceOrigin:origin
++            sourceSize:extent toBuffer:readback destinationOffset:base
++            destinationBytesPerRow:depthRow destinationBytesPerImage:depthPlane
++            options:MTLBlitOptionDepthFromDepthStencil];
++        [blit copyFromTexture:texture sourceSlice:0u sourceLevel:0u sourceOrigin:origin
++            sourceSize:extent toBuffer:readback destinationOffset:base + depthPlane
++            destinationBytesPerRow:stencilRow destinationBytesPerImage:stencilPlane
++            options:MTLBlitOptionStencilFromDepthStencil];
++    };
++    encodeOne(first, 0u);
++    encodeOne(second, oneTextureBytes);
++    [blit endEncoding];
++
++    struct PairContext
++    {
++        id<MTLBuffer> readback;
++        NSUInteger width = 0u, height = 0u, depthRow = 0u, stencilRow = 0u;
++        NSUInteger depthPlane = 0u, stencilPlane = 0u, oneTextureBytes = 0u, readbackByteCount = 0u;
++        std::uint32_t frame = 0u;
++        std::string phase, outputDirectory;
++        bool expectEqual = false, expectDifferent = false;
++    };
++    auto context = std::make_shared<PairContext>();
++    context->readback = readback; context->width = width; context->height = height;
++    context->depthRow = depthRow; context->stencilRow = stencilRow;
++    context->depthPlane = depthPlane; context->stencilPlane = stencilPlane;
++    context->oneTextureBytes = oneTextureBytes; context->readbackByteCount = totalBytes;
++    context->frame = descriptor.engineFrame;
++    context->phase = descriptor.phase; context->outputDirectory = descriptor.outputDirectory;
++    context->expectEqual = descriptor.expectEqual; context->expectDifferent = descriptor.expectDifferent;
++    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
++        const bool commandSucceeded = completed.status == MTLCommandBufferStatusCompleted;
++        const auto* bytes = static_cast<const std::uint8_t*>(context->readback.contents);
++        const bool readbackAvailable = bytes != nullptr;
++        std::uint64_t depthMismatchPixels = 0u, depthMismatchBytes = 0u;
++        std::uint64_t stencilMismatchPixels = 0u, stencilMismatchBytes = 0u;
++        if (commandSucceeded && readbackAvailable)
++        {
++            for (NSUInteger y = 0u; y < context->height; ++y)
++            {
++                const auto* firstDepthRow = bytes + y * context->depthRow;
++                const auto* secondDepthRow = bytes + context->oneTextureBytes + y * context->depthRow;
++                const auto* firstStencilRow = bytes + context->depthPlane + y * context->stencilRow;
++                const auto* secondStencilRow = bytes + context->oneTextureBytes + context->depthPlane + y * context->stencilRow;
++                for (NSUInteger x = 0u; x < context->width; ++x)
++                {
++                    std::uint64_t depthLocal = 0u;
++                    for (NSUInteger component = 0u; component < sizeof(float); ++component)
++                        if (firstDepthRow[x * sizeof(float) + component] !=
++                            secondDepthRow[x * sizeof(float) + component]) ++depthLocal;
++                    if (depthLocal) ++depthMismatchPixels;
++                    depthMismatchBytes += depthLocal;
++                    if (firstStencilRow[x] != secondStencilRow[x])
++                    { ++stencilMismatchPixels; ++stencilMismatchBytes; }
++                }
++            }
++        }
++        const bool hasDifference = depthMismatchBytes != 0u || stencilMismatchBytes != 0u;
++        const bool passed = commandSucceeded && readbackAvailable &&
++            (!context->expectEqual || !hasDifference) &&
++            (!context->expectDifferent || hasDifference);
++        const std::filesystem::path path = std::filesystem::path(context->outputDirectory) /
++            ("r4_depth_stencil_pair_" + safeFilenamePart(context->phase) + "_frame_" +
++                std::to_string(context->frame) + ".json");
++        std::error_code fsError;
++        std::filesystem::create_directories(path.parent_path(), fsError);
++        std::lock_guard<std::mutex> outputLock(outputMutex());
++        std::ofstream report(path);
++        if (report)
++        {
++            report << "{\n  \"schema\": \"r4-depth-stencil-pair/v1\",\n"
++                << "  \"frame\": " << context->frame << ",\n"
++                << "  \"width\": " << context->width << ",\n"
++                << "  \"height\": " << context->height << ",\n"
++                << "  \"readback_byte_count\": " << context->readbackByteCount << ",\n"
++                << "  \"readback_available\": " << (readbackAvailable ? "true" : "false") << ",\n"
++                << "  \"phase\": \"" << jsonEscape(context->phase) << "\",\n"
++                << "  \"command_completed\": " << (commandSucceeded ? "true" : "false") << ",\n"
++                << "  \"expect_equal\": " << (context->expectEqual ? "true" : "false") << ",\n"
++                << "  \"expect_different\": " << (context->expectDifferent ? "true" : "false") << ",\n"
++                << "  \"depth_mismatch_pixel_count\": " << depthMismatchPixels << ",\n"
++                << "  \"depth_mismatch_byte_count\": " << depthMismatchBytes << ",\n"
++                << "  \"stencil_mismatch_pixel_count\": " << stencilMismatchPixels << ",\n"
++                << "  \"stencil_mismatch_byte_count\": " << stencilMismatchBytes << ",\n"
++                << "  \"result\": \"" << (passed ? "PASS" : "FAIL") << "\"\n}\n";
++        }
++        std::cerr << "R4 depth/stencil pair validation " << context->phase << " frame "
++            << context->frame << " " << (passed ? "PASS" : "FAIL") << " report=" << path.string() << std::endl;
++    }];
++    return true;
++}
+--- a/src/Layers/xrRenderMetal/R4TemporalTextureValidation.h
++++ b/src/Layers/xrRenderMetal/R4TemporalTextureValidation.h
+@@ -28,3 +28,16 @@
+ bool EncodeMetalR4TemporalTextureValidation(void* commandBuffer,
+     const std::vector<void*>& nativeTextures,
+     const R4TemporalTextureValidationDesc& descriptor, std::string& error);
++
++struct R4DepthStencilPairValidationDesc
++{
++    std::uint32_t engineFrame = 0;
++    std::string phase;
++    std::string outputDirectory;
++    bool expectEqual = false;
++    bool expectDifferent = false;
++};
++
++bool EncodeMetalR4DepthStencilPairValidation(void* commandBuffer,
++    void* firstDepthStencil, void* secondDepthStencil,
++    const R4DepthStencilPairValidationDesc& descriptor, std::string& error);

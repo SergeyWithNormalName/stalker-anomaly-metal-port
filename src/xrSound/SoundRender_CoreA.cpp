@@ -566,3 +566,12 @@ void CSoundRender_CoreA::update_listener(const Fvector& P, const Fvector& D, con
 	A_CHK(alListener3f (AL_VELOCITY, Listener.prevVelocity.x, Listener.prevVelocity.y, -Listener.prevVelocity.z));
 	A_CHK(alListenerfv (AL_ORIENTATION,&Listener.orientation[0].x));
 }
+
+void CSoundRender_CoreA::start_deferred_target(CSoundRender_Target* target)
+{
+	CSoundRender_TargetA* Ptr = static_cast<CSoundRender_TargetA*>(target);
+	if (m_is_supported)
+		Ptr->SetSlot(slot);
+	Ptr->render();
+}
+

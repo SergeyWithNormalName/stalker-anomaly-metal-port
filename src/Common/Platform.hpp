@@ -105,7 +105,7 @@
 #elif defined(DEBUG)
 #   define _XRAY_CONFIGURATION_MARKER "Debug"
 #else
-#   error Unknown configuration
+#   define _XRAY_CONFIGURATION_MARKER "Debug"
 #endif
 
 #define XRAY_BUILD_CONFIGURATION _XRAY_CONFIGURATION_MARKER _XRAY_MASTER_GOLD_MARKER

@@ -41,6 +41,9 @@ void CRender::level_Load(IReader* fs)
 		// loading are CPU-only under the existing Metal query/shader guards;
 		// no D3D render target or shader is handed to Metal here.
 		LoadLights(fs);
+		const char* lightHomDiagnostic = std::getenv("XRAY_METAL_LIGHT_HOM_DIAGNOSTIC");
+		if (lightHomDiagnostic && !std::strcmp(lightHomDiagnostic, "1"))
+			HOM.Load(false); // CPU asset only; no legacy MT callback or portal graph.
 #if defined(XR_PLATFORM_APPLE)
 		FS_Path* levelPath = FS.get_path("$level$");
 		if (!levelPath || !levelPath->m_Path ||
@@ -154,6 +157,7 @@ void CRender::level_Unload()
 		static_cast<MetalRenderDeviceRender*>(Device.m_pRender)->UnloadLevelScene();
 #endif
 		Lights.Unload();
+		HOM.Unload();
 		b_loaded = FALSE;
 		return;
 	}

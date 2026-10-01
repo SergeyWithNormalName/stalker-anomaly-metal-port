@@ -40,6 +40,7 @@ XRSOUND_API extern float psSoundRolloff;
 XRSOUND_API extern float psSoundOcclusionScale;
 XRSOUND_API extern Flags32 psSoundFlags;
 XRSOUND_API extern int psSoundTargets;
+XRSOUND_API extern int psSoundAppleSpatialMode;
 XRSOUND_API extern float snd_efx_environment_change_time;
 XRSOUND_API extern float psSpeedOfSound;
 XRSOUND_API extern int psSoundCacheSizeMB;
@@ -432,6 +433,10 @@ public:
 
 	virtual void object_relcase(CObject* obj) = 0;
 	virtual const Fvector& listener_position() = 0;
+
+	virtual void set_apple_spatial_mode(int mode) {}
+	virtual int get_apple_spatial_mode() const { return -1; }
+	virtual bool get_apple_spatial_diagnostics(char* outBuf, size_t outBufSize) { return false; }
 #ifdef __BORLANDC__
 	virtual SoundEnvironment_LIB*	get_env_library			()																						= 0;
 	virtual void					refresh_env_library		()																						= 0;

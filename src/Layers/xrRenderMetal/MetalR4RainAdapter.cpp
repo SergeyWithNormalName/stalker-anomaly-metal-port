@@ -20,6 +20,14 @@ struct RainVertex
 };
 static_assert(sizeof(RainVertex) == 28u, "effects_rain MSC vertex ABI must be P4/UV2/D3DCOLOR");
 
+struct SplashVertex
+{
+    float position[4];
+    float texcoord[2];
+    std::uint32_t d3dColor;
+};
+static_assert(sizeof(SplashVertex) == 28u, "effects_rain_splash MSC vertex ABI must be P4/UV2/D3DCOLOR");
+
 bool createBuffer(IR4Resources& resources, R4BufferUsage usage, const char* label,
     const void* source, std::size_t size, std::shared_ptr<IR4Buffer>& output, std::string& error)
 {
@@ -88,6 +96,53 @@ bool validBundle(const std::filesystem::path& directory, std::string& error)
     return true;
 }
 
+bool validSplashBundle(const std::filesystem::path& directory, std::string& error)
+{
+    const auto read = [](const std::filesystem::path& path, std::string& data) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return false;
+        data.assign(std::istreambuf_iterator<char>(input), {});
+        return true;
+    };
+    std::string vs, ps, dxil, receipt;
+    if (!read(directory / "effects_rain.vs.reflection.json", vs) ||
+        !read(directory / "effects_rain_splash.ps.reflection.json", ps) ||
+        !read(directory / "effects_rain_splash.ps.dxil.txt", dxil) ||
+        !read(directory / "effects-msc-receipt.json", receipt) ||
+        !std::filesystem::is_regular_file(directory / "effects_rain.vs.metallib") ||
+        !std::filesystem::is_regular_file(directory / "effects_rain_splash.ps.metallib"))
+    {
+        error = "SSFX rain-splash artifact, reflection, DXIL reflection, or receipt is missing";
+        return false;
+    }
+    const bool vsOk = vs.find("\"ShaderType\":\"Vertex\"") != std::string::npos &&
+        vs.find("\"ResourceCount\":2") != std::string::npos &&
+        vs.find("\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"") != std::string::npos &&
+        vs.find("\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"") != std::string::npos;
+    static constexpr const char* psEntries[] = {
+        "\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"",
+        "\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"",
+        "\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"",
+        "\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"",
+        "\"EltOffset\":96,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"Sampler\"",
+    };
+    bool psOk = ps.find("\"ShaderType\":\"Fragment\"") != std::string::npos &&
+        ps.find("\"ResourceCount\":5") != std::string::npos &&
+        ps.find("\"num_render_targets\":1") != std::string::npos;
+    for (const char* entry : psEntries) psOk = psOk && ps.find(entry) != std::string::npos;
+    const bool setupOk = dxil.find("float4 ssfx_rain_setup") != std::string::npos &&
+        dxil.find("Offset:  256") != std::string::npos && dxil.find("Size:   272") != std::string::npos;
+    const bool receiptOk = receipt.find("\"scope\": \"exact_active_e06_leaf_non_msaa\"") != std::string::npos &&
+        receipt.find("\"SSFX_RAIN_QUALITY=2\"") != std::string::npos;
+    if (!vsOk || !psOk || !setupOk || !receiptOk)
+    {
+        error = "SSFX rain-splash reflection/constant-buffer/receipt ABI mismatch";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 std::array<float, 16> texgen(const std::array<float, 16>& viewProjection)
 {
     std::array<float, 16> result{};
@@ -106,11 +161,16 @@ struct MetalR4RainAdapter::Impl
 {
     std::shared_ptr<IR4GraphicsPipeline> refractionPipeline;
     std::shared_ptr<IR4GraphicsPipeline> pipeline;
+    std::shared_ptr<IR4GraphicsPipeline> splashPipeline;
     std::shared_ptr<IR4Texture> base;
+    std::shared_ptr<IR4Texture> splashBase;
     std::shared_ptr<IR4Sampler> baseSampler;
     std::shared_ptr<IR4Sampler> linearSampler;
     std::shared_ptr<IR4Buffer> vertices;
     std::shared_ptr<IR4Buffer> indices;
+    std::vector<SplashVertex> splashVertices;
+    std::vector<std::uint32_t> splashIndices;
+    std::array<float, 4> splashSetup{};
     std::shared_ptr<IR4Buffer> transforms;
     std::shared_ptr<IR4Buffer> setup;
     std::shared_ptr<IR4Buffer> refractionVertices;
@@ -233,8 +293,47 @@ bool MetalR4RainAdapter::Configure(IR4Backend& backend, const Options& options, 
         !createBuffer(backend.Resources(), R4BufferUsage::Uniform, "R4 ssfx_rain transforms",
             identity.data(), sizeof(identity), m_impl->refractionTransforms, error))
     { m_status = "ssfx_rain prepass resources unavailable: " + error; status = m_status; return true; }
+
+    std::string splashStatus;
+    if (options.splashShaderDirectory.empty())
+        splashStatus = "SSFX splash bundle not configured";
+    else
+    {
+        if (validSplashBundle(options.splashShaderDirectory, splashStatus) && options.ddsBytesProvider &&
+            loadDds(backend.Resources(), options.ddsBytesProvider, "fx/rain_splash.dds", m_impl->splashBase, splashStatus))
+        {
+            R4GraphicsPipelineDesc splash;
+            splash.label = "R4 exact effects_rain_splash SSFX ground particles";
+            splash.shaderKey = "r4-effects-rain-splash-msc-e06-v1";
+            const std::string splashVs = (options.splashShaderDirectory / "effects_rain.vs.metallib").string();
+            const std::string splashPs = (options.splashShaderDirectory / "effects_rain_splash.ps.metallib").string();
+            splash.vertexMetallibPath = splashVs.c_str();
+            splash.fragmentMetallibPath = splashPs.c_str();
+            splash.vertexAttributes = {{11u, 6u, offsetof(SplashVertex, position), R4VertexFormat::Float4},
+                {12u, 6u, offsetof(SplashVertex, texcoord), R4VertexFormat::Float2},
+                {13u, 6u, offsetof(SplashVertex, d3dColor), R4VertexFormat::UChar4Normalized}};
+            splash.vertexLayouts = {{6u, sizeof(SplashVertex)}};
+            splash.colorFormats = {R4PixelFormat::RGBA8Unorm};
+            splash.depthFormat = R4PixelFormat::Depth32FloatStencil8;
+            splash.depthCompare = R4CompareFunction::LessEqual;
+            splash.depthWrite = false;
+            splash.cullMode = R4CullMode::None;
+            splash.blend.enabled = true;
+            splash.blend.sourceRgb = splash.blend.sourceAlpha = R4BlendFactor::SourceAlpha;
+            splash.blend.destinationRgb = splash.blend.destinationAlpha = R4BlendFactor::OneMinusSourceAlpha;
+            m_impl->splashPipeline = backend.CreateGraphicsPipeline(splash, splashStatus);
+            if (!m_impl->splashPipeline)
+                splashStatus = "SSFX splash pipeline unavailable: " + splashStatus;
+        }
+        else if (splashStatus.empty())
+            splashStatus = "SSFX splash texture provider or fx/rain_splash DDS unavailable";
+    }
     m_ready = true;
     m_status = "exact effects_rain MSC sprite pipeline ready";
+    if (m_impl->splashPipeline)
+        m_status += "; exact SSFX ground splash pipeline ready";
+    else if (!splashStatus.empty())
+        m_status += "; " + splashStatus;
     status = m_status;
     return true;
 }
@@ -244,7 +343,41 @@ bool MetalR4RainAdapter::StageFrame(IR4Resources& resources, xray::metal::rain::
 {
     if (!m_ready || !m_impl)
         return true;
-    m_telemetry = {frame.vertices.size(), 0u, frame.droppedVertices, frame.density, frame.ssfx};
+    m_telemetry = {};
+    m_telemetry.capturedVertices = frame.vertices.size();
+    m_telemetry.capturedSplashVertices = frame.splashVertices.size();
+    m_telemetry.droppedVertices = frame.droppedVertices;
+    m_telemetry.droppedSplashVertices = frame.droppedSplashVertices;
+    m_telemetry.density = frame.density;
+    m_telemetry.ssfx = frame.ssfx;
+    m_impl->splashVertices.clear();
+    m_impl->splashIndices.clear();
+    m_impl->splashSetup = frame.splashSetup;
+    if (frame.ssfx && !frame.splashVertices.empty() && !frame.splashIndices.empty() && m_impl->splashPipeline)
+    {
+        m_impl->splashVertices.reserve(frame.splashVertices.size());
+        for (const auto& source : frame.splashVertices)
+        {
+            SplashVertex destination{};
+            destination.position[0] = source.position[0];
+            destination.position[1] = source.position[1];
+            destination.position[2] = source.position[2];
+            destination.position[3] = 1.0f;
+            destination.texcoord[0] = source.texcoord[0];
+            destination.texcoord[1] = source.texcoord[1];
+            destination.d3dColor = source.d3dColor;
+            m_impl->splashVertices.push_back(destination);
+        }
+        m_impl->splashIndices = std::move(frame.splashIndices);
+        for (const std::uint32_t index : m_impl->splashIndices)
+            if (index >= m_impl->splashVertices.size())
+            {
+                m_impl->splashVertices.clear();
+                m_impl->splashIndices.clear();
+                error = "SSFX splash capture contains an out-of-range index";
+                return false;
+            }
+    }
     m_impl->vertices.reset(); m_impl->indices.reset(); m_impl->indexCount = 0u;
     if (frame.vertices.empty())
         return true;
@@ -264,7 +397,7 @@ bool MetalR4RainAdapter::StageFrame(IR4Resources& resources, xray::metal::rain::
     {
         const std::uint16_t base = static_cast<std::uint16_t>(quad * 4u);
         indices.insert(indices.end(), {base, static_cast<std::uint16_t>(base + 1u), static_cast<std::uint16_t>(base + 2u),
-            base, static_cast<std::uint16_t>(base + 2u), static_cast<std::uint16_t>(base + 3u)});
+            static_cast<std::uint16_t>(base + 2u), static_cast<std::uint16_t>(base + 1u), static_cast<std::uint16_t>(base + 3u)});
     }
     if (!createBuffer(resources, R4BufferUsage::Vertex, "R4 effects_rain vertices", vertices.data(),
             vertices.size() * sizeof(RainVertex), m_impl->vertices, error) ||
@@ -329,13 +462,14 @@ bool MetalR4RainAdapter::DrawIntoActiveForward(IR4Backend& backend, const std::a
     const std::array<float, 16> screenTexgen = texgen(viewProjection);
     std::memcpy(transforms.data(), viewProjection.data(), sizeof(viewProjection));
     std::memcpy(transforms.data() + 64u, screenTexgen.data(), sizeof(screenTexgen));
-    if (!backend.Resources().UpdateBuffer(m_impl->transforms, 0u, transforms.data(), transforms.size(), error))
+    R4FrameBufferSlice transformSlice;
+    if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u, transformSlice, error))
         return false;
     R4MscStageBindings vertex;
     vertex.stage = R4ShaderStage::Vertex;
     vertex.tlabSize = 48u;
-    vertex.resources = {{R4MscResourceType::ConstantBuffer, 0u, m_impl->transforms, 0u, 256u, nullptr, nullptr},
-        {R4MscResourceType::ConstantBuffer, 24u, m_impl->transforms, 64u, 64u, nullptr, nullptr}};
+    vertex.resources = {{R4MscResourceType::ConstantBuffer, 0u, transformSlice.buffer, transformSlice.offset, 256u, nullptr, nullptr},
+        {R4MscResourceType::ConstantBuffer, 24u, transformSlice.buffer, transformSlice.offset + 64u, 64u, nullptr, nullptr}};
     R4MscStageBindings fragment;
     fragment.stage = R4ShaderStage::Fragment;
     fragment.tlabSize = 192u;
@@ -359,6 +493,64 @@ bool MetalR4RainAdapter::DrawIntoActiveForward(IR4Backend& backend, const std::a
         !backend.DrawIndexed(draw, error))
         return false;
     m_telemetry.submittedDrops = m_impl->indexCount / 6u;
+    return true;
+}
+
+bool MetalR4RainAdapter::DrawSplashesIntoActiveForward(IR4Backend& backend,
+    const std::array<float, 16>& viewProjection, const std::shared_ptr<IR4Texture>& refraction,
+    std::string& error)
+{
+    if (!m_ready || !m_impl || !m_impl->splashPipeline || m_impl->splashIndices.empty())
+        return true;
+    if (!refraction || !m_impl->splashBase || !m_impl->baseSampler || !m_impl->linearSampler)
+    {
+        error = "SSFX ground splashes have incomplete texture inputs";
+        return false;
+    }
+    std::array<std::uint8_t, 256> transforms{};
+    const std::array<float, 16> screenTexgen = texgen(viewProjection);
+    std::memcpy(transforms.data(), viewProjection.data(), sizeof(viewProjection));
+    std::memcpy(transforms.data() + 64u, screenTexgen.data(), sizeof(screenTexgen));
+    R4FrameBufferSlice vertexConstants, vertexData, indexData, fragmentConstants;
+    std::array<std::uint8_t, 272> setup{};
+    std::memcpy(setup.data() + 256u, m_impl->splashSetup.data(), sizeof(m_impl->splashSetup));
+    if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u, vertexConstants, error) ||
+        !backend.UploadFrameData(m_impl->splashVertices.data(), m_impl->splashVertices.size() * sizeof(SplashVertex),
+            16u, vertexData, error) ||
+        !backend.UploadFrameData(m_impl->splashIndices.data(), m_impl->splashIndices.size() * sizeof(std::uint32_t),
+            16u, indexData, error) ||
+        !backend.UploadFrameData(setup.data(), setup.size(), 256u, fragmentConstants, error))
+        return false;
+
+    R4MscStageBindings vertex;
+    vertex.stage = R4ShaderStage::Vertex;
+    vertex.tlabSize = 48u;
+    vertex.resources = {
+        {R4MscResourceType::ConstantBuffer, 0u, vertexConstants.buffer, vertexConstants.offset, 64u, nullptr, nullptr},
+        {R4MscResourceType::ConstantBuffer, 24u, vertexConstants.buffer, vertexConstants.offset + 64u, 64u, nullptr, nullptr},
+    };
+    R4MscStageBindings fragment;
+    fragment.stage = R4ShaderStage::Fragment;
+    fragment.tlabSize = 120u;
+    fragment.resources = {
+        {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, m_impl->splashBase, nullptr},
+        {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, refraction, nullptr},
+        {R4MscResourceType::ConstantBuffer, 48u, fragmentConstants.buffer, fragmentConstants.offset, 272u, nullptr, nullptr},
+        // DXIL reflection maps smp_rtlinear to s0 and smp_base to s1.
+        {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, m_impl->linearSampler},
+        {R4MscResourceType::Sampler, 96u, nullptr, 0u, 0u, nullptr, m_impl->baseSampler},
+    };
+    R4IndexedDrawDesc draw;
+    draw.indexBuffer = indexData.buffer;
+    draw.indexBufferOffset = indexData.offset;
+    draw.indexCount = static_cast<std::uint32_t>(m_impl->splashIndices.size());
+    draw.indexType = R4IndexType::UInt32;
+    if (!backend.BindGraphicsPipeline(m_impl->splashPipeline, error) ||
+        !backend.BindVertexBuffer(6u, vertexData.buffer, vertexData.offset, error) ||
+        !backend.BindMscResources(vertex, error) || !backend.BindMscResources(fragment, error) ||
+        !backend.DrawIndexed(draw, error))
+        return false;
+    m_telemetry.submittedSplashTriangles = m_impl->splashIndices.size() / 3u;
     return true;
 }
 
@@ -395,6 +587,11 @@ bool MetalR4RainAdapter::DrawRefraction(IR4Backend& backend, const std::shared_p
 bool MetalR4RainAdapter::HasDrops() const
 {
     return m_ready && m_impl && m_impl->indexCount != 0u;
+}
+
+bool MetalR4RainAdapter::HasSplashes() const
+{
+    return m_ready && m_impl && m_impl->splashPipeline && !m_impl->splashIndices.empty();
 }
 
 const std::shared_ptr<IR4Texture>& MetalR4RainAdapter::MotionTarget() const

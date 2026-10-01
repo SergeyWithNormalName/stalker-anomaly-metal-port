@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include <dinput.h>
 #include "UIPropertiesBox.h"
 #include "../level.h"
 #include "UIListBoxItem.h"
@@ -393,5 +394,74 @@ void CUIPropertiesBox::Draw()
 
 bool CUIPropertiesBox::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {
+	if (keyboard_action != WINDOW_KEY_PRESSED)
+		return true;
+
+	const u32 total = m_UIListWnd.GetSize();
+	if (total == 0)
+	{
+		if (dik == DIK_ESCAPE)
+			Hide();
+		return true;
+	}
+
+	const u32 curIdx = m_UIListWnd.GetSelectedIDX();
+
+	if (dik == DIK_DOWN)
+	{
+		if (curIdx == u32(-1) || curIdx + 1 >= total)
+			m_UIListWnd.SetSelectedIDX(0);
+		else
+			m_UIListWnd.SetSelectedIDX(curIdx + 1);
+		return true;
+	}
+	else if (dik == DIK_UP)
+	{
+		if (curIdx == u32(-1) || curIdx == 0)
+			m_UIListWnd.SetSelectedIDX(total - 1);
+		else
+			m_UIListWnd.SetSelectedIDX(curIdx - 1);
+		return true;
+	}
+	else if (dik == DIK_RETURN || dik == (0xed + 100) /* MOUSE_1 */)
+	{
+		CUIListBoxItem* sel = m_UIListWnd.GetSelectedItem();
+		if (sel)
+		{
+			if (m_item_submenus.count(sel))
+			{
+				HideActiveSubmenu();
+				ShowSubMenuForItem(sel);
+				return true;
+			}
+			GetMessageTarget()->SendMessage(this, PROPERTY_CLICKED);
+			Hide();
+		}
+		return true;
+	}
+	else if (dik == DIK_RIGHT)
+	{
+		CUIListBoxItem* sel = m_UIListWnd.GetSelectedItem();
+		if (sel && m_item_submenus.count(sel))
+		{
+			HideActiveSubmenu();
+			ShowSubMenuForItem(sel);
+			return true;
+		}
+	}
+	else if (dik == DIK_LEFT)
+	{
+		if (m_parent_menu)
+		{
+			Hide();
+			return true;
+		}
+	}
+	else if (dik == DIK_ESCAPE)
+	{
+		Hide();
+		return true;
+	}
+
 	return true;
 }

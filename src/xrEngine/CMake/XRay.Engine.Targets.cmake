@@ -65,6 +65,50 @@ function(add_engine_target NAME)
     # Keep Homebrew's dylib directory in the executable's search paths so the
     # backend resolves without requiring DYLD_LIBRARY_PATH at launch.
     target_link_options(${NAME} PRIVATE "-Wl,-rpath,/opt/homebrew/lib")
+
+    # Unified deployment target resolution for Info.plist LSMinimumSystemVersion.
+    # If CMAKE_OSX_DEPLOYMENT_TARGET is not explicitly set, AppleClang targets
+    # the active macOS SDK by default. Query it so Info.plist matches the
+    # Mach-O executable's LC_BUILD_VERSION minos exactly.
+    if(NOT "${CMAKE_OSX_DEPLOYMENT_TARGET}" STREQUAL "")
+      set(MACOS_BUNDLE_MINIMUM_SYSTEM_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    else()
+      execute_process(
+        COMMAND xcrun --sdk macosx --show-sdk-version
+        OUTPUT_VARIABLE _MACOS_DETECTED_SDK_VER
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(_MACOS_DETECTED_SDK_VER)
+        set(MACOS_BUNDLE_MINIMUM_SYSTEM_VERSION "${_MACOS_DETECTED_SDK_VER}")
+      else()
+        set(MACOS_BUNDLE_MINIMUM_SYSTEM_VERSION "${CMAKE_SYSTEM_VERSION}")
+      endif()
+    endif()
+
+    set(MACOS_BUNDLE_IDENTIFIER "com.stalker-anomaly.game")
+    set(MACOS_BUNDLE_NAME "Anomaly")
+    set(MACOS_BUNDLE_DISPLAY_NAME "S.T.A.L.K.E.R. Anomaly")
+    set(MACOS_BUNDLE_EXECUTABLE "${${NAME}_NAME_OUTPUT}")
+    set(MACOS_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+    set(MACOS_BUNDLE_VERSION "${TODAY_DOTS}")
+    set(MACOS_BUNDLE_ICON_FILE "AppIcon")
+
+    set(PLIST_IN "${CMAKE_SOURCE_DIR}/packaging/macos/Info.plist.in")
+    set(PLIST_OUT "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.Info.plist")
+    configure_file("${PLIST_IN}" "${PLIST_OUT}" @ONLY)
+
+    set(SYNC_DEV_BUNDLE_SCRIPT "${CMAKE_SOURCE_DIR}/packaging/macos/sync_dev_bundle.sh")
+
+    add_custom_command(TARGET ${NAME} POST_BUILD
+      COMMAND /bin/bash "${SYNC_DEV_BUNDLE_SCRIPT}"
+        --target-file "$<TARGET_FILE:${NAME}>"
+        --bundle-dir "$<TARGET_FILE_DIR:${NAME}>/Anomaly.app"
+        --plist-file "${PLIST_OUT}"
+        --output-name "${${NAME}_NAME_OUTPUT}"
+      COMMENT "Updating DEV macOS bundle: Anomaly.app"
+      VERBATIM
+    )
   endif()
 endfunction()
 

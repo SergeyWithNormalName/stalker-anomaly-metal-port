@@ -198,6 +198,10 @@ void CMainMenu::Activate(bool bActivate)
 
 	if (bActivate)
 	{
+#if defined(XR_PLATFORM_APPLE)
+		if (pInput)
+			pInput->SetRelativeMouseMode(false);
+#endif
 		b_shniaganeed_pp = true;
 		Device.Pause(TRUE, FALSE, TRUE, "mm_activate1");
 		m_Flags.set(flActive | flNeedChangeCapture,TRUE);
@@ -353,6 +357,10 @@ void CMainMenu::IR_OnMouseHold(int btn)
 void CMainMenu::IR_OnMouseMove(int x, int y)
 {
 	if (!IsActive()) return;
+#if defined(XR_PLATFORM_APPLE)
+	if (pInput)
+		pInput->SetRelativeMouseMode(false);
+#endif
 	CDialogHolder::IR_UIOnMouseMove(x, y);
 };
 

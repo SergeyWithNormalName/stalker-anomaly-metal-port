@@ -61,6 +61,8 @@ public:
 	u32 uTime2Change;
 	EVENT eDemoStart;
 
+	CUISequencer* Intro() const { return m_intro; }
+
 	CGamePersistent();
 	virtual ~CGamePersistent();
 

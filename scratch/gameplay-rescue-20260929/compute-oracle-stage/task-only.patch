@@ -1,0 +1,463 @@
+--- a/src/Layers/xrRenderMetal/IR4Backend.h
++++ b/src/Layers/xrRenderMetal/IR4Backend.h
+@@ -65,6 +65,16 @@
+ // existing 36-byte SKIN_0 stream. The canonical buffer must outlive the
+ // acquired frame and must not be an arena upload slice. The backend validates every resource span
+ // and the full job batch before it encodes any writes.
++struct R4ComputeSkinOracleRequest
++{
++    std::string stableKey;
++    std::vector<std::uint8_t> expectedBytes;
++    std::uint64_t poseHash = 0u;
++    std::uint64_t outputWriteSerial = 0u;
++    std::uint64_t prewarmEpoch = 0u;
++    std::uint32_t engineFrame = 0u;
++};
++
+ struct R4ComputeSkinJob
+ {
+     std::shared_ptr<IR4Buffer> canonicalInput;
+@@ -78,6 +88,10 @@
+     std::uint32_t influenceCount = 0;
+     std::uint32_t boneCount = 0;
+     std::uint32_t maxReferencedBoneIndex = 0;
++    // Optional, default-off diagnostic request. The backend owns the request
++    // through command-buffer completion and may skip it when its per-frame
++    // readback cap is exhausted. This never changes compute dispatch semantics.
++    std::shared_ptr<const R4ComputeSkinOracleRequest> oracle;
+ };
+ 
+ // Value-only gameplay state captured after the actor update and before the
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -60,6 +60,7 @@
+ #include <fstream>
+ #include <iomanip>
+ #include <limits>
++#include <memory>
+ #include <mutex>
+ #include <sstream>
+ #include <stdio.h>
+@@ -74,6 +75,96 @@
+ {
+ constexpr std::size_t MaxFramesInFlight = 3;
+ constexpr std::size_t MaxPrivateUploadRecoveryFailures = 3;
++constexpr std::size_t MaxComputeSkinOracleBytesPerFrame = 4u * 1024u * 1024u;
++
++enum class ComputeSkinOracleOutcome
++{
++    Pending,
++    Pass,
++    Fail,
++    Inconclusive,
++};
++
++struct ComputeSkinOracleReceipt
++{
++    std::shared_ptr<const R4ComputeSkinOracleRequest> request;
++    id<MTLBuffer> readback = nil;
++    std::uint64_t acquireEpoch = 0u;
++    std::uint32_t vertexCount = 0u;
++    std::uint32_t influenceCount = 0u;
++    bool copyEncoded = false;
++    const char* unavailableReason = nullptr;
++    ComputeSkinOracleOutcome outcome = ComputeSkinOracleOutcome::Pending;
++};
++
++ComputeSkinOracleOutcome finishComputeSkinOracleReceipt(
++    const std::shared_ptr<ComputeSkinOracleReceipt>& receipt,
++    const MTLCommandBufferStatus commandStatus, const std::uint64_t frameSerial,
++    const bool probeCompletion)
++{
++    if (!receipt || !receipt->request)
++        return ComputeSkinOracleOutcome::Inconclusive;
++    const R4ComputeSkinOracleRequest& request = *receipt->request;
++    ComputeSkinOracleOutcome outcome = ComputeSkinOracleOutcome::Inconclusive;
++    std::size_t mismatchOffset = std::numeric_limits<std::size_t>::max();
++    std::size_t mismatchBytes = 0u;
++    if (commandStatus == MTLCommandBufferStatusCompleted && receipt->copyEncoded &&
++        receipt->readback && receipt->readback.length >= request.expectedBytes.size() &&
++        receipt->readback.contents &&
++        !request.expectedBytes.empty())
++    {
++        const auto* actual = static_cast<const std::uint8_t*>(receipt->readback.contents);
++        if (std::memcmp(actual, request.expectedBytes.data(), request.expectedBytes.size()) == 0)
++            outcome = ComputeSkinOracleOutcome::Pass;
++        else
++        {
++            outcome = ComputeSkinOracleOutcome::Fail;
++            for (std::size_t i = 0; i < request.expectedBytes.size(); ++i)
++                if (actual[i] != request.expectedBytes[i])
++                {
++                    if (mismatchOffset == std::numeric_limits<std::size_t>::max())
++                        mismatchOffset = i;
++                    ++mismatchBytes;
++                }
++        }
++    }
++
++    const char* status = outcome == ComputeSkinOracleOutcome::Pass ? "PASS" :
++        (outcome == ComputeSkinOracleOutcome::Fail ? "FAIL" : "INCONCLUSIVE");
++    const char* reason = outcome != ComputeSkinOracleOutcome::Inconclusive ? "" :
++        (commandStatus != MTLCommandBufferStatusCompleted ? "command-buffer-error" :
++            (receipt->unavailableReason ? receipt->unavailableReason : "missing-readback"));
++    const char* serialLabel = probeCompletion ? "probe" : "submitted";
++    std::fprintf(stderr,
++        "METAL_COMPUTE_SKIN_ORACLE status=%s key=\"%s\" frame_serial_%s=%llu engine_frame=%u "
++        "prewarm_epoch=%llu acquire_epoch=%llu pose_hash=%llu output_write_serial=%llu "
++        "vertices=%u influences=%u bytes=%zu msl_sha256=%s reason=%s mismatch_bytes=%zu mismatch_offset=%zu\n",
++        status, request.stableKey.c_str(), serialLabel,
++        static_cast<unsigned long long>(frameSerial), request.engineFrame,
++        static_cast<unsigned long long>(request.prewarmEpoch),
++        static_cast<unsigned long long>(receipt->acquireEpoch),
++        static_cast<unsigned long long>(request.poseHash),
++        static_cast<unsigned long long>(request.outputWriteSerial), receipt->vertexCount,
++        receipt->influenceCount, request.expectedBytes.size(), xray::metal::R4ComputeSkinSourceSha256,
++        reason, mismatchBytes, mismatchOffset);
++    receipt->outcome = outcome;
++    return outcome;
++}
++
++void reportSkippedComputeSkinOracle(const R4ComputeSkinOracleRequest& request,
++    const std::uint64_t acquireEpoch, const char* reason)
++{
++    std::fprintf(stderr,
++        "METAL_COMPUTE_SKIN_ORACLE status=SKIPPED key=\"%s\" engine_frame=%u "
++        "prewarm_epoch=%llu acquire_epoch=%llu pose_hash=%llu output_write_serial=%llu "
++        "bytes=%zu reason=%s msl_sha256=%s\n",
++        request.stableKey.c_str(), request.engineFrame,
++        static_cast<unsigned long long>(request.prewarmEpoch),
++        static_cast<unsigned long long>(acquireEpoch),
++        static_cast<unsigned long long>(request.poseHash),
++        static_cast<unsigned long long>(request.outputWriteSerial), request.expectedBytes.size(),
++        reason, xray::metal::R4ComputeSkinSourceSha256);
++}
+ 
+ static std::size_t GetConfiguredFramesInFlight()
+ {
+@@ -1193,6 +1284,7 @@
+         context.retainedResources.clear();
+         context.retainedOwners.clear();
+         context.indirectReads.clear();
++        context.computeSkinOracleReceipt.reset();
+         context.privateUploads.clear();
+         context.uploadArena.Reset();
+         context.e02CowBytes = 0;
+@@ -1872,8 +1964,67 @@
+                 }
+         }
+ 
++        std::shared_ptr<ComputeSkinOracleReceipt> oracleReceipt;
++        const ValidatedJob* oracleJob = nullptr;
++        bool oracleFrameCapReached = bool(context.computeSkinOracleReceipt);
++        for (const ValidatedJob& item : validated)
++        {
++            const auto& request = item.job->oracle;
++            if (!request) continue;
++            if (oracleFrameCapReached)
++            {
++                reportSkippedComputeSkinOracle(*request, acquireEpoch, "one-readback-per-frame-cap");
++                continue;
++            }
++            if (!m_computeSkinOracleEnabled)
++            {
++                reportSkippedComputeSkinOracle(*request, acquireEpoch, "oracle-opt-in-disabled");
++                continue;
++            }
++            const bool requestMetadataValid = !request->stableKey.empty() &&
++                request->prewarmEpoch != 0u && request->outputWriteSerial != 0u;
++            if (!requestMetadataValid || request->expectedBytes.empty() ||
++                request->expectedBytes.size() != item.outputBytes ||
++                request->expectedBytes.size() > MaxComputeSkinOracleBytesPerFrame)
++            {
++                reportSkippedComputeSkinOracle(*request, acquireEpoch,
++                    request->expectedBytes.size() > MaxComputeSkinOracleBytesPerFrame ?
++                        "four-megabyte-frame-cap" : "invalid-request-span-or-metadata");
++                continue;
++            }
++            id<MTLBuffer> readback = [m_device newBufferWithLength:request->expectedBytes.size()
++                options:MTLResourceStorageModeShared];
++            if (!readback)
++            {
++                reportSkippedComputeSkinOracle(*request, acquireEpoch, "readback-allocation-failed");
++                continue;
++            }
++            try
++            {
++                oracleReceipt = std::make_shared<ComputeSkinOracleReceipt>();
++            }
++            catch (...)
++            {
++                reportSkippedComputeSkinOracle(*request, acquireEpoch, "receipt-allocation-failed");
++                continue;
++            }
++            readback.label = @"R4 compute skin bounded oracle readback";
++            oracleReceipt->request = request;
++            oracleReceipt->readback = readback;
++            oracleReceipt->acquireEpoch = acquireEpoch;
++            oracleReceipt->vertexCount = item.job->vertexCount;
++            oracleReceipt->influenceCount = item.job->influenceCount;
++            oracleJob = &item;
++            oracleFrameCapReached = true;
++        }
++
+         if (!ensureComputeSkinPipeline(error))
+-            return false;
++        {
++            if (oracleReceipt && oracleReceipt->request)
++                reportSkippedComputeSkinOracle(*oracleReceipt->request, acquireEpoch,
++                    "compute-pipeline-unavailable-before-dispatch");
++            return false;
++        }
+         try
+         {
+             const std::size_t extraOwners = jobs.size() * 6u;
+@@ -1906,11 +2057,16 @@
+         id<MTLComputeCommandEncoder> compute = [context.commandBuffer computeCommandEncoder];
+         if (!compute)
+         {
++            if (oracleReceipt && oracleReceipt->request)
++                reportSkippedComputeSkinOracle(*oracleReceipt->request, acquireEpoch,
++                    "compute-encoder-unavailable-before-dispatch");
+             error = "compute skinning encoder creation failed before dispatch";
+             return false;
+         }
+         compute.label = @"R4 canonical compute skin jobs";
+         [compute setComputePipelineState:m_computeSkinPipeline];
++        if (oracleReceipt)
++            context.computeSkinOracleReceipt = oracleReceipt;
+         struct SkinParams { std::uint32_t vertices, influences; };
+         const NSUInteger threadWidth = std::max<NSUInteger>(1u,
+             std::min<NSUInteger>(m_computeSkinPipeline.threadExecutionWidth,
+@@ -1927,6 +2083,21 @@
+                 threadsPerThreadgroup:MTLSizeMake(threadWidth, 1u, 1u)];
+         }
+         [compute endEncoding];
++        if (oracleReceipt && oracleJob)
++        {
++            id<MTLBlitCommandEncoder> oracleBlit = [context.commandBuffer blitCommandEncoder];
++            if (!oracleBlit)
++                oracleReceipt->unavailableReason = "oracle-blit-encoder-unavailable-after-dispatch";
++            else
++            {
++                [oracleBlit copyFromBuffer:oracleJob->outputNative
++                    sourceOffset:oracleJob->job->outputOffset
++                    toBuffer:oracleReceipt->readback destinationOffset:0
++                    size:oracleJob->job->outputSize];
++                [oracleBlit endEncoding];
++                oracleReceipt->copyEncoded = true;
++            }
++        }
+         error.clear();
+         return true;
+     }
+@@ -2103,6 +2274,8 @@
+         R4SaveThumbnailSnapshot* latestThumbnail = &m_latestThumbnail;
+         const std::uint64_t generation = context.drawableGeneration;
+         id<MTLBuffer> thumbnailBuffer = context.thumbnailBuffer;
++        const std::shared_ptr<ComputeSkinOracleReceipt> computeSkinOracleReceipt =
++            std::move(context.computeSkinOracleReceipt);
+         id<CAMetalDrawable> e01Drawable = e01 ? context.drawable : nil;
+         if (e01 && m_e01Presentation && m_e01Presentation->file)
+         {
+@@ -2190,6 +2363,9 @@
+                             (unsigned long long)e08PassCpuRecords[i].second);
+                     }
+                 }
++                if (computeSkinOracleReceipt)
++                    finishComputeSkinOracleReceipt(computeSkinOracleReceipt,
++                        commandBuffer.status, serial, false);
+                 std::uint64_t observed = completedSerial->load(std::memory_order_relaxed);
+                 while (observed < serial &&
+                        !completedSerial->compare_exchange_weak(
+@@ -3509,6 +3685,7 @@
+             context.retainedResources.clear();
+             context.retainedOwners.clear();
+             context.indirectReads.clear();
++            context.computeSkinOracleReceipt.reset();
+             // Balance the drain wait before ARC releases the dispatch object;
+             // libdispatch traps if a semaphore is destroyed while consumed.
+             dispatch_semaphore_signal(context.available);
+@@ -4058,6 +4235,7 @@
+         std::vector<std::shared_ptr<void>> retainedResources;
+         std::unordered_set<const void*> retainedOwners;
+         std::unordered_map<const void*, MTLRenderStages> indirectReads;
++        std::shared_ptr<ComputeSkinOracleReceipt> computeSkinOracleReceipt;
+         MetalFrameUploadArena uploadArena;
+         std::size_t e02CowBytes = 0;
+         std::vector<TlabBlock> tlabBlocks;
+@@ -4408,6 +4586,7 @@
+         context.retainedResources.clear();
+         context.retainedOwners.clear();
+         context.indirectReads.clear();
++        context.computeSkinOracleReceipt.reset();
+         const bool hadUploads = !context.privateUploads.empty();
+         prunePrivateUploads(context.privateUploads);
+         if (hadUploads && ++m_privateUploadRecoveryFailures >= MaxPrivateUploadRecoveryFailures)
+@@ -4451,6 +4630,10 @@
+     std::uint64_t m_nextFrameAcquireEpoch = 0;
+     bool m_computeSkinEnabled = [] {
+         const char* value = std::getenv("XRAY_METAL_COMPUTE_SKIN");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    bool m_computeSkinOracleEnabled = [] {
++        const char* value = std::getenv("XRAY_METAL_COMPUTE_SKIN_ORACLE");
+         return value && std::strcmp(value, "1") == 0;
+     }();
+     std::array<FrameContext, MaxFramesInFlight> m_frames;
+@@ -4960,6 +5143,36 @@
+             job.maxReferencedBoneIndex = static_cast<std::uint32_t>(vertex);
+             jobs.push_back(std::move(job));
+         }
++        struct ExpectedOutput
++        {
++            float position[4];
++            std::uint8_t normal[4], tangent[4], binormal[4];
++            float texcoord[2];
++        };
++        static_assert(sizeof(ExpectedOutput) == OutputStride, "compute skin output ABI");
++        constexpr float expectedFirstVertexX = 0.25f;
++        ExpectedOutput expectedFirstVertex{};
++        expectedFirstVertex.position[0] = expectedFirstVertexX;
++        expectedFirstVertex.position[1] = 0.5f;
++        expectedFirstVertex.position[2] = 0.75f;
++        expectedFirstVertex.position[3] = 1.0f;
++        expectedFirstVertex.normal[0] = 127; expectedFirstVertex.normal[1] = 255;
++        expectedFirstVertex.normal[2] = 127; expectedFirstVertex.normal[3] = 0;
++        expectedFirstVertex.tangent[0] = 127; expectedFirstVertex.tangent[1] = 127;
++        expectedFirstVertex.tangent[2] = 255; expectedFirstVertex.tangent[3] = 0;
++        expectedFirstVertex.binormal[0] = 255; expectedFirstVertex.binormal[1] = 127;
++        expectedFirstVertex.binormal[2] = 127; expectedFirstVertex.binormal[3] = 0;
++        expectedFirstVertex.texcoord[0] = 0.125f;
++        expectedFirstVertex.texcoord[1] = 0.875f;
++        auto positiveOracle = std::make_shared<R4ComputeSkinOracleRequest>();
++        positiveOracle->stableKey = "backend-gpu-probe:positive-1w";
++        positiveOracle->expectedBytes.resize(OutputStride);
++        std::memcpy(positiveOracle->expectedBytes.data(), &expectedFirstVertex, OutputStride);
++        positiveOracle->poseHash = 0x52d31u;
++        positiveOracle->outputWriteSerial = 1u;
++        positiveOracle->prewarmEpoch = 1u;
++        positiveOracle->engineFrame = 1u;
++        jobs[0].oracle = positiveOracle;
+ 
+         // Each rejection uses the production validator and leaves the same
+         // private sentinel untouched. The range case points at an alignment gap.
+@@ -5035,18 +5248,16 @@
+         if (command.status != MTLCommandBufferStatusCompleted)
+             return fail("compute skin backend GPU probe command failed: " + describeError(command.error));
+         context.privateUploads.clear(); // These staged writes completed with this probe command.
++        const std::shared_ptr<ComputeSkinOracleReceipt> positiveReceipt =
++            std::move(context.computeSkinOracleReceipt);
++        if (!positiveReceipt || finishComputeSkinOracleReceipt(positiveReceipt,
++                command.status, 0u, true) != ComputeSkinOracleOutcome::Pass)
++            return fail("compute skin probe exact-byte positive oracle did not pass");
+ 
+         const auto* sentinelResult = static_cast<const std::uint8_t*>(invalidReadback.contents);
+         if (!std::equal(sentinel.begin(), sentinel.end(), sentinelResult))
+             return fail("rejected compute skin batch modified output before dispatch");
+ 
+-        struct ExpectedOutput
+-        {
+-            float position[4];
+-            std::uint8_t normal[4], tangent[4], binormal[4];
+-            float texcoord[2];
+-        };
+-        static_assert(sizeof(ExpectedOutput) == OutputStride, "compute skin output ABI");
+         const auto* result = static_cast<const std::uint8_t*>(resultReadback.contents);
+         constexpr std::array<float, VertexCount> expectedX{{0.25f, 1.0f, 1.5f, 2.125f}};
+         for (std::size_t vertex = 0; vertex < VertexCount; ++vertex)
+@@ -5074,6 +5285,58 @@
+             return fail("discard did not clear the acquired frame epoch");
+         if (!beginManualAcquiredFrame())
+             return fail("compute skin probe could not reacquire after discard");
++        R4FrameBufferSlice negativeBones;
++        if (!backend.UploadFrameData(boneMatrices.data(), sizeof(boneMatrices), 256u,
++                negativeBones, error))
++            return fail("compute skin probe negative-oracle bone upload failed: " + error);
++        R4ComputeSkinJob negativeJob = jobs[0];
++        negativeJob.bones = negativeBones;
++        auto negativeOracle = std::make_shared<R4ComputeSkinOracleRequest>(*positiveOracle);
++        negativeOracle->stableKey = "backend-gpu-probe:negative-one-bit";
++        negativeOracle->expectedBytes[0] ^= 0x01u;
++        negativeOracle->poseHash = 0x52d32u;
++        negativeOracle->outputWriteSerial = 2u;
++        negativeOracle->prewarmEpoch = 2u;
++        negativeOracle->engineFrame = 2u;
++        negativeJob.oracle = negativeOracle;
++        if (!backend.EncodeComputeSkinJobs({negativeJob}, error))
++            return fail("compute skin negative-oracle encode failed: " + error);
++        id<MTLCommandBuffer> negativeCommand = context.commandBuffer;
++        [negativeCommand commit];
++        [negativeCommand waitUntilCompleted];
++        if (negativeCommand.status != MTLCommandBufferStatusCompleted)
++            return fail("compute skin negative-oracle command failed: " + describeError(negativeCommand.error));
++        context.privateUploads.clear();
++        const std::shared_ptr<ComputeSkinOracleReceipt> negativeReceipt =
++            std::move(context.computeSkinOracleReceipt);
++        if (!negativeReceipt || finishComputeSkinOracleReceipt(negativeReceipt,
++                negativeCommand.status, 0u, true) != ComputeSkinOracleOutcome::Fail)
++            return fail("compute skin probe one-bit mismatch was not rejected exactly");
++        backend.DiscardFrame();
++
++        if (!beginManualAcquiredFrame())
++            return fail("compute skin probe could not begin abandoned-oracle frame");
++        R4FrameBufferSlice abandonedBones;
++        if (!backend.UploadFrameData(boneMatrices.data(), sizeof(boneMatrices), 256u,
++                abandonedBones, error))
++            return fail("compute skin probe abandoned-oracle bone upload failed: " + error);
++        R4ComputeSkinJob abandonedJob = jobs[0];
++        abandonedJob.bones = abandonedBones;
++        auto abandonedOracle = std::make_shared<R4ComputeSkinOracleRequest>(*positiveOracle);
++        abandonedOracle->stableKey = "backend-gpu-probe:abandoned-no-completion";
++        abandonedOracle->outputWriteSerial = 3u;
++        abandonedOracle->prewarmEpoch = 3u;
++        abandonedOracle->engineFrame = 3u;
++        abandonedJob.oracle = abandonedOracle;
++        if (!backend.EncodeComputeSkinJobs({abandonedJob}, error) ||
++            !context.computeSkinOracleReceipt)
++            return fail("compute skin abandoned-oracle request was not staged");
++        backend.DiscardFrame();
++        if (context.computeSkinOracleReceipt)
++            return fail("discard retained an oracle receipt without GPU completion");
++
++        if (!beginManualAcquiredFrame())
++            return fail("compute skin probe could not begin stale-span frame");
+         rejected = {staleJob};
+         error.clear();
+         if (backend.EncodeComputeSkinJobs(rejected, error))
+@@ -5121,17 +5384,35 @@
+     const char* current = std::getenv("XRAY_METAL_COMPUTE_SKIN");
+     const bool hadValue = current != nullptr;
+     const std::string oldValue = current ? current : "";
++    const char* currentOracle = std::getenv("XRAY_METAL_COMPUTE_SKIN_ORACLE");
++    const bool hadOracleValue = currentOracle != nullptr;
++    const std::string oldOracleValue = currentOracle ? currentOracle : "";
+     if (::setenv("XRAY_METAL_COMPUTE_SKIN", "1", 1) != 0)
+     {
+         error = "compute skin probe could not enable the opt-in backend path";
++        return false;
++    }
++    if (::setenv("XRAY_METAL_COMPUTE_SKIN_ORACLE", "1", 1) != 0)
++    {
++        if (hadValue) ::setenv("XRAY_METAL_COMPUTE_SKIN", oldValue.c_str(), 1);
++        else ::unsetenv("XRAY_METAL_COMPUTE_SKIN");
++        error = "compute skin probe could not enable the bounded oracle";
+         return false;
+     }
+     const bool passed = MetalR4Backend::ProbeComputeSkinBackendGpu(error);
+     const int restored = hadValue ? ::setenv("XRAY_METAL_COMPUTE_SKIN", oldValue.c_str(), 1) :
+         ::unsetenv("XRAY_METAL_COMPUTE_SKIN");
++    const int oracleRestored = hadOracleValue ?
++        ::setenv("XRAY_METAL_COMPUTE_SKIN_ORACLE", oldOracleValue.c_str(), 1) :
++        ::unsetenv("XRAY_METAL_COMPUTE_SKIN_ORACLE");
+     if (restored != 0 && passed)
+     {
+         error = "compute skin probe could not restore XRAY_METAL_COMPUTE_SKIN";
++        return false;
++    }
++    if (oracleRestored != 0 && passed)
++    {
++        error = "compute skin probe could not restore XRAY_METAL_COMPUTE_SKIN_ORACLE";
+         return false;
+     }
+     return passed;

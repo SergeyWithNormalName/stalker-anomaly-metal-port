@@ -1,0 +1,2 @@
+Root review fix: reset both deferred wind/owner unknown counters on every valid DrawIntoActiveGBufferCommon invocation, preserving per-frame and isolated-branch telemetry. No culling or math changes. The original agent hash/diff receipts precede this fix; a new root build manifest will pin the fixed candidate.
+Root adds explicit oracle drawable extent check and previous_valid/previous_engine_frame/camera_cut receipt fields. Copied the19unchanged files from immutable stage10; root v11 manifest pins all22 staged files after fixes.

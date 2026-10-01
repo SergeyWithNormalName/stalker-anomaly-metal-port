@@ -1,11 +1,14 @@
 #include "MetalR4FloraAdapter.h"
 #include "MetalR4EngineFs.h"
+#include "R4StaticShadowIndex.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <numeric>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -16,10 +19,20 @@ namespace
 {
 constexpr std::uint32_t kTreeVisualType = 7u;
 constexpr std::size_t kStaticGlobalsSize = 528u;
-constexpr std::size_t kLeafVertexGlobalsSize = 464u;
+constexpr std::size_t kLeafVertexGlobalsSize = 1520u;
 constexpr std::size_t kTrunkVertexGlobalsSize = 496u;
-constexpr std::size_t kFragmentGlobalsSize = 176u;
+// The leaf PS has ssfx_floravariation and two flora-fix float4s after the
+// 176-byte common prefix. The trunk PS ends at that prefix. Binding only the
+// prefix lets the leaf shader read stale upload-arena bytes as color variation.
+constexpr std::size_t kLeafFragmentGlobalsSize = 224u;
+// The original opaque deffer_base_flat PS binds the shared 176-byte globals
+// block and 256-byte dynamic_transforms block, matching its exact reflected
+// CB0/CB1 TLAB slots. It has no alpha discard; the adjacent shadow PS is a
+// separate depth-only shader.
+constexpr std::size_t kTrunkFragmentGlobalsSize = 176u;
 constexpr std::size_t kTransformsSize = 256u;
+constexpr std::size_t kTreeShadowGlobalsSize = 320u;
+constexpr std::size_t kTreeShadowStaticGlobalsSize = 528u;
 
 struct Matrix4 { float elements[16]{}; };
 
@@ -87,6 +100,8 @@ bool isOutsideMetalClipVolume(const bool hasBounds,
     return std::any_of(outside.begin(), outside.end(), [](const bool value) { return value; });
 }
 
+using FloraShadowIndex = xray::metal::R4StaticShadowIndex;
+
 bool readText(const std::filesystem::path& path, std::string& value)
 {
     std::ifstream input(path, std::ios::binary);
@@ -145,18 +160,94 @@ bool validateBundle(const std::filesystem::path& vsPath, const std::filesystem::
         error = "flora MSC metallib or adjacent reflection receipt is unavailable";
         return false;
     }
-    static constexpr const char* VertexTlab =
+    static constexpr const char* TrunkVertexTlab =
         "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+    static constexpr const char* LeafVertexTlab =
+        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
+    const bool leafWindVertex = std::string(vsName) == "leaf_wave_hq.vs.metallib";
+    const bool alphaTestedFragment = std::string(psName) == "leaf_wave_hq.ps.metallib";
+    const char* vertexTlab = leafWindVertex ? LeafVertexTlab : TrunkVertexTlab;
     if (vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
-        vs.find("\"ResourceCount\":2") == std::string::npos ||
-        vs.find(VertexTlab) == std::string::npos || vs.find(vsInputs) == std::string::npos ||
+        vs.find(leafWindVertex ? "\"ResourceCount\":4" : "\"ResourceCount\":2") == std::string::npos ||
+        vs.find(vertexTlab) == std::string::npos || vs.find(vsInputs) == std::string::npos ||
         ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
         ps.find("\"ResourceCount\":" + std::to_string(psResourceCount)) == std::string::npos ||
         ps.find(psTlab) == std::string::npos ||
-        ps.find("\"num_render_targets\":4") == std::string::npos)
+        ps.find("\"num_render_targets\":4") == std::string::npos ||
+        ps.find(std::string("\"discards\":") + (alphaTestedFragment ? "true" : "false")) ==
+            std::string::npos)
     {
         error = "flora MSC reflection does not match the recorded tree ABI";
         return false;
+    }
+    return true;
+}
+
+bool validateTreeShadowBundle(const std::filesystem::path& directory, std::string& error)
+{
+    const std::array<const char*, 4> names = {"shadow_direct_tree.vs.metallib",
+        "shadow_direct_tree_aref.vs.metallib", "shadow_direct_base_color.ps.metallib",
+        "shadow_direct_base_aref_color.ps.metallib"};
+    for (const char* name : names)
+        if (!std::filesystem::is_regular_file(directory / name))
+        {
+            error = std::string("flora shadow MSC bundle is missing ") + name;
+            return false;
+        }
+    const auto reflection = [&directory](const char* name, std::string& json) {
+        std::filesystem::path path = directory / name;
+        path.replace_extension(".reflection.json");
+        return readText(path, json);
+    };
+    std::string opaqueVs, leafVs, opaquePs, alphaPs;
+    if (!reflection(names[0], opaqueVs) || !reflection(names[1], leafVs) ||
+        !reflection(names[2], opaquePs) || !reflection(names[3], alphaPs))
+    {
+        error = "flora shadow MSC reflection receipt is missing";
+        return false;
+    }
+    const auto contains = [](const std::string& text, const char* token) {
+        return text.find(token) != std::string::npos;
+    };
+    if (!contains(opaqueVs, "\"ShaderType\":\"Vertex\"") ||
+        !contains(opaqueVs, "\"ResourceCount\":2") ||
+        !contains(opaqueVs, "\"name\":\"position0\"") ||
+        !contains(opaqueVs, "\"columnCount\":4,\"elementType\":\"Float\"") ||
+        !contains(leafVs, "\"ShaderType\":\"Vertex\"") ||
+        !contains(leafVs, "\"ResourceCount\":4") ||
+        !contains(leafVs, "\"name\":\"texcoord0\"") ||
+        !contains(leafVs, "\"elementType\":\"Int32\"") ||
+        !contains(opaquePs, "\"ShaderType\":\"Fragment\"") ||
+        !contains(opaquePs, "\"num_render_targets\":1") ||
+        !contains(alphaPs, "\"ShaderType\":\"Fragment\"") ||
+        !contains(alphaPs, "\"ResourceCount\":2") ||
+        !contains(alphaPs, "\"discards\":true"))
+    {
+        error = "flora shadow reflection differs from the treewave/AREF source ABI";
+        return false;
+    }
+    return true;
+}
+
+// Exact MSC resource order: the model SRV precedes the unchanged source CBs.
+bool validateInstancedTreeShadowBundle(const std::filesystem::path& directory, std::string& error)
+{
+    for (const bool leaf : {false, true})
+    {
+        const std::string name = leaf ? "shadow_direct_tree_instanced_aref.vs" :
+            "shadow_direct_tree_instanced.vs";
+        std::string json;
+        if (!std::filesystem::is_regular_file(directory / (name + ".metallib")) ||
+            !readText(directory / (name + ".reflection.json"), json))
+        { error = "E08 instanced Flora shader/reflection unavailable"; return false; }
+        const std::string expected = leaf ?
+            "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":96,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]" :
+            "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
+        if (json.find(expected) == std::string::npos ||
+            json.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+            json.find(leaf ? "\"ResourceCount\":5" : "\"ResourceCount\":3") == std::string::npos ||
+            json.find("\"needs_draw_params\":false") == std::string::npos)
+        { error = "E08 instanced Flora reflected model-buffer ABI mismatch"; return false; }
     }
     return true;
 }
@@ -224,6 +315,27 @@ std::vector<FloraCandidate> collectFloraCandidates(
         result.push_back({&visual, material});
     }
     return result;
+}
+
+bool validateFloraMaterialFlags(const FloraMaterial material, const bool alphaBlend,
+    const bool objectLod, std::string& error)
+{
+    if (objectLod)
+    {
+        error = "Object LOD Flora variant has no admitted Metal G-buffer pipeline";
+        return false;
+    }
+    if (material == FloraMaterial::LeafBump && !alphaBlend)
+    {
+        error = "opaque leaf B_TREE variant has no admitted Metal G-buffer pipeline";
+        return false;
+    }
+    if (material == FloraMaterial::TrunkFlat && alphaBlend)
+    {
+        error = "alpha trunk B_TREE variant has no matching admitted wind pipeline";
+        return false;
+    }
+    return true;
 }
 
 std::string geometryCacheKey(const xray::metal::R4StaticVisual& visual)
@@ -327,7 +439,10 @@ struct MetalR4FloraAdapter::Impl
     struct Draw
     {
         std::uint32_t visualId = 0;
+        std::size_t shadowGroup = 0;
         Material material = Material::LeafBump;
+        bool alphaTested = false;
+        bool objectLod = false;
         Matrix4 model{};
         std::array<float, 5> treeScale{};
         std::array<float, 5> treeBias{};
@@ -338,17 +453,36 @@ struct MetalR4FloraAdapter::Impl
         std::shared_ptr<IR4Buffer> vertices;
         std::shared_ptr<IR4Buffer> indices;
         std::vector<std::shared_ptr<IR4Texture>> textures;
-        std::shared_ptr<IR4Buffer> vertexGlobals;
-        std::shared_ptr<IR4Buffer> staticGlobals;
-        std::shared_ptr<IR4Buffer> fragmentGlobals;
-        std::shared_ptr<IR4Buffer> transforms;
     };
     std::shared_ptr<IR4GraphicsPipeline> leafPipeline;
     std::shared_ptr<IR4GraphicsPipeline> trunkPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> leafShadowPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaShadowPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> trunkShadowPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> leafInstancedShadowPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaInstancedShadowPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> trunkInstancedShadowPipeline;
+    struct ShadowGroup
+    {
+        std::size_t representative = 0;
+        std::vector<Matrix4> models;
+    };
+    std::vector<ShadowGroup> shadowGroups;
+    bool shadowInstancing = false;
+    bool reuseVisibleGlobals = std::getenv("XRAY_METAL_E08_FLORA_REUSE_GLOBALS") != nullptr;
+    std::vector<std::uint8_t> visibleVertexGlobals;
+    std::vector<std::uint8_t> visibleFragmentGlobals;
+    std::vector<std::uint8_t> visibleTransforms;
     std::shared_ptr<IR4Sampler> sampler;
+    std::shared_ptr<IR4Texture> wavesTexture;
+    std::string shadowError;
     std::unordered_map<std::string, CachedGeometry> geometry;
     std::unordered_map<std::string, std::shared_ptr<IR4Texture>> textures;
     std::vector<Draw> draws;
+    FloraShadowIndex shadowIndex;
+    bool shadowLinear = std::getenv("XRAY_METAL_E08_FLORA_LINEAR") != nullptr;
+    bool shadowOracle = std::getenv("XRAY_METAL_E08_FLORA_ORACLE") != nullptr;
+    std::size_t oracleViews = 0;
 };
 
 MetalR4FloraAdapter::MetalR4FloraAdapter() = default;
@@ -362,6 +496,16 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
     m_status.clear();
     m_telemetry = {};
     m_impl = std::make_unique<Impl>();
+    std::unordered_map<std::string, R4FloraBlenderMaterial> materialFlags;
+    for (const R4FloraBlenderMaterial& material : options.shaderMaterials)
+    {
+        if (material.shaderName.empty() || !materialFlags.emplace(material.shaderName, material).second)
+        {
+            m_status = "flora shader material metadata is empty or duplicated";
+            status = m_status;
+            return true;
+        }
+    }
     if (!options.ddsBytesProvider)
     {
         m_status = "flora MSC admission requires the engine XRFS DDS provider";
@@ -420,6 +564,88 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
         status = m_status;
         return true;
     }
+    if (!options.shadowShaderDirectory.empty())
+    {
+        std::string shadowError;
+        const auto makeShadowPipeline = [&backend, &shadowError](const char* label, const char* key,
+            const std::filesystem::path& vsPath, const std::filesystem::path& psPath,
+            const bool alphaTested) {
+            R4GraphicsPipelineDesc pipeline;
+            pipeline.label = label;
+            pipeline.shaderKey = key;
+            const std::string vsString = vsPath.string();
+            const std::string psString = psPath.string();
+            pipeline.vertexMetallibPath = vsString.c_str();
+            pipeline.fragmentMetallibPath = psString.c_str();
+            pipeline.vertexAttributes = {{11u, 6u, 0u, R4VertexFormat::Float4}};
+            if (alphaTested)
+                // shadow_direct_tree_aref.vs has POSITION0/TEXCOORD0, so its
+                // second MSC vertex input maps to attribute index 12 (not the
+                // full tree G-buffer's texcoord index 15).
+                pipeline.vertexAttributes.push_back({12u, 6u, 56u, R4VertexFormat::Int4});
+            pipeline.vertexLayouts = {{6u, sizeof(R4FloraStaticVertex)}};
+            pipeline.colorFormats = {R4PixelFormat::R32Float};
+            pipeline.depthFormat = R4PixelFormat::Depth32Float;
+            pipeline.depthCompare = R4CompareFunction::Less;
+            pipeline.depthWrite = true;
+            // CBlender_Tree's shadow r_Pass does not override D3DRS_CULLMODE.
+            // The regular R4 scene baseline is D3DCULL_CCW, which maps to
+            // Metal back-face culling with clockwise front faces.
+            pipeline.cullMode = R4CullMode::Back;
+            pipeline.frontFace = R4Winding::Clockwise;
+            return backend.CreateGraphicsPipeline(pipeline, shadowError);
+        };
+        if (!validateTreeShadowBundle(options.shadowShaderDirectory, shadowError))
+            m_impl->shadowError = shadowError;
+        else
+        {
+            m_impl->trunkShadowPipeline = makeShadowPipeline("R4 flora shadow regular-tree opaque",
+                "r4-flora-shadow-tree-opaque-v1",
+                options.shadowShaderDirectory / "shadow_direct_tree.vs.metallib",
+                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", false);
+            if (m_impl->trunkShadowPipeline)
+                m_impl->leafShadowPipeline = makeShadowPipeline("R4 flora shadow regular-tree alpha",
+                    "r4-flora-shadow-tree-aref-v1",
+                    options.shadowShaderDirectory / "shadow_direct_tree_aref.vs.metallib",
+                    options.shadowShaderDirectory / "shadow_direct_base_aref_color.ps.metallib", true);
+            if (m_impl->leafShadowPipeline)
+                m_impl->leafNoAlphaShadowPipeline = makeShadowPipeline(
+                    "R4 flora shadow regular-tree alpha-ignore validation",
+                    "r4-flora-shadow-tree-aref-no-alpha-validation-v1",
+                    options.shadowShaderDirectory / "shadow_direct_tree_aref.vs.metallib",
+                    options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", true);
+            if (!m_impl->trunkShadowPipeline || !m_impl->leafShadowPipeline ||
+                !m_impl->leafNoAlphaShadowPipeline)
+                m_impl->shadowError = "flora shadow pipeline creation failed: " + shadowError;
+        }
+        if (!options.instancedShadowShaderDirectory.empty() &&
+            std::getenv("XRAY_METAL_E08_FLORA_INSTANCING_OFF") == nullptr)
+        {
+            if (!m_impl->shadowError.empty() ||
+                !validateInstancedTreeShadowBundle(options.instancedShadowShaderDirectory, shadowError))
+            { status = "E08 instanced Flora preparation failed: " + shadowError; return false; }
+            const auto& dir = options.instancedShadowShaderDirectory;
+            m_impl->trunkInstancedShadowPipeline = makeShadowPipeline(
+                "R4 E08 instanced Flora trunk shadow", "r4-e08-flora-instanced-trunk",
+                dir / "shadow_direct_tree_instanced.vs.metallib",
+                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", false);
+            m_impl->leafInstancedShadowPipeline = makeShadowPipeline(
+                "R4 E08 instanced Flora leaf shadow", "r4-e08-flora-instanced-leaf",
+                dir / "shadow_direct_tree_instanced_aref.vs.metallib",
+                options.shadowShaderDirectory / "shadow_direct_base_aref_color.ps.metallib", true);
+            m_impl->leafNoAlphaInstancedShadowPipeline = makeShadowPipeline(
+                "R4 E08 instanced Flora leaf alpha-ignore", "r4-e08-flora-instanced-leaf-no-alpha",
+                dir / "shadow_direct_tree_instanced_aref.vs.metallib",
+                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", true);
+            if (!m_impl->trunkInstancedShadowPipeline || !m_impl->leafInstancedShadowPipeline ||
+                !m_impl->leafNoAlphaInstancedShadowPipeline)
+            { status = "E08 instanced Flora pipeline failed: " + shadowError; return false; }
+            m_impl->shadowInstancing = true;
+        }
+        if (!m_impl->shadowError.empty())
+            std::fprintf(stderr, "METAL_FLORA_SHADOW_UNAVAILABLE reason=\"%s\"\n",
+                m_impl->shadowError.c_str());
+    }
     R4SamplerDesc sampler;
     sampler.label = "R4 flora MSC base sampler";
     sampler.maxAnisotropy = 8u;
@@ -427,6 +653,20 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
     if (!m_impl->sampler)
     {
         m_status = "flora MSC sampler unavailable: " + error;
+        status = m_status;
+        return true;
+    }
+    if (options.wavesTexturePath.empty())
+    {
+        m_status = "flora wind bundle requires the production fx\\wind_wave XRFS texture";
+        status = m_status;
+        return true;
+    }
+    xray::metal::R4DdsTexture waves;
+    if (!xray::metal::LoadR4DdsTexture(options.wavesTexturePath, options.ddsBytesProvider, waves, error) ||
+        !uploadDds(backend.Resources(), waves, "R4 flora production wind-wave DDS", m_impl->wavesTexture, error))
+    {
+        m_status = "flora wind-wave texture unavailable: " + error;
         status = m_status;
         return true;
     }
@@ -444,7 +684,21 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
         if (!visual || visual->shaderId >= geometry.shaders.size() ||
             visual->vertexBufferId >= geometry.vertexBuffers.size() || visual->indexBufferId >= geometry.indexBuffers.size())
             localError = "missing visual, material, or source buffer";
-        else if (!visual->hasTreeLighting)
+        const R4FloraBlenderMaterial* blenderMaterial = nullptr;
+        if (localError.empty())
+        {
+            const std::string& shaderName = geometry.shaders[visual->shaderId].shaderName;
+            const auto found = materialFlags.find(shaderName);
+            if (found == materialFlags.end())
+                localError = "archive-winning B_TREE metadata is missing for " + shaderName;
+            else
+                blenderMaterial = &found->second;
+        }
+        if (localError.empty() && blenderMaterial)
+            validateFloraMaterialFlags(candidate.material == Impl::Material::LeafBump ?
+                    FloraMaterial::LeafBump : FloraMaterial::TrunkFlat,
+                blenderMaterial->alphaBlend, blenderMaterial->objectLod, localError);
+        if (localError.empty() && !visual->hasTreeLighting)
             localError = "tree visual is missing its authored OGF_TREEDEF2 scale/bias lighting";
         std::vector<R4FloraStaticVertex> vertices;
         std::vector<std::uint16_t> indices;
@@ -477,6 +731,11 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
         Impl::Draw draw;
         draw.visualId = visual ? visual->visualId : 0u;
         draw.material = candidate.material;
+        if (blenderMaterial)
+        {
+            draw.alphaTested = blenderMaterial->alphaBlend;
+            draw.objectLod = blenderMaterial->objectLod;
+        }
         draw.indexCount = visual ? visual->indexCount : 0u;
         if (visual && visual->referencedPositionBounds.available)
         {
@@ -569,20 +828,6 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
                 draw.textures.emplace_back(std::move(texture));
             }
         }
-        const auto makeUniform = [&resources, &localError](const std::size_t size, const char* label) {
-            R4BufferDesc desc{size, R4ResourceStorage::Shared, R4BufferUsage::Uniform, label};
-            return resources.CreateBuffer(desc, nullptr, 0, localError);
-        };
-        if (localError.empty())
-        {
-            draw.vertexGlobals = makeUniform(candidate.material == Impl::Material::LeafBump ?
-                kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize, "R4 flora VS globals");
-            draw.staticGlobals = makeUniform(kStaticGlobalsSize, "R4 flora static globals");
-            draw.fragmentGlobals = makeUniform(kFragmentGlobalsSize, "R4 flora PS globals");
-            draw.transforms = makeUniform(kTransformsSize, "R4 flora transforms");
-            if (!draw.vertexGlobals || !draw.staticGlobals || !draw.fragmentGlobals || !draw.transforms)
-                localError = localError.empty() ? "flora uniform allocation failed" : localError;
-        }
         if (!localError.empty())
         {
             ++m_telemetry.skippedVisuals;
@@ -593,6 +838,40 @@ bool MetalR4FloraAdapter::Prepare(IR4Backend& backend,
         m_impl->draws.emplace_back(std::move(draw));
         ++m_telemetry.admittedVisuals;
     }
+    for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+    {
+        const auto& d = m_impl->draws[i];
+        m_impl->shadowIndex.Add(d.hasBounds, d.boundsMinimum, d.boundsMaximum, d.model.elements, i);
+    }
+    m_impl->shadowIndex.Finish();
+    // Only identical geometry/material resources share a draw. Instance order
+    // within each group follows the original level draw order; the immutable
+    // model slice is fresh for every light/cascade and every submitted frame.
+    std::vector<std::size_t> groupSizes;
+    for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+    {
+        auto& d = m_impl->draws[i];
+        std::size_t g = 0;
+        for (; g < m_impl->shadowGroups.size(); ++g)
+        {
+            const auto& r = m_impl->draws[m_impl->shadowGroups[g].representative];
+            if (d.vertices == r.vertices && d.indices == r.indices && d.indexCount == r.indexCount &&
+                d.material == r.material && d.alphaTested == r.alphaTested &&
+                d.objectLod == r.objectLod && d.textures[0] == r.textures[0])
+                break;
+        }
+        if (g == m_impl->shadowGroups.size())
+        { m_impl->shadowGroups.push_back({i, {}}); groupSizes.push_back(0); }
+        d.shadowGroup = g;
+        ++groupSizes[g];
+    }
+    for (std::size_t g = 0; g < groupSizes.size(); ++g)
+        m_impl->shadowGroups[g].models.reserve(groupSizes[g]);
+    std::fprintf(stderr, "METAL_E08_FLORA_INSTANCING enabled=%d groups=%zu instances=%zu stride=64\n",
+        int(m_impl->shadowInstancing), m_impl->shadowGroups.size(), m_impl->draws.size());
+
+    std::fprintf(stderr, "METAL_E08_FLORA_INVENTORY draws=%zu geometry_buffers=%zu textures=%zu\n",
+        m_impl->draws.size(), m_impl->geometry.size(), m_impl->textures.size());
     m_ready = !m_impl->draws.empty();
     m_status = m_ready ? "flora MSC adapter ready" : "flora MSC adapter admitted no visuals";
     status = m_status;
@@ -635,68 +914,125 @@ bool MetalR4FloraAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
             ++m_telemetry.culledVisuals;
             continue;
         }
-        std::vector<std::uint8_t> vertexGlobals(
-            draw.material == Impl::Material::LeafBump ? kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize);
-        std::vector<std::uint8_t> staticGlobals(kStaticGlobalsSize);
-        std::vector<std::uint8_t> fragmentGlobals(kFragmentGlobalsSize);
-        std::vector<std::uint8_t> transforms(kTransformsSize);
+        std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+        auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+        auto& fragmentGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleFragmentGlobals : localFragment;
+        auto& transforms = m_impl->reuseVisibleGlobals ? m_impl->visibleTransforms : localTransforms;
+        // CPU staging only: every GPU bind still receives an immutable arena
+        // slice. assign clears the complete source CB, including unused bytes.
+        vertexGlobals.assign(draw.material == Impl::Material::LeafBump ?
+            kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize, 0);
+        fragmentGlobals.assign(draw.material == Impl::Material::LeafBump ?
+            kLeafFragmentGlobalsSize : kTrunkFragmentGlobalsSize, 0);
+        transforms.assign(kTransformsSize, 0);
         std::memcpy(vertexGlobals.data(), &wvp, sizeof(wvp));
         std::memcpy(vertexGlobals.data() + 64u, &previousVp, sizeof(previousVp));
-        std::memcpy(vertexGlobals.data() + 160u, &draw.model, sizeof(draw.model));
-        std::memcpy(vertexGlobals.data() + 224u, &wv, sizeof(wv));
-        putFloat4(vertexGlobals, 288u, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
+        const bool leaf = draw.material == Impl::Material::LeafBump;
+        const std::size_t transformOffset = leaf ? 1216u : 160u;
+        const std::size_t viewTransformOffset = leaf ? 1280u : 224u;
+        const std::size_t constsOffset = leaf ? 1344u : 288u;
+        std::memcpy(vertexGlobals.data() + transformOffset, &draw.model, sizeof(draw.model));
+        std::memcpy(vertexGlobals.data() + viewTransformOffset, &wv, sizeof(wv));
+        putFloat4(vertexGlobals, constsOffset, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
         // FTreeVisual halves OGF_TREEDEF2 colours at load, then R4 applies
         // r__d_tree_SBC * 1.3333 before binding c_scale/c_bias/c_sun.
         const float treeCorrection = std::isfinite(view.treeScaleBiasCorrection) ?
             view.treeScaleBiasCorrection * (1.3333f * 0.5f) : 0.0f;
-        putFloat4(vertexGlobals, 304u, treeCorrection * draw.treeScale[0],
+        const std::size_t scaleOffset = leaf ? 1360u : 304u;
+        const std::size_t biasOffset = leaf ? 1376u : 320u;
+        const std::size_t sunOffset = leaf ? 1424u : 368u;
+        putFloat4(vertexGlobals, scaleOffset, treeCorrection * draw.treeScale[0],
             treeCorrection * draw.treeScale[1], treeCorrection * draw.treeScale[2],
             treeCorrection * draw.treeScale[3]);
-        putFloat4(vertexGlobals, 320u, treeCorrection * draw.treeBias[0],
+        putFloat4(vertexGlobals, biasOffset, treeCorrection * draw.treeBias[0],
             treeCorrection * draw.treeBias[1], treeCorrection * draw.treeBias[2],
             treeCorrection * draw.treeBias[3]);
-        putFloat4(vertexGlobals, 336u, treeCorrection * draw.treeScale[4],
+        putFloat4(vertexGlobals, sunOffset, treeCorrection * draw.treeScale[4],
             treeCorrection * draw.treeBias[4], 0.0f, 0.0f);
-        putFloat4(vertexGlobals, 352u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
-        if (draw.material == Impl::Material::TrunkFlat)
+        if (leaf)
         {
+            if (view.windValid)
+            {
+                std::memcpy(vertexGlobals.data() + 160u, view.previousBenders.data(),
+                    sizeof(view.previousBenders));
+                std::memcpy(vertexGlobals.data() + 672u, view.currentBenders.data(),
+                    sizeof(view.currentBenders));
+                std::memcpy(vertexGlobals.data() + 1184u, view.bendersSetup.data(),
+                    sizeof(view.bendersSetup));
+            }
+            putFloat4(vertexGlobals, 1200u, 0.0f, 0.0f, 0.0f, 0.0f);
+            putFloat4(vertexGlobals, 1392u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+            putFloat4(vertexGlobals, 1408u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+            putFloat4(vertexGlobals, 1440u, view.windParams[0], view.windParams[1],
+                view.windParams[2], view.windParams[3]);
+            putFloat4(vertexGlobals, 1456u, view.windSetupGrass[0], view.windSetupGrass[1],
+                view.windSetupGrass[2], view.windSetupGrass[3]);
+            putFloat4(vertexGlobals, 1472u, view.windSetupTrees[0], view.windSetupTrees[1],
+                view.windSetupTrees[2], view.windSetupTrees[3]);
+            putFloat4(vertexGlobals, 1488u, view.windAnimation[0], view.windAnimation[1],
+                view.windAnimation[2], view.windAnimation[3]);
+            putFloat4(vertexGlobals, 1504u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
+                view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
+        }
+        else
+        {
+            putFloat4(vertexGlobals, 336u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+            putFloat4(vertexGlobals, 352u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
             putFloat4(vertexGlobals, 384u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
             putFloat4(vertexGlobals, 400u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+            putFloat4(vertexGlobals, 416u, view.windParams[0], view.windParams[1],
+                view.windParams[2], view.windParams[3]);
+            putFloat4(vertexGlobals, 432u, view.windSetupGrass[0], view.windSetupGrass[1],
+                view.windSetupGrass[2], view.windSetupGrass[3]);
+            putFloat4(vertexGlobals, 448u, view.windSetupTrees[0], view.windSetupTrees[1],
+                view.windSetupTrees[2], view.windSetupTrees[3]);
+            putFloat4(vertexGlobals, 464u, view.windAnimation[0], view.windAnimation[1],
+                view.windAnimation[2], view.windAnimation[3]);
+            putFloat4(vertexGlobals, 480u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
+                view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
         }
-        std::memcpy(staticGlobals.data(), &viewMatrix, sizeof(viewMatrix));
-        std::memcpy(staticGlobals.data() + 128u, &projection, sizeof(projection));
-        std::memcpy(staticGlobals.data() + 192u, &vp, sizeof(vp));
-        putFloat4(staticGlobals, 256u, view.timeSeconds, 0.0f, 0.0f, 0.0f);
-        putFloat4(staticGlobals, 384u, view.eye[0], view.eye[1], view.eye[2], 0.0f);
         std::memcpy(fragmentGlobals.data(), &wvp, sizeof(wvp));
         std::memcpy(fragmentGlobals.data() + 64u, &previousVp, sizeof(previousVp));
         std::memcpy(transforms.data(), &wvp, sizeof(wvp));
         std::memcpy(transforms.data() + 64u, &wv, sizeof(wv));
         std::memcpy(transforms.data() + 128u, &draw.model, sizeof(draw.model));
         putFloat4(transforms, 192u, 0.0f, 0.0f, 0.0f, 0.25f);
-        if (!backend.Resources().UpdateBuffer(draw.vertexGlobals, 0, vertexGlobals.data(), vertexGlobals.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.staticGlobals, 0, staticGlobals.data(), staticGlobals.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.fragmentGlobals, 0, fragmentGlobals.data(), fragmentGlobals.size(), error) ||
-            !backend.Resources().UpdateBuffer(draw.transforms, 0, transforms.data(), transforms.size(), error))
+        R4FrameBufferSlice vertexGlobalsSlice;
+        R4FrameBufferSlice fragmentGlobalsSlice;
+        R4FrameBufferSlice transformsSlice;
+        if (!backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u,
+                vertexGlobalsSlice, error) ||
+            !backend.UploadFrameData(fragmentGlobals.data(), fragmentGlobals.size(), 256u,
+                fragmentGlobalsSlice, error) ||
+            !backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                transformsSlice, error))
             return false;
-        const bool leaf = draw.material == Impl::Material::LeafBump;
-        R4MscStageBindings vs{R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer, 0u,
-            draw.vertexGlobals, 0, vertexGlobals.size()}, {R4MscResourceType::ConstantBuffer, 24u,
-            view.staticGlobals, 0, kStaticGlobalsSize}}};
+        R4MscStageBindings vs;
+        vs.stage = R4ShaderStage::Vertex;
+        if (leaf)
+            vs = {R4ShaderStage::Vertex, 96u, {{R4MscResourceType::Texture, 0u, nullptr, 0u, 0u,
+                m_impl->wavesTexture}, {R4MscResourceType::ConstantBuffer, 24u, vertexGlobalsSlice.buffer,
+                vertexGlobalsSlice.offset, vertexGlobalsSlice.size}, {R4MscResourceType::ConstantBuffer, 48u,
+                view.staticGlobals, 0u, kStaticGlobalsSize}, {R4MscResourceType::Sampler, 72u,
+                nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
+        else
+            vs = {R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer, 0u,
+                vertexGlobalsSlice.buffer, vertexGlobalsSlice.offset, vertexGlobalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 24u, view.staticGlobals, 0u, kStaticGlobalsSize}}};
         R4MscStageBindings ps;
         ps.stage = R4ShaderStage::Fragment;
         if (leaf)
             ps = {R4ShaderStage::Fragment, 168u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
                 {R4MscResourceType::Texture, 24u, {}, 0, 0, draw.textures[1]},
                 {R4MscResourceType::Texture, 48u, {}, 0, 0, draw.textures[2]},
-                {R4MscResourceType::ConstantBuffer, 72u, draw.fragmentGlobals, 0, kFragmentGlobalsSize},
-                {R4MscResourceType::ConstantBuffer, 96u, draw.transforms, 0, kTransformsSize},
+                {R4MscResourceType::ConstantBuffer, 72u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 96u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
                 {R4MscResourceType::ConstantBuffer, 120u, view.staticGlobals, 0, kStaticGlobalsSize},
                 {R4MscResourceType::Sampler, 144u, {}, 0, 0, {}, m_impl->sampler}}};
         else
             ps = {R4ShaderStage::Fragment, 96u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
-                {R4MscResourceType::ConstantBuffer, 24u, draw.fragmentGlobals, 0, kFragmentGlobalsSize},
-                {R4MscResourceType::ConstantBuffer, 48u, draw.transforms, 0, kTransformsSize},
+                {R4MscResourceType::ConstantBuffer, 24u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 48u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
                 {R4MscResourceType::Sampler, 72u, {}, 0, 0, {}, m_impl->sampler}}};
         R4IndexedDrawDesc indexed;
         indexed.indexBuffer = draw.indices;
@@ -711,6 +1047,241 @@ bool MetalR4FloraAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,
         ++m_telemetry.submittedVisuals;
     }
     return true;
+}
+
+bool MetalR4FloraAdapter::HasShadowCasters() const
+{
+    return m_ready && m_impl && m_impl->leafShadowPipeline &&
+        m_impl->leafNoAlphaShadowPipeline && m_impl->trunkShadowPipeline;
+}
+
+bool MetalR4FloraAdapter::DrawShadowCasters(IR4Backend& backend,
+    const std::array<float, 16>& lightViewProjection,
+    const R4FloraViewState& view, std::string& error)
+{
+    if (!m_ready || !m_impl || !view.valid)
+        return true;
+    if (!HasShadowCasters())
+    {
+        error = m_impl->shadowError.empty() ? "flora shadow bundle is not configured" : m_impl->shadowError;
+        return false;
+    }
+    if (!m_impl->wavesTexture || !m_impl->sampler)
+    {
+        error = "flora shadow tree branch requires the visible-path wind-wave texture and sampler";
+        return false;
+    }
+    Matrix4 lvp{};
+    std::memcpy(lvp.elements, lightViewProjection.data(), sizeof(lvp.elements));
+    for (const float value : lvp.elements)
+        if (!std::isfinite(value))
+        {
+            error = "flora shadow matrix contains a non-finite value";
+            return false;
+        }
+    m_telemetry.shadowDraws = 0u;
+    m_telemetry.shadowSubmittedVisuals = 0u;
+    m_telemetry.shadowCulledVisuals = 0u;
+    Matrix4 cameraView{};
+    Matrix4 cameraProjection{};
+    std::memcpy(cameraView.elements, view.view.data(), sizeof(cameraView));
+    std::memcpy(cameraProjection.elements, view.projection.data(), sizeof(cameraProjection));
+    const Matrix4 cameraVp = multiply(cameraProjection, cameraView);
+    std::shared_ptr<IR4Buffer> lastVertices;
+    std::shared_ptr<IR4GraphicsPipeline> lastPipeline;
+    std::vector<std::uint8_t> staticGlobals(kTreeShadowStaticGlobalsSize);
+    std::memcpy(staticGlobals.data() + 192u, &lvp, sizeof(lvp));
+    R4FrameBufferSlice staticGlobalsSlice;
+    bool staticGlobalsUploaded = false;
+    const auto& selected = m_impl->shadowIndex.Query(lvp.elements);
+    if (m_impl->shadowLinear)
+    {
+        auto& all = m_impl->shadowIndex.candidates;
+        all.resize(m_impl->draws.size()); std::iota(all.begin(), all.end(), 0u);
+    }
+    if (m_impl->shadowOracle)
+    {
+        for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+        {
+            const auto& d = m_impl->draws[i];
+            if (!isOutsideMetalClipVolume(d.hasBounds, d.boundsMinimum, d.boundsMaximum,
+                    multiply(lvp, d.model)) && !std::binary_search(selected.begin(), selected.end(), i))
+            { error = "E08 Flora shadow broad phase omitted an oracle caster"; return false; }
+        }
+        if (++m_impl->oracleViews % 1000 == 0)
+            std::fprintf(stderr, "METAL_E08_FLORA_ORACLE views=%zu draws=%zu misses=0\n",
+                m_impl->oracleViews, m_impl->draws.size());
+    }
+    m_telemetry.shadowCulledVisuals = m_impl->draws.size() - selected.size();
+    if (m_impl->shadowInstancing)
+        for (auto& group : m_impl->shadowGroups) group.models.clear();
+    const auto encodeCaster = [&](const Impl::Draw& draw, const std::vector<Matrix4>* models) {
+        const bool leaf = draw.material == Impl::Material::LeafBump;
+        const auto& pipeline = models ? (leaf ?
+            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaInstancedShadowPipeline : m_impl->leafInstancedShadowPipeline) :
+            m_impl->trunkInstancedShadowPipeline) : (leaf ?
+            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaShadowPipeline : m_impl->leafShadowPipeline) :
+            m_impl->trunkShadowPipeline);
+        std::vector<std::uint8_t> globals(kTreeShadowGlobalsSize);
+        std::memcpy(globals.data(), &lvp, sizeof(lvp));
+        std::memcpy(globals.data() + 64u, &lvp, sizeof(lvp));
+        std::memcpy(globals.data() + 160u, &draw.model, sizeof(draw.model));
+        putFloat4(globals, 224u, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
+        // Both original regular-tree permutations consume the same current
+        // wind state: aref branches sample s_waves; opaque trunks use the
+        // trunk analytic wave. Only the branch VS binds the wave texture.
+        putFloat4(globals, 240u, view.windParams[0], view.windParams[1],
+            view.windParams[2], view.windParams[3]);
+        putFloat4(globals, 256u, view.windSetupGrass[0], view.windSetupGrass[1],
+            view.windSetupGrass[2], view.windSetupGrass[3]);
+        putFloat4(globals, 272u, view.windSetupTrees[0], view.windSetupTrees[1],
+            view.windSetupTrees[2], view.windSetupTrees[3]);
+        putFloat4(globals, 288u, view.windAnimation[0], view.windAnimation[1],
+            view.windAnimation[2], view.windAnimation[3]);
+        putFloat4(globals, 304u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
+            view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
+        R4FrameBufferSlice globalsSlice;
+        if (!backend.UploadFrameData(globals.data(), globals.size(), 256u, globalsSlice, error))
+            return false;
+        if (!staticGlobalsUploaded)
+        {
+            if (!backend.UploadFrameData(staticGlobals.data(), staticGlobals.size(), 256u,
+                    staticGlobalsSlice, error))
+                return false;
+            staticGlobalsUploaded = true;
+        }
+
+        R4MscStageBindings vs;
+        vs.stage = R4ShaderStage::Vertex;
+        if (leaf)
+            vs = {R4ShaderStage::Vertex, 96u, {
+                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, m_impl->wavesTexture},
+                {R4MscResourceType::ConstantBuffer, 24u, globalsSlice.buffer,
+                    globalsSlice.offset, globalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 48u, staticGlobalsSlice.buffer,
+                    staticGlobalsSlice.offset, staticGlobalsSlice.size},
+                {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
+        else
+            vs = {R4ShaderStage::Vertex, 48u, {
+                {R4MscResourceType::ConstantBuffer, 0u, globalsSlice.buffer,
+                    globalsSlice.offset, globalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 24u, staticGlobalsSlice.buffer,
+                    staticGlobalsSlice.offset, staticGlobalsSlice.size}}};
+
+        if (models)
+        {
+            R4FrameBufferSlice modelSlice;
+            if (!backend.UploadFrameData(models->data(), models->size() * sizeof(Matrix4),
+                    256u, modelSlice, error))
+                return false;
+            // The descriptor-table buffer entry encodes GPU address and byte
+            // length for both CBV and structured-buffer SRV resources.
+            vs = leaf ? R4MscStageBindings{R4ShaderStage::Vertex, 120u, {
+                {R4MscResourceType::ConstantBuffer, 0u, modelSlice.buffer, modelSlice.offset, modelSlice.size},
+                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, m_impl->wavesTexture},
+                {R4MscResourceType::ConstantBuffer, 48u, globalsSlice.buffer, globalsSlice.offset, globalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 72u, staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size},
+                {R4MscResourceType::Sampler, 96u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}} :
+                R4MscStageBindings{R4ShaderStage::Vertex, 72u, {
+                {R4MscResourceType::ConstantBuffer, 0u, modelSlice.buffer, modelSlice.offset, modelSlice.size},
+                {R4MscResourceType::ConstantBuffer, 24u, globalsSlice.buffer, globalsSlice.offset, globalsSlice.size},
+                {R4MscResourceType::ConstantBuffer, 48u, staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size}}};
+        }
+
+        if (leaf && !view.shadowIgnoreAlpha)
+        {
+            R4MscStageBindings ps{R4ShaderStage::Fragment, 48u, {
+                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, draw.textures[0]},
+                {R4MscResourceType::Sampler, 24u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
+            if (!backend.BindMscResources(ps, error))
+                return false;
+        }
+        if (pipeline != lastPipeline)
+        {
+            if (!backend.BindGraphicsPipeline(pipeline, error))
+                return false;
+            lastPipeline = pipeline;
+        }
+        if (!backend.BindMscResources(vs, error))
+            return false;
+        if (draw.vertices != lastVertices)
+        {
+            if (!backend.BindVertexBuffer(6u, draw.vertices, 0u, error))
+                return false;
+            lastVertices = draw.vertices;
+        }
+        R4IndexedDrawDesc indexed;
+        indexed.indexBuffer = draw.indices;
+        indexed.indexCount = draw.indexCount;
+        indexed.indexType = R4IndexType::UInt16;
+        indexed.instanceCount = models ? static_cast<std::uint32_t>(models->size()) : 1u;
+        if (!backend.DrawIndexed(indexed, error))
+            return false;
+        m_telemetry.shadowSubmittedVisuals += indexed.instanceCount;
+        ++m_telemetry.shadowDraws;
+        return true;
+    };
+    for (const std::size_t drawIndex : selected)
+    {
+        const Impl::Draw& draw = m_impl->draws[drawIndex];
+        if (view.shadowOnlyOffCamera)
+        {
+            const Matrix4 cameraWvp = multiply(cameraVp, draw.model);
+            if (!isOutsideMetalClipVolume(draw.hasBounds,
+                    draw.boundsMinimum, draw.boundsMaximum, cameraWvp))
+            {
+                ++m_telemetry.shadowCulledVisuals;
+                continue;
+            }
+        }
+        const Matrix4 wvp = multiply(lvp, draw.model);
+        if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
+        {
+            ++m_telemetry.shadowCulledVisuals;
+            continue;
+        }
+        if (m_impl->shadowInstancing)
+            m_impl->shadowGroups[draw.shadowGroup].models.push_back(draw.model);
+        else if (!encodeCaster(draw, nullptr))
+            return false;
+    }
+    if (m_impl->shadowInstancing)
+        for (const auto& group : m_impl->shadowGroups)
+            if (!group.models.empty() &&
+                !encodeCaster(m_impl->draws[group.representative], &group.models))
+                return false;
+    return true;
+}
+
+bool MetalR4FloraAdapter::DrawShadowCastersForValidation(IR4Backend& backend,
+    const std::array<float, 16>& lightViewProjection,
+    const R4FloraViewState& view, const bool instanced,
+    Telemetry& sampledTelemetry, std::string& error)
+{
+    if (!m_ready || !m_impl || !view.valid)
+    {
+        error = "Flora pixel oracle requires a prepared adapter and valid scene view";
+        return false;
+    }
+    if (instanced && (!m_impl->trunkInstancedShadowPipeline ||
+        !m_impl->leafInstancedShadowPipeline || !m_impl->leafNoAlphaInstancedShadowPipeline))
+    {
+        error = "Flora pixel oracle requires the admitted instanced shadow shader directory";
+        return false;
+    }
+    struct Restore
+    {
+        bool& mode;
+        const bool savedMode;
+        Telemetry& telemetry;
+        const Telemetry savedTelemetry;
+        ~Restore() { mode = savedMode; telemetry = savedTelemetry; }
+    } restore{m_impl->shadowInstancing, m_impl->shadowInstancing, m_telemetry, m_telemetry};
+    m_telemetry = {};
+    m_impl->shadowInstancing = instanced;
+    const bool result = DrawShadowCasters(backend, lightViewProjection, view, error);
+    sampledTelemetry = m_telemetry;
+    return result;
 }
 
 bool RunR4FloraAdapterSelfTest(std::string& error)
@@ -746,6 +1317,18 @@ bool RunR4FloraAdapterSelfTest(std::string& error)
         vertices[0].texcoord[0] != 1024 || vertices[0].texcoord[1] != -1024)
     {
         if (error.empty()) error = "flora static vertex repack did not preserve the recorded ABI";
+        return false;
+    }
+    // Verify that after unpack_D3DCOLOR (c.bgra) and unpack_bx4 (4*v - 2) in the shader,
+    // the normal corresponds to the intended world basis direction (+X axis).
+    const float shaderNormalX = 4.0f * vertices[0].normal[2] - 2.0f;
+    const float shaderNormalY = 4.0f * vertices[0].normal[1] - 2.0f;
+    const float shaderNormalZ = 4.0f * vertices[0].normal[0] - 2.0f;
+    if (std::abs(shaderNormalX - 2.0f) > 0.05f ||
+        std::abs(shaderNormalY) > 0.05f ||
+        std::abs(shaderNormalZ) > 0.05f)
+    {
+        error = "flora normal unpacking does not preserve world basis after shader unpack_D3DCOLOR/unpack_bx4";
         return false;
     }
     std::vector<std::filesystem::path> textures;
@@ -786,6 +1369,28 @@ bool RunR4FloraAdapterSelfTest(std::string& error)
         error = "flora automatic candidate selection lost its proof leaves or admitted a duplicate";
         return false;
     }
+    const std::vector<R4FloraBlenderMaterial> materialRecords = {
+        {"flora\\leaf_wave", true, false}, {"flora\\trunk_wave", false, false}};
+    std::unordered_map<std::string, R4FloraBlenderMaterial> materialFlags;
+    for (const R4FloraBlenderMaterial& record : materialRecords)
+        materialFlags.emplace(record.shaderName, record);
+    const auto leafFlags = materialFlags.find(candidates.shaders[selected[0].visual->shaderId].shaderName);
+    const auto trunkFlags = materialFlags.find(candidates.shaders[selected[1].visual->shaderId].shaderName);
+    std::string flagsError;
+    if (leafFlags == materialFlags.end() || trunkFlags == materialFlags.end() ||
+        !validateFloraMaterialFlags(FloraMaterial::LeafBump,
+            leafFlags == materialFlags.end() ? false : leafFlags->second.alphaBlend,
+            leafFlags == materialFlags.end() ? false : leafFlags->second.objectLod, flagsError) ||
+        !validateFloraMaterialFlags(FloraMaterial::TrunkFlat,
+            trunkFlags == materialFlags.end() ? true : trunkFlags->second.alphaBlend,
+            trunkFlags == materialFlags.end() ? true : trunkFlags->second.objectLod, flagsError) ||
+        validateFloraMaterialFlags(FloraMaterial::LeafBump, false, false, flagsError) ||
+        validateFloraMaterialFlags(FloraMaterial::TrunkFlat, true, false, flagsError) ||
+        validateFloraMaterialFlags(FloraMaterial::LeafBump, true, true, flagsError))
+    {
+        error = "flora archive B_TREE alpha/Object LOD flags selected the wrong G-buffer route";
+        return false;
+    }
     Matrix4 identity;
     identity.elements[0] = identity.elements[5] = identity.elements[10] = identity.elements[15] = 1.0f;
     const std::array<float, 3> visibleMinimum = {-0.5f, -0.5f, 0.2f};
@@ -817,5 +1422,50 @@ bool RunR4FloraAdapterSelfTest(std::string& error)
         error = "flora Metal clip-volume AABB culling is not conservative";
         return false;
     }
+    FloraShadowIndex index;
+    std::vector<Matrix4> models;
+    std::vector<std::array<float, 3>> minima, maxima;
+    std::uint32_t seed = 0xE08;
+    auto random = [&seed]() { seed = seed * 1664525u + 1013904223u;
+        return float(seed & 65535u) / 65535.f; };
+    for (std::size_t i = 0; i < 1024; ++i)
+    {
+        Matrix4 model = identity;
+        for (std::size_t a = 0; a < 3; ++a)
+        {
+            for (std::size_t k = 0; k < 3; ++k) model.elements[k * 4 + a] = random() * 4 - 2;
+            model.elements[12 + a] = random() * 2000 - 1000;
+        }
+        std::array<float, 3> lo = {-random() * 10, -random() * 10, -random() * 10};
+        std::array<float, 3> hi = {random() * 10, random() * 10, random() * 10};
+        if (i == 0) model = nonFinite;
+        if (i == 1) model.elements[3] = .5f; // non-affine -> always a candidate
+        models.push_back(model); minima.push_back(lo); maxima.push_back(hi);
+        index.Add(i != 2, lo, hi, model.elements, i);
+    }
+    index.Finish();
+    for (std::size_t v = 0; v < 128; ++v)
+    {
+        Matrix4 vp = identity;
+        for (std::size_t a = 0; a < 16; ++a) vp.elements[a] = (random() * 2 - 1) * .01f;
+        if (v == 0) vp = identity;
+        if (v == 1) vp = nonFinite;
+        if (v == 2) vp.elements[0] = std::numeric_limits<float>::max();
+        const auto& selected = index.Query(vp.elements);
+        if (!std::is_sorted(selected.begin(), selected.end()) ||
+            std::adjacent_find(selected.begin(), selected.end()) != selected.end())
+        { error = "E08 Flora candidates changed source order or duplicate draws"; return false; }
+        for (std::size_t i = 0; i < models.size(); ++i)
+            if (!isOutsideMetalClipVolume(i != 2, minima[i], maxima[i], multiply(vp, models[i])) &&
+                !std::binary_search(selected.begin(), selected.end(), i))
+            { error = "E08 Flora index omitted an independent corner-oracle caster"; return false; }
+    }
+    // Touching a Metal plane must pass through to the exact test.
+    FloraShadowIndex boundary;
+    boundary.Add(true, {1, -1, 0}, {1, 1, 1}, identity.elements, 0);
+    boundary.Add(true, {100, 100, 100}, {101, 101, 101}, identity.elements, 1);
+    boundary.Finish();
+    if (boundary.Query(identity.elements).empty() || boundary.Query(identity.elements).front() != 0)
+    { error = "E08 Flora index rejected a clip-plane boundary"; return false; }
     return true;
 }

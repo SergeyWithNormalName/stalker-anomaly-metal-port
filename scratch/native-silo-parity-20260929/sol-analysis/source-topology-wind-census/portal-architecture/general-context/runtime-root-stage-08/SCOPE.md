@@ -1,0 +1,1 @@
+Defaultoff observe/on per-frame general portal+wind hypothesis. Full immutable population join intentionally retained each frame initially; total graph+mask cost measured before any caching complexity. Original source order, shaders, uploads and shadows preserved. Unknown/stale inputs fail open. Not shipping admitted.

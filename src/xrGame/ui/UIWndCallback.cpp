@@ -39,6 +39,14 @@ void CUIWndCallback::OnEvent(CUIWindow* pWnd, s16 msg, void* pData)
 		(*it)->m_cpp_callback(pWnd, pData);
 }
 
+bool CUIWndCallback::HasCallback(CUIWindow* pWnd, s16 msg) const
+{
+	if (!pWnd)
+		return false;
+	const event_comparer comparer(pWnd, msg);
+	return std::find_if(m_callbacks.begin(), m_callbacks.end(), comparer) != m_callbacks.end();
+}
+
 SCallbackInfo* CUIWndCallback::NewCallback()
 {
 	m_callbacks.push_back(xr_new<SCallbackInfo>());

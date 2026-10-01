@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include <dinput.h>
 #include "UITalkWnd.h"
 
 #include "UITalkDialogWnd.h"
@@ -370,6 +371,14 @@ bool CUITalkWnd::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {
 	if (keyboard_action == WINDOW_KEY_PRESSED)
 	{
+		if (UITalkDialogWnd && dik == DIK_UP && UITalkDialogWnd->MoveQuestionSelection(-1))
+			return true;
+		if (UITalkDialogWnd && dik == DIK_DOWN && UITalkDialogWnd->MoveQuestionSelection(1))
+			return true;
+		if (UITalkDialogWnd && (dik == DIK_RETURN || dik == DIK_NUMPADENTER) &&
+			UITalkDialogWnd->ActivateSelectedQuestion())
+			return true;
+
 		if (is_binded(kUSE, dik) || is_binded(kQUIT, dik))
 		{
 			if (!b_disable_break)

@@ -1,0 +1,83 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -2613,6 +2613,7 @@
+     const xray::metal::R4PortalContextFrameInput& input,
+     const xray::metal::R4PortalContextFrameOutput& portal,
+     const xray::metal::R4LevelGeometry& geometry,
++    const std::vector<R4FloraBlenderMaterial>& floraShaderMaterials,
+     const std::vector<R4FloraRestRecord>& restRecords,
+     const R4FloraViewState& frozenView,
+     const bool selectedPrimaryViewMatches,
+@@ -2649,12 +2650,11 @@
+     }
+ 
+     // The adapter publishes one value record per admitted main Flora draw.
+-    // Require the complete pinned capture count and a full unique source join
+-    // before admitting any mask. An individual unknown envelope below remains
+-    // visible; missing/ambiguous records disable the entire candidate set.
+-    constexpr std::size_t kExpectedRestRecordCount = 5316u;
+-    if (restRecords.size() != kExpectedRestRecordCount)
+-    { result.reason = "incomplete-rest-record-count"; return false; }
++    // Require the complete admitted adapter population and a full unique
++    // source join before admitting any mask. An individual unknown envelope
++    // below remains visible; missing/ambiguous records disable the whole set.
++    if (restRecords.empty())
++    { result.reason = "rest-record-population-empty"; return false; }
+     std::unordered_map<std::uint32_t, const xray::metal::R4StaticVisual*> sourceVisualById;
+     std::unordered_set<std::uint32_t> duplicateSourceIds;
+     sourceVisualById.reserve(cache.graph.visualNodes.size());
+@@ -2664,17 +2664,27 @@
+             duplicateSourceIds.insert(visual.visualId);
+     }
+     std::unordered_set<std::uint32_t> expectedFloraIds;
++    std::unordered_map<std::string, const R4FloraBlenderMaterial*> blenderByName;
++    std::unordered_set<std::string> duplicateBlenderNames;
++    for (const R4FloraBlenderMaterial& material : floraShaderMaterials)
++        if (!blenderByName.emplace(material.shaderName, &material).second)
++            duplicateBlenderNames.insert(material.shaderName);
+     for (const xray::metal::R4StaticVisual& visual : geometry.visuals)
+     {
+         if (visual.visualType != 7u || !visual.valid || !visual.hasTreeLighting ||
+             visual.shaderId >= geometry.shaders.size())
+             continue;
+         const std::string& shaderName = geometry.shaders[visual.shaderId].shaderName;
+-        if (shaderName == "flora\\leaf_wave" || shaderName == "flora\\trunk_wave")
++        const bool leaf = shaderName == "flora\\leaf_wave";
++        const bool trunk = shaderName == "flora\\trunk_wave";
++        const auto foundBlender = blenderByName.find(shaderName);
++        if ((leaf || trunk) && foundBlender != blenderByName.end() &&
++            !duplicateBlenderNames.count(shaderName) && !foundBlender->second->objectLod &&
++            (leaf ? foundBlender->second->alphaBlend : !foundBlender->second->alphaBlend))
+             expectedFloraIds.insert(visual.visualId);
+     }
+-    if (expectedFloraIds.size() != kExpectedRestRecordCount)
+-    { result.reason = "known-source-flora-join-count-is-not-5316"; return false; }
++    if (expectedFloraIds.empty() || expectedFloraIds.size() != restRecords.size())
++    { result.reason = "known-source-flora-join-count-does-not-match-rest-record-population"; return false; }
+     const auto finite3 = [](const float* p) {
+         return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+     };
+@@ -2715,7 +2725,7 @@
+             visual.indexBase > ib.indexCount || visual.indexCount > ib.indexCount - visual.indexBase)
+         { result.reason = "rest-record-source-index-range-invalid"; return false; }
+     }
+-    if (seen.size() != kExpectedRestRecordCount || seen != expectedFloraIds)
++    if (seen.size() != restRecords.size() || seen != expectedFloraIds)
+     { result.reason = "rest-record-id-set-does-not-match-complete-source-flora-join"; return false; }
+ 
+     for (const R4FloraRestRecord& record : restRecords)
+@@ -7721,10 +7731,11 @@
+             const auto& restRecords = impl->flora->RestRecordsForValidation();
+             const MetalR4FloraAdapter::Telemetry& floraTelemetry = impl->flora->LastTelemetry();
+             const std::size_t admittedDraws = floraTelemetry.admittedVisuals;
+-            if (restRecords.size() != 5316u || admittedDraws != restRecords.size())
+-            { candidates.reason = "rest-record-count-does-not-match-5316-admitted-draws"; callbackError = candidates.reason; return false; }
++            if (restRecords.empty() || admittedDraws == 0u || admittedDraws != restRecords.size())
++            { candidates.reason = "rest-record-population-does-not-match-admitted-draws"; callbackError = candidates.reason; return false; }
+             if (!buildMainFloraPortalCandidateSet(impl->portalCache, impl->portalInput,
+-                    impl->portalOutput, impl->scene.geometry, restRecords, frozenView,
++                    impl->portalOutput, impl->scene.geometry, impl->portalFloraShaderMaterials,
++                    restRecords, frozenView,
+                     impl->portalSelectedViewMatches, motionSnapshotFresh, environmentSnapshotFresh, candidates))
+             { callbackError = candidates.reason; return false; }
+             return true;

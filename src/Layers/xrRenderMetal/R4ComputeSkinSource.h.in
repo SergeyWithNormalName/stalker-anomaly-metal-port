@@ -1,0 +1,9 @@
+#pragma once
+
+namespace xray::metal
+{
+// Generated only from canonical R4ComputeSkin.metal. The CMake configure
+// dependency makes every shader change regenerate the embedded source.
+inline constexpr const char R4ComputeSkinSourceSha256[] = "@R4_COMPUTE_SKIN_SHA256@";
+inline constexpr const char R4ComputeSkinMslSource[] = R"R4SKIN(@R4_COMPUTE_SKIN_MSL@)R4SKIN";
+} // namespace xray::metal

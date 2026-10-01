@@ -62,6 +62,9 @@ void CRenderDevice::Destroy(void)
 	{
 		SDL_DestroyWindow((SDL_Window*)m_hWnd);
 		m_hWnd = NULL;
+#if defined(XR_PLATFORM_APPLE)
+		g_mainSdlWindow = NULL;
+#endif
 	}
 #endif
 }

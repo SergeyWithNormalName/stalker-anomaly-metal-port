@@ -41,6 +41,12 @@ CHARACTER_COMMUNITY_ID CHARACTER_COMMUNITY::id() const
 
 u8 CHARACTER_COMMUNITY::team() const
 {
+	// An unresolved community leaves m_current_index at NO_COMMUNITY_INDEX and
+	// this read went out of bounds in release builds (VERIFY is compiled out).
+	// 255 means "no team", the same convention the config uses.
+	if (m_current_index == NO_COMMUNITY_INDEX)
+		return 255;
+
 	return (*m_pItemDataVector)[m_current_index].team;
 }
 

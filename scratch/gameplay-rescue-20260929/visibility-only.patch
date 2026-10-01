@@ -1,0 +1,280 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -7,6 +7,7 @@
+ #include "MetalR4LensFlareAdapter.h"
+ #include "R4LocalShadowAtlasFoundation.h"
+ #include "R4LocalShadowBatchPlan.h"
++#include "R4LocalLightFaceVisibility.h"
+ #include "R4StaticShadowIndex.h"
+ #include "R4StaticShadowMerge.h"
+ #include "MetalR4VolumetricCapture.h"
+@@ -2407,6 +2408,7 @@
+ 
+ bool planLocalShadowBatches(const MetalR4EngineScene::ViewState& view,
+     const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
++    const R4EnvironmentSnapshot& environment,
+     std::vector<std::vector<std::size_t>>& batches, std::vector<std::size_t>& unshadowed,
+     std::string& error)
+ {
+@@ -2453,7 +2455,77 @@
+     candidates.erase(std::remove_if(candidates.begin(),candidates.end(),[&](const auto& c) {
+         return !visibleParents.count(c.omni?c.parentId:c.lightId);
+     }),candidates.end());
+-    return xray::metal::PlanR4LocalShadowBatches(candidates,batches,error);
++    if (!xray::metal::PlanR4LocalShadowBatches(candidates,batches,error)) return false;
++    static const bool faceCull=[] {
++        const char* value=std::getenv("XRAY_METAL_LOCAL_LIGHT_FACE_CULL");
++        return value && !std::strcmp(value,"1");
++    }();
++    // Preserve the old complete-six-face witness contract when that diagnostic
++    // is requested. Pixel parity for face culling uses the color-phase capture.
++    const char* batchProbe=std::getenv("XRAY_METAL_LOCAL_SHADOW_BATCH_PROBE_DIR");
++    if (faceCull && batchProbe && *batchProbe)
++    {
++        static bool logged=false;
++        if (!logged) std::fprintf(stderr,"METAL_LOCAL_LIGHT_FACE_CULL status=bypassed reason=complete_face_batch_witness\n");
++        logged=true;
++        return true;
++    }
++    if (!faceCull || !environment.valid ||
++        environment.engineFrame!=view.engineFrame || snapshot->engineFrame!=view.engineFrame ||
++        view.engineFrame==UINT32_MAX || !finiteMatrix(viewProjection) ||
++        !std::isfinite(snapshot->shadowDepthScale) || !std::isfinite(snapshot->shadowDepthBias)) return true;
++    std::unordered_set<std::uint64_t> exemptParents;
++    for (const auto& light:snapshot->lights)
++        if (light.type==R4EngineLocalLightType::OmniFace &&
++            !xray::metal::R4LocalLightFaceMayBeCulled(light,environment))
++            exemptParents.insert(light.parentLightId);
++    std::array<float,16> vp{};
++    std::memcpy(vp.data(),viewProjection.elements,sizeof(viewProjection));
++    const Matrix4 inverseView=inverseRigidTransform(cameraView);
++    if (!finiteMatrix(inverseView)) return true;
++    std::size_t before=0, eligible=0, exempt=0, unknown=0, removed=0;
++    for (auto& batch:batches)
++    {
++        before+=batch.size();
++        batch.erase(std::remove_if(batch.begin(),batch.end(),[&](std::size_t index) {
++            const auto& light=snapshot->lights[index];
++            if (light.type!=R4EngineLocalLightType::OmniFace) return false;
++            if (exemptParents.count(light.parentLightId)) { ++exempt; return false; }
++            ++eligible;
++            std::array<float,3> minimum{},maximum{};
++            if (!BuildMetalR4LocalLightVolumeBounds(light,minimum,maximum)) { ++unknown; return false; }
++            if (!xray::metal::R4LocalLightFaceBoundsOutsideView(minimum,maximum,vp)) return false;
++            // Culling must not hide a malformed shadow source. Check the same
++            // projection/derived-matrix admission used by its tile; uncertainty
++            // retains the record so the normal renderer reports the error.
++            const Matrix4 lightView=makeR4SpotLightView(light);
++            const Matrix4 lightProjection=makeR4SpotLightProjection(light);
++            if (!light.lightId || !finiteMatrix(lightView) || !finiteMatrix(lightProjection) ||
++                !finiteMatrix(multiply(lightProjection,lightView))) { ++unknown; return false; }
++            xray::metal::R4LocalShadowAtlasRecord proof;
++            proof.atlasSize=LocalShadowTileSize; proof.atlasExtent=LocalShadowAtlasExtent;
++            std::memcpy(proof.lightView.data(),lightView.elements,sizeof(lightView));
++            std::memcpy(proof.lightProjection.data(),lightProjection.elements,sizeof(lightProjection));
++            std::memcpy(proof.deviceInverseView.data(),inverseView.elements,sizeof(inverseView));
++            std::string proofError;
++            if (!xray::metal::DeriveR4LocalShadowMatrix(proof,snapshot->shadowDepthScale,
++                    snapshot->shadowDepthBias,proof.shadowMatrix,proofError) ||
++                !xray::metal::DeriveR4LocalLightMapMatrix(proof,snapshot->shadowDepthScale,
++                    snapshot->shadowDepthBias,proof.lightMapMatrix,proofError)) { ++unknown; return false; }
++            ++removed;
++            return true;
++        }),batch.end());
++    }
++    batches.erase(std::remove_if(batches.begin(),batches.end(),[](const auto& batch) {
++        return batch.empty();
++    }),batches.end());
++    // A removed record cannot produce accumulator fragments. Its complete
++    // shadow tile and all caster families are consequently unnecessary; caster
++    // admission for the remaining records still uses each light's own frustum.
++    if (view.engineFrame%120u==0u)
++        std::fprintf(stderr,"METAL_LOCAL_LIGHT_FACE_CULL frame=%u before=%zu eligible=%zu exempt=%zu unknown=%zu removed=%zu remaining=%zu batches=%zu\n",
++            view.engineFrame,before,eligible,exempt,unknown,removed,before-removed,batches.size());
++    return true;
+ }
+ 
+ // Exact ordered source IDs are the key. Geometry/model/materials are immutable
+@@ -4265,7 +4337,7 @@
+         std::vector<std::size_t> unshadowed;
+         const bool e08PlanTiming = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120u == 0u;
+         const auto e08PlanStart = e08PlanTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+-        if (!planLocalShadowBatches(view,snapshot,batches,unshadowed,error)) return false;
++        if (!planLocalShadowBatches(view,snapshot,environment,batches,unshadowed,error)) return false;
+         if (e08PlanTiming)
+             std::fprintf(stderr, "METAL_E08_LOCAL_PLAN frame=%u cpu_ms=%.6f batches=%zu\n", view.engineFrame,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08PlanStart).count(), batches.size());
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -12,6 +12,10 @@
+ add_executable(XRay.Metal.LightHomBoundsProbe tests/R4LightHomBoundsProbe.cpp)
+ target_compile_features(XRay.Metal.LightHomBoundsProbe PRIVATE cxx_std_17)
+ add_test(NAME XRay.Metal.LightHomBounds.SelfTest COMMAND XRay.Metal.LightHomBoundsProbe)
++
++add_executable(XRay.Metal.LocalLightFaceVisibilityProbe tests/R4LocalLightFaceVisibilityProbe.cpp)
++target_compile_features(XRay.Metal.LocalLightFaceVisibilityProbe PRIVATE cxx_std_17)
++add_test(NAME XRay.Metal.LocalLightFaceVisibility.SelfTest COMMAND XRay.Metal.LocalLightFaceVisibilityProbe)
+ 
+ add_library(XRay.Metal.R4Backend STATIC
+   MetalR4DefObjectsLodAdapter.cpp
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4LocalLightFaceVisibility.h
+@@ -0,0 +1,76 @@
++#pragma once
++
++#include "IR4Backend.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <limits>
++
++namespace xray::metal
++{
++// Only an accumulator-only OmniFace may use the accumulator mesh as its
++// contribution bound. A volumetric cone can extend beyond that mesh, and HUD
++// sources follow a separate projection contract. Unknown input stays visible.
++inline bool R4LocalLightFaceMayBeCulled(const R4EngineLocalLight& light,
++    const R4EnvironmentSnapshot& environment)
++{
++    if (light.type != R4EngineLocalLightType::OmniFace || !light.active ||
++        !light.shadowed || light.hudMode || !environment.valid)
++        return false;
++    for (const float value : environment.ssfxVolumetric)
++        if (!std::isfinite(value)) return false;
++    return !environment.localVolumetricEnabled || environment.volumetricMode == 1 ||
++        (!light.volumetricEnabled && !(environment.ssfxVolumetric[0] > 0.0f));
++}
++
++// The caller supplies the padded world AABB of the real accumulator mesh.
++// All eight corners must lie strictly outside one homogeneous clip plane.
++// The near/camera plane remains fail open, including boxes which cross it.
++inline bool R4LocalLightFaceBoundsOutsideView(const std::array<float, 3>& minimum,
++    const std::array<float, 3>& maximum, const std::array<float, 16>& viewProjection)
++{
++    for (unsigned axis = 0; axis < 3; ++axis)
++        if (!std::isfinite(minimum[axis]) || !std::isfinite(maximum[axis]) ||
++            minimum[axis] > maximum[axis]) return false;
++    for (const float value : viewProjection)
++        if (!std::isfinite(value)) return false;
++    std::array<bool, 5> outside{true, true, true, true, true};
++    for (unsigned corner = 0; corner < 8; ++corner)
++    {
++        const std::array<double, 4> position{
++            corner & 1u ? maximum[0] : minimum[0],
++            corner & 2u ? maximum[1] : minimum[1],
++            corner & 4u ? maximum[2] : minimum[2], 1.0};
++        std::array<double, 4> clip{}, magnitude{};
++        for (unsigned row = 0; row < 4; ++row)
++            for (unsigned column = 0; column < 4; ++column)
++            {
++                const double term = position[column] * viewProjection[column * 4u + row];
++                clip[row] += term;
++                magnitude[row] += std::abs(term);
++            }
++        // GPU float matrix products may cancel large translation terms. Bound
++        // roundoff from those terms, not only the small resulting clip W. The
++        // factor also covers CPU model/WVP multiplication and its reassociation.
++        std::array<double, 4> roundoff{};
++        for (unsigned row = 0; row < 4; ++row)
++        {
++            if (!std::isfinite(clip[row]) || !std::isfinite(magnitude[row]) ||
++                magnitude[row] > std::numeric_limits<float>::max() / 128.0) return false;
++            roundoff[row] = 64.0 * std::numeric_limits<float>::epsilon() * magnitude[row];
++        }
++        const double base = 1.e-5 * std::max(1.0, std::abs(clip[3]));
++        if (clip[3] <= base + roundoff[3] || clip[2] <= base + roundoff[2]) return false;
++        const double xMargin = base + roundoff[0] + roundoff[3];
++        const double yMargin = base + roundoff[1] + roundoff[3];
++        const double zMargin = base + roundoff[2] + roundoff[3];
++        outside[0] = outside[0] && clip[0] < -clip[3] - xMargin;
++        outside[1] = outside[1] && clip[0] > clip[3] + xMargin;
++        outside[2] = outside[2] && clip[1] < -clip[3] - yMargin;
++        outside[3] = outside[3] && clip[1] > clip[3] + yMargin;
++        outside[4] = outside[4] && clip[2] > clip[3] + zMargin;
++    }
++    return std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
++}
++} // namespace xray::metal
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/tests/R4LocalLightFaceVisibilityProbe.cpp
+@@ -0,0 +1,79 @@
++#include "../R4LocalLightFaceVisibility.h"
++
++#include <cstdio>
++#include <limits>
++
++int main()
++{
++    using namespace xray::metal;
++    std::array<float, 16> vp{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++    const auto outside = [&](std::array<float, 3> lo, std::array<float, 3> hi) {
++        return R4LocalLightFaceBoundsOutsideView(lo, hi, vp);
++    };
++    bool ok = outside({2,.2f,.2f}, {3,.3f,.3f});
++    ok &= outside({-3,.2f,.2f}, {-2,.3f,.3f});
++    ok &= outside({.2f,2,.2f}, {.3f,3,.3f});
++    ok &= outside({.2f,-3,.2f}, {.3f,-2,.3f});
++    ok &= outside({.2f,.2f,2}, {.3f,.3f,3});
++    ok &= !outside({.2f,.2f,.2f}, {.3f,.3f,.3f});
++    ok &= !outside({1,.2f,.2f}, {2,.3f,.3f}); // Boundary touches.
++    ok &= !outside({2,.2f,-.1f}, {3,.3f,.3f}); // Near-plane crossing.
++    ok &= !outside({3,.2f,.2f}, {2,.3f,.3f}); // Invalid box.
++    vp[15] = 0;
++    ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
++    vp[15] = -1;
++    ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
++    vp[15] = 1;
++    // Compare translated/cancelling clip evaluation to the actual float dot
++    // products. A double result strictly outside is insufficient near an edge.
++    const auto floatOutsideRight = [&](std::array<float,3> lo, std::array<float,3> hi) {
++        for (unsigned corner = 0; corner < 8; ++corner)
++        {
++            const std::array<float,4> p{corner & 1u ? hi[0] : lo[0],
++                corner & 2u ? hi[1] : lo[1], corner & 4u ? hi[2] : lo[2], 1};
++            float x=0, w=0;
++            for (unsigned column=0; column<4; ++column)
++            { x+=p[column]*vp[column*4]; w+=p[column]*vp[column*4+3]; }
++            if (!(x>w)) return false;
++        }
++        return true;
++    };
++    vp[12] = -100000000.0f;
++    const std::array<float,3> largeLo{100000016.0f,.2f,.2f}, largeHi{100000032.0f,.3f,.3f};
++    ok &= floatOutsideRight(largeLo,largeHi);
++    ok &= !outside(largeLo,largeHi); // Float roundoff budget exceeds separation.
++    const std::array<float,3> distantLo{100016384.0f,.2f,.2f}, distantHi{100032768.0f,.3f,.3f};
++    ok &= floatOutsideRight(distantLo,distantHi) && outside(distantLo,distantHi);
++    vp[12] = 0;
++    vp[14] = -100000000.0f;
++    ok &= !outside({2,.2f,100000000.0f},{3,.3f,100000016.0f}); // Float near-plane touch.
++    vp[14] = 0;
++    vp[0] = std::numeric_limits<float>::quiet_NaN();
++    ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
++    R4EngineLocalLight light;
++    light.type = R4EngineLocalLightType::OmniFace;
++    light.active = light.shadowed = true;
++    R4EnvironmentSnapshot environment;
++    environment.valid = true;
++    ok &= R4LocalLightFaceMayBeCulled(light, environment);
++    light.hudMode = true;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    light.hudMode = false;
++    environment.localVolumetricEnabled = true;
++    light.volumetricEnabled = true;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    light.volumetricEnabled = false;
++    environment.ssfxVolumetric[0] = 1;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    environment.volumetricMode = 1;
++    ok &= R4LocalLightFaceMayBeCulled(light, environment);
++    light.type = R4EngineLocalLightType::Spot;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    light.type = R4EngineLocalLightType::Point;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    light.type = R4EngineLocalLightType::OmniFace;
++    environment.valid = false;
++    ok &= !R4LocalLightFaceMayBeCulled(light, environment);
++    if (!ok) std::fprintf(stderr, "local-light face visibility safety checks failed\n");
++    return ok ? 0 : 1;
++}

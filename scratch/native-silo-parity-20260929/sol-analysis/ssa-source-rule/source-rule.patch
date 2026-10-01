@@ -1,0 +1,576 @@
+diff --git a/src/Layers/xrRenderMetal/R4LevelGeometry.h b/src/Layers/xrRenderMetal/R4LevelGeometry.h
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.h
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.h
+@@ -55,6 +55,10 @@
+ 	std::uint32_t indexBase = 0;
+ 	std::uint32_t indexCount = 0;
+ 	bool valid = false;
++	// Exact OGF_HEADER world sphere used by the source static SSA rule.
++	// Missing/non-finite/non-positive metadata keeps the visual fail-open.
++	std::array<float, 4> sourceSphere{};
++	bool hasSourceSphere = false;
+ 	bool hasModelTransform = false;
+ 	std::array<float, 16> modelTransform{
+ 		1.0f, 0.0f, 0.0f, 0.0f,
+diff --git a/src/Layers/xrRenderMetal/R4LevelGeometry.cpp b/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
+@@ -650,6 +650,10 @@
+ 		visual.visualId = visualChunk.id;
+ 		visual.visualType = result.visualNodes.back().visualType;
+ 		visual.shaderId = result.visualNodes.back().shaderId;
++		std::memcpy(visual.sourceSphere.data(), levelBytes.data() + header->dataBegin + 28u,
++			sizeof(visual.sourceSphere));
++		visual.hasSourceSphere = std::all_of(visual.sourceSphere.begin(), visual.sourceSphere.end(),
++			[](const float value) { return std::isfinite(value); }) && visual.sourceSphere[3] > 0.0f;
+ 		if (visual.visualType == 7u || visual.visualType == 11u)
+ 		{
+ 			if (!treeDefinition || treeDefinition->dataEnd - treeDefinition->dataBegin < 64u)
+@@ -903,6 +907,8 @@
+ 	header[0] = kOgfFormatVersion;
+ 	header[1] = 7u;
+ 	header[2] = 1u;
++	const std::array<float, 4> authoredSphere{2.0f, 3.0f, 4.0f, 1.25f};
++	std::memcpy(header.data() + 28u, authoredSphere.data(), sizeof(authoredSphere));
+ 	appendChunk(visual, kOgfHeaderChunk, header);
+ 	std::vector<std::uint8_t> treeDefinition;
+ 	for (std::size_t element = 0; element < 16u; ++element)
+@@ -913,7 +919,7 @@
+ 		if (element == 14u) value = 4.0f;
+ 		appendFloat(treeDefinition, value);
+ 	}
+-	treeDefinition.resize(96u, 0u);
++	treeDefinition.resize(64u + sizeof(float) * 10u, 0u);
+ 	appendChunk(visual, kOgfTreeDefinitionChunk, treeDefinition);
+ 	appendChunk(visual, kOgfGeometryContainerChunk, geometryContainer);
+ 	std::vector<std::uint8_t> visuals;
+@@ -946,6 +952,7 @@
+ 		parsed.shaders[1].textures[2] != "test_hemi" || parsed.visuals.size() != 1u
+ 		|| parsed.visualNodes.size() != 2u || parsed.visualNodes[1].linkedChildren != std::vector<std::uint32_t>{0u}
+ 		|| !parsed.visuals.front().valid || !parsed.visuals.front().hasModelTransform
++		|| !parsed.visuals.front().hasSourceSphere || parsed.visuals.front().sourceSphere != authoredSphere
+ 		|| parsed.visuals.front().modelTransform[12] != 2.0f
+ 		|| parsed.visuals.front().modelTransform[13] != 3.0f
+ 		|| parsed.visuals.front().modelTransform[14] != 4.0f
+diff --git a/src/Layers/xrRenderMetal/R4FloraBlenderMaterial.h b/src/Layers/xrRenderMetal/R4FloraBlenderMaterial.h
+--- a/src/Layers/xrRenderMetal/R4FloraBlenderMaterial.h
++++ b/src/Layers/xrRenderMetal/R4FloraBlenderMaterial.h
+@@ -9,4 +9,7 @@
+     std::string shaderName;
+     bool alphaBlend = false;
+     bool objectLod = false;
++    // Archive B_TREE route without a named Lua shader override. Unknown
++    // material provenance leaves the source SSA optimization disabled.
++    bool sourceSsaEligible = false;
+ };
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraMaterialCapture.h b/src/Layers/xrRenderMetal/MetalR4FloraMaterialCapture.h
+--- a/src/Layers/xrRenderMetal/MetalR4FloraMaterialCapture.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraMaterialCapture.h
+@@ -4,10 +4,13 @@
+ // probe headers; they consume only R4FloraBlenderMaterial values.
+ #include "../xrRenderPC_R4/stdafx.h"
+ #include "../xrRender/Blender_tree.h"
++#include "../xrRender/ResourceManager.h"
+ #include "../xrRender/blenders/Blender_CLSID.h"
+ #include "R4FloraBlenderMaterial.h"
+ 
+ #include <string>
++#include <cstdlib>
++#include <cstring>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -101,5 +104,17 @@
+         error = "shaders.xr contains no B_TREE flora material records";
+         return false;
+     }
++    const char* mode = std::getenv("XRAY_METAL_FLORA_SOURCE_SSA");
++    if (mode && std::strcmp(mode, "1") == 0)
++    {
++        xr_vector<shared_str> names;
++        xr_vector<bool> overrides;
++        for (const auto& material : materials)
++            names.emplace_back(material.shaderName.c_str());
++        const bool known = CResourceManager::InspectShaderScriptOverrides(names, overrides);
++        for (std::size_t index = 0; index < materials.size(); ++index)
++            materials[index].sourceSsaEligible = known && !materials[index].objectLod && !overrides[index];
++        Msg("* METAL_FLORA_SSA_ROUTES known=%u materials=%u", known, unsigned(materials.size()));
++    }
+     return true;
+ }
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -4,6 +4,7 @@
+ #include "R4DdsTexture.h"
+ #include "R4FloraBlenderMaterial.h"
+ #include "R4LevelGeometry.h"
++#include "R4StaticVisualSsa.h"
+ 
+ #include <array>
+ #include <filesystem>
+@@ -21,6 +22,8 @@
+     std::array<float, 16> previousView{};
+     std::array<float, 16> previousProjection{};
+     std::array<float, 3> eye{};
++    std::uint32_t engineFrame = 0;
++    R4StaticVisualSsaSettings sourceSsa;
+     // Authoritative scene static_globals from combine/G-buffer setup. Tree
+     // shaders consume ambient/hemi/sun/fog here; synthesizing a zero-filled
+     // copy turns otherwise valid foliage into black silhouettes.
+@@ -104,6 +107,9 @@
+         std::size_t skippedVisuals = 0;
+         std::size_t submittedVisuals = 0;
+         std::size_t culledVisuals = 0;
++        std::size_t sourceSsaEligibleVisuals = 0;
++        std::size_t sourceSsaCulledVisuals = 0;
++        bool sourceSsaActive = false;
+         std::size_t draws = 0;
+         std::size_t shadowSubmittedVisuals = 0;
+         std::size_t shadowCulledVisuals = 0;
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -439,6 +439,9 @@
+     struct Draw
+     {
+         std::uint32_t visualId = 0;
++        std::array<float, 4> sourceSphere{};
++        std::uint32_t sourceSphereHash = 0;
++        bool sourceSsaEligible = false;
+         std::size_t shadowGroup = 0;
+         Material material = Material::LeafBump;
+         bool alphaTested = false;
+@@ -483,6 +486,10 @@
+     bool shadowLinear = std::getenv("XRAY_METAL_E08_FLORA_LINEAR") != nullptr;
+     bool shadowOracle = std::getenv("XRAY_METAL_E08_FLORA_ORACLE") != nullptr;
+     std::size_t oracleViews = 0;
++    bool sourceSsaEnabled = [] {
++        const char* value = std::getenv("XRAY_METAL_FLORA_SOURCE_SSA");
++        return value && std::strcmp(value, "1") == 0;
++    }();
+ };
+ 
+ MetalR4FloraAdapter::MetalR4FloraAdapter() = default;
+@@ -735,6 +742,15 @@
+         {
+             draw.alphaTested = blenderMaterial->alphaBlend;
+             draw.objectLod = blenderMaterial->objectLod;
++            // Immutable level MT_TREE_ST visuals start with flags zero in the
++            // source loader; mutable HUD/dynamic visuals use another adapter.
++            draw.sourceSsaEligible = blenderMaterial->sourceSsaEligible &&
++                visual && visual->visualType == kTreeVisualType && visual->hasSourceSphere;
++        }
++        if (draw.sourceSsaEligible)
++        {
++            draw.sourceSphere = visual->sourceSphere;
++            draw.sourceSphereHash = R4SourceSphereHash(draw.sourceSphere);
+         }
+         draw.indexCount = visual ? visual->indexCount : 0u;
+         if (visual && visual->referencedPositionBounds.available)
+@@ -905,6 +921,10 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    m_telemetry.sourceSsaEligibleVisuals = 0;
++    m_telemetry.sourceSsaCulledVisuals = 0;
++    m_telemetry.sourceSsaActive = m_impl->sourceSsaEnabled && view.sourceSsa.valid &&
++        view.sourceSsa.engineFrame == view.engineFrame;
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+@@ -913,6 +933,16 @@
+         {
+             ++m_telemetry.culledVisuals;
+             continue;
++        }
++        if (m_telemetry.sourceSsaActive && draw.sourceSsaEligible)
++        {
++            ++m_telemetry.sourceSsaEligibleVisuals;
++            if (R4SourceStaticSsaReject(draw.sourceSphere, draw.sourceSphereHash,
++                    view.eye, view.sourceSsa))
++            {
++                ++m_telemetry.sourceSsaCulledVisuals;
++                continue;
++            }
+         }
+         std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+         auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+@@ -1392,6 +1422,45 @@
+         return false;
+     }
+     Matrix4 identity;
++    const std::array<float, 3> ssaEye{};
++    const std::array<float, 4> smallSphere{0.0f, 0.0f, 10.0f, 1.0f};
++    const std::array<float, 4> keptSphere{0.0f, 0.0f, 8.0f, 1.0f};
++    R4StaticVisualSsaSettings ssaSettings{1u, 0.02f, 4.0f, 0.5f, true};
++    if (R4SourceSphereHash(smallSphere) != 0x9fee86c7u ||
++        !R4SourceStaticSsaReject(smallSphere, R4SourceSphereHash(smallSphere), ssaEye, ssaSettings))
++    {
++        error = "source static SSA hash or hard threshold contract failed";
++        return false;
++    }
++    ssaSettings.discard = 0.005f;
++    if (!R4SourceStaticSsaReject(smallSphere, R4SourceSphereHash(smallSphere), ssaEye, ssaSettings) ||
++        R4SourceStaticSsaReject(keptSphere, R4SourceSphereHash(keptSphere), ssaEye, ssaSettings))
++    {
++        error = "source static SSA deterministic fade controls failed";
++        return false;
++    }
++    ssaSettings.fadeK = 1.0f;
++    if (R4SourceStaticSsaReject(smallSphere, R4SourceSphereHash(smallSphere), ssaEye, ssaSettings))
++    {
++        error = "source static SSA fadeK=1 did not preserve above-threshold geometry";
++        return false;
++    }
++    ssaSettings.discard = 0.0f;
++    const bool disabledKeeps = !R4SourceStaticSsaReject(smallSphere,
++        R4SourceSphereHash(smallSphere), ssaEye, ssaSettings);
++    ssaSettings.discard = 0.005f;
++    auto invalidSphere = smallSphere;
++    invalidSphere[3] = std::numeric_limits<float>::quiet_NaN();
++    auto invalidEye = ssaEye;
++    invalidEye[0] = std::numeric_limits<float>::quiet_NaN();
++    if (!disabledKeeps ||
++        R4SourceStaticSsaReject(invalidSphere, 0u, ssaEye, ssaSettings) ||
++        R4SourceStaticSsaReject(smallSphere, R4SourceSphereHash(smallSphere), invalidEye, ssaSettings) ||
++        leafFlags->second.sourceSsaEligible || trunkFlags->second.sourceSsaEligible)
++    {
++        error = "source static SSA unknown/disabled metadata did not keep drawing";
++        return false;
++    }
+     identity.elements[0] = identity.elements[5] = identity.elements[10] = identity.elements[15] = 1.0f;
+     const std::array<float, 3> visibleMinimum = {-0.5f, -0.5f, 0.2f};
+     const std::array<float, 3> visibleMaximum = {0.5f, 0.5f, 0.8f};
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.h b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.h
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+@@ -137,6 +137,7 @@
+         std::array<float, 16> previousView{};
+         std::array<float, 16> previousProjection{};
+         std::array<float, 3> eye{};
++        R4StaticVisualSsaSettings sourceSsa;
+         std::uint32_t engineFrame = 0;
+         std::uint32_t previousFrame = 0;
+         bool cameraCut = false;
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -2540,7 +2540,8 @@
+     R4FloraViewState result;
+     result.view=view.view; result.projection=view.projection;
+     result.previousView=view.previousView; result.previousProjection=view.previousProjection;
+-    result.eye=view.eye; result.staticGlobals=staticGlobals;
++    result.eye=view.eye; result.engineFrame=view.engineFrame;
++    result.sourceSsa=view.sourceSsa; result.staticGlobals=staticGlobals;
+     result.timeSeconds=environment.globalTime; result.treeScaleBiasCorrection=environment.treeScaleBiasCorrection;
+     result.previousBenders=motion.previousBenders; result.currentBenders=motion.currentBenders;
+     result.bendersSetup=motion.bendersSetup; result.windParams=motion.windParams;
+@@ -7243,10 +7244,12 @@
+                     floraFrame % 300u == 0u)
+                 {
+                     std::fprintf(stderr,
+-                        "METAL_FLORA_FRAME sample=%llu total=%zu admitted=%zu submitted=%zu culled=%zu live_view=%s skipped=%zu\n",
++                        "METAL_FLORA_FRAME sample=%llu total=%zu admitted=%zu submitted=%zu culled=%zu live_view=%s skipped=%zu ssa_active=%u ssa_eligible=%zu ssa_culled=%zu\n",
+                         static_cast<unsigned long long>(floraFrame), flora.totalVisuals,
+                         flora.admittedVisuals, flora.submittedVisuals, flora.culledVisuals,
+-                        callbackView.valid ? "true" : "false", flora.skippedVisuals);
++                        callbackView.valid ? "true" : "false", flora.skippedVisuals,
++                        flora.sourceSsaActive ? 1u : 0u,
++                        flora.sourceSsaEligibleVisuals, flora.sourceSsaCulledVisuals);
+                     if (firstLiveReport)
+                         impl->floraLiveFrustumReported = true;
+                     if (firstGameplayReport)
+diff --git a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -40,6 +40,7 @@
+ 
+ // Source LOD controls captured before the value-only OmniFace setup.
+ extern float r_ssaGLOD_start, r_ssaGLOD_end;
++extern float r_ssaDISCARD, ps_r__ssaDISCARD_exp, ps_r__ssaDISCARD_fade_k;
+ extern ENGINE_API BOOL g_appLoaded;
+ 
+ namespace
+@@ -687,8 +688,8 @@
+             }
+             for (const auto& material:options.flora.shaderMaterials)
+                 if (material.shaderName=="flora\\leaf_wave" || material.shaderName=="flora\\trunk_wave")
+-                    std::fprintf(stderr,"METAL_FLORA_BLENDER material=%s alpha=%u object_lod=%u source=shaders.xr\n",
+-                        material.shaderName.c_str(),material.alphaBlend,material.objectLod);
++                    std::fprintf(stderr,"METAL_FLORA_BLENDER material=%s alpha=%u object_lod=%u source=shaders.xr ssa_eligible=%u\n",
++                        material.shaderName.c_str(),material.alphaBlend,material.objectLod,material.sourceSsaEligible);
+         }
+         sceneOptions = std::move(options);
+         sceneOptionsReady = true;
+@@ -1745,6 +1746,13 @@
+     };
+     viewState.engineFrame = Device.dwFrame;
+     viewState.valid = true;
++    viewState.sourceSsa.engineFrame = Device.dwFrame;
++    viewState.sourceSsa.discard = r_ssaDISCARD;
++    viewState.sourceSsa.fadeK = ps_r__ssaDISCARD_fade_k;
++    viewState.sourceSsa.exponent = ps_r__ssaDISCARD_exp;
++    viewState.sourceSsa.valid = std::isfinite(r_ssaDISCARD) && r_ssaDISCARD >= 0.0f &&
++        std::isfinite(ps_r__ssaDISCARD_fade_k) && ps_r__ssaDISCARD_fade_k >= 1.0f &&
++        std::isfinite(ps_r__ssaDISCARD_exp) && ps_r__ssaDISCARD_exp > 0.0f;
+ }
+ void MetalRenderDeviceRender::SetCacheXform_prev(Fmatrix& view, Fmatrix& projection)
+ {
+diff --git a/src/Layers/xrRender/ResourceManager.h b/src/Layers/xrRender/ResourceManager.h
+--- a/src/Layers/xrRender/ResourceManager.h
++++ b/src/Layers/xrRender/ResourceManager.h
+@@ -98,6 +98,9 @@
+ private:
+ 	void LS_Load();
+ 	void LS_Unload();
++#if defined(USE_DX10) || defined(USE_DX11)
++	bool LS_LoadImpl(bool inspection);
++#endif
+ public:
+ 	// Miscelaneous
+ 	void _ParseList(sh_list& dest, LPCSTR names);
+@@ -200,6 +203,10 @@
+ 	                    LPCSTR s_matrices = 0);
+ 	Shader* _lua_Create(LPCSTR s_shader, LPCSTR s_textures);
+ 	BOOL _lua_HasShader(LPCSTR s_shader);
++#if defined(USE_DX10) || defined(USE_DX11)
++	// CPU-only route qualification; unknown script state leaves all visuals drawing.
++	static bool InspectShaderScriptOverrides(const xr_vector<shared_str>& names, xr_vector<bool>& overrides);
++#endif
+ 
+ 	CResourceManager() : bDeferredLoad(TRUE)
+ 	{
+diff --git a/src/Layers/xrRenderDX10/dx10ResourceManager_Scripting.cpp b/src/Layers/xrRenderDX10/dx10ResourceManager_Scripting.cpp
+--- a/src/Layers/xrRenderDX10/dx10ResourceManager_Scripting.cpp
++++ b/src/Layers/xrRenderDX10/dx10ResourceManager_Scripting.cpp
+@@ -329,7 +329,61 @@
+ // export
+ extern int luaopen_lua_extensions(lua_State* L, bool IsDebug = false);
+ 
++namespace
++{
++struct ShaderInspectionLoad
++{
++    LPCSTR path;
++    LPCSTR nameSpace;
++    bool loaded;
++};
++
++int LoadShaderForInspection(lua_State* vm)
++{
++    auto* request = static_cast<ShaderInspectionLoad*>(lua_touserdata(vm, 1));
++    request->loaded = Script::bfLoadFileIntoNamespace(vm, request->path, request->nameSpace, true);
++    return 0;
++}
++
++// The source lookup can fatal on a namespace replaced by a non-table. Such
++// scripts, and metatable-dependent routes, are unknown to this optional gate.
++bool InspectionNamespaceKnown(lua_State* vm, LPCSTR name)
++{
++    const int top = lua_gettop(vm);
++    lua_pushstring(vm, "_G");
++    lua_rawget(vm, LUA_GLOBALSINDEX);
++    bool known = lua_istable(vm, -1);
++    LPCSTR part = name;
++    while (known && part[0])
++    {
++        if (lua_getmetatable(vm, -1))
++        {
++            known = false;
++            break;
++        }
++        LPCSTR dot = strchr(part, '.');
++        lua_pushlstring(vm, part, dot ? size_t(dot - part) : strlen(part));
++        lua_rawget(vm, -2);
++        if (lua_isnil(vm, -1))
++            break; // The source predicate returns false for a missing namespace.
++        known = lua_istable(vm, -1);
++        if (!dot)
++            break;
++        part = dot + 1;
++        if (!part[0])
++            known = false;
++    }
++    lua_settop(vm, top);
++    return known;
++}
++}
++
+ void CResourceManager::LS_Load()
++{
++    (void)LS_LoadImpl(false);
++}
++
++bool CResourceManager::LS_LoadImpl(bool inspection)
+ {
+ #ifdef USE_GSC_MEM_ALLOC
+ 	LSVM = lua_newstate(lua_alloc, NULL);
+@@ -340,7 +394,7 @@
+ 	if (!LSVM)
+ 	{
+ 		Msg("! ERROR : Cannot initialize LUA VM!");
+-		return;
++		return false;
+ 	}
+ 
+ 	// initialize lua standard library functions 
+@@ -468,7 +522,10 @@
+ 	// load shaders
+ 	xr_vector<char*>* folder = FS.file_list_open("$game_shaders$", ::Render->getShaderPath(),
+ 	                                             FS_ListFiles | FS_RootOnly);
++	if (!folder && inspection)
++		return false;
+ 	VERIFY(folder);
++	bool complete = true;
+ 	for (u32 it = 0; it < folder->size(); it++)
+ 	{
+ 		string_path namesp, fn;
+@@ -480,14 +537,76 @@
+ 		FS.update_path(fn, "$game_shaders$", fn);
+ 		try
+ 		{
+-			Script::bfLoadFileIntoNamespace(LSVM, fn, namesp, true);
++            if (inspection)
++            {
++                ShaderInspectionLoad request{fn, namesp, false};
++                const int top = lua_gettop(LSVM);
++                const int result = lua_cpcall(LSVM, LoadShaderForInspection, &request);
++                complete = complete && result == 0 && request.loaded;
++                if (result != 0 || !request.loaded)
++                    Msg("! METAL_FLORA_SSA_SCRIPT_UNKNOWN file=%s", fn);
++                lua_settop(LSVM, top);
++            }
++            else
++                Script::bfLoadFileIntoNamespace(LSVM, fn, namesp, true);
+ 		}
+ 		catch (...)
+ 		{
+-			Log(lua_tostring(LSVM, -1));
++            if (!inspection)
++                Log(lua_tostring(LSVM, -1));
++            complete = false;
+ 		}
+ 	}
+ 	FS.file_list_close(folder);
++    return complete;
++}
++
++bool CResourceManager::InspectShaderScriptOverrides(const xr_vector<shared_str>& names,
++    xr_vector<bool>& overrides)
++{
++    overrides.clear();
++    if (!::Render)
++        return false;
++    CResourceManager inspection;
++    inspection.LSVM = nullptr;
++    bool complete = false;
++    try
++    {
++        complete = inspection.LS_LoadImpl(true);
++        if (complete)
++        {
++            for (const auto& name : names)
++            {
++                if (!name.c_str() || !name.size() || name.size() >= sizeof(string256))
++                {
++                    complete = false;
++                    break;
++                }
++                string256 route;
++                xr_strcpy(route, name.c_str());
++                for (char* c = route; *c; ++c)
++                    if (*c == '\\') *c = '_';
++                if (!InspectionNamespaceKnown(inspection.LSVM, route))
++                {
++                    complete = false;
++                    break;
++                }
++                overrides.push_back(inspection._lua_HasShader(name.c_str()) != FALSE);
++            }
++        }
++    }
++    catch (...)
++    {
++        complete = false;
++    }
++    if (inspection.LSVM)
++        inspection.LS_Unload();
++    if (!complete || overrides.size() != names.size())
++    {
++        overrides.clear();
++        return false;
++    }
++    return true;
+ }
+ 
+ void CResourceManager::LS_Unload()
+diff --git a/src/Layers/xrRenderMetal/R4StaticVisualSsa.h b/src/Layers/xrRenderMetal/R4StaticVisualSsa.h
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4StaticVisualSsa.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++// Values established by CRender::Calculate for the current engine camera.
++// They are copied with the accepted view, never recomputed from a drawable.
++struct R4StaticVisualSsaSettings
++{
++    std::uint32_t engineFrame = 0;
++    float discard = 0.0f;
++    float fadeK = 1.0f;
++    float exponent = 1.0f;
++    bool valid = false;
++};
++
++inline std::uint32_t R4SourceSphereHash(const std::array<float, 4>& sphere)
++{
++    std::array<std::uint32_t, 3> bits{};
++    std::memcpy(bits.data(), sphere.data(), sizeof(bits));
++    std::uint32_t hash = bits[0] * 73856093u ^ bits[1] * 19349663u ^ bits[2] * 83492791u;
++    hash ^= hash >> 16;
++    hash *= 0x85ebca6bu;
++    hash ^= hash >> 13;
++    hash *= 0xc2b2ae35u;
++    hash ^= hash >> 16;
++    return hash;
++}
++
++// Match the source whole-visual SSA/thinning rule. Unknown and numerically
++// marginal cases keep drawing. Callers must separately qualify material and
++// visual exceptions; a vertex AABB is never a substitute for the OGF sphere.
++inline bool R4SourceStaticSsaReject(const std::array<float, 4>& sphere,
++    const std::uint32_t sphereHash, const std::array<float, 3>& eye,
++    const R4StaticVisualSsaSettings& settings)
++{
++    if (!settings.valid || !std::isfinite(settings.discard) || settings.discard <= 0.0f ||
++        !std::isfinite(settings.fadeK) || settings.fadeK < 1.0f ||
++        !std::isfinite(settings.exponent) || settings.exponent <= 0.0f ||
++        !std::isfinite(sphere[3]) || sphere[3] <= 0.0f)
++        return false;
++    for (std::size_t axis = 0; axis < 3u; ++axis)
++        if (!std::isfinite(sphere[axis]) || !std::isfinite(eye[axis]))
++            return false;
++    const float x = eye[0] - sphere[0], y = eye[1] - sphere[1], z = eye[2] - sphere[2];
++    const float distanceSquared = x * x + y * y + z * z + 0.0000100f;
++    const float ssa = sphere[3] * sphere[3] / distanceSquared;
++    if (!std::isfinite(distanceSquared) || distanceSquared <= 0.0f || !std::isfinite(ssa))
++        return false;
++    const float guard = settings.discard * (64.0f * std::numeric_limits<float>::epsilon());
++    if (ssa < settings.discard - guard)
++        return true;
++    const float fadeStart = settings.discard * settings.fadeK;
++    if (!std::isfinite(fadeStart) || fadeStart <= settings.discard ||
++        ssa <= settings.discard + guard || ssa >= fadeStart - guard * settings.fadeK)
++        return false;
++    const float survival = (ssa - settings.discard) / (fadeStart - settings.discard);
++    const float probability = std::pow(survival, settings.exponent);
++    const float value = static_cast<float>(sphereHash) * (1.0f / 4294967296.0f);
++    return std::isfinite(probability) && value > probability + 0.000001f;
++}

@@ -86,6 +86,8 @@ add_module(XRay.Game.Core.Client.Level
   LevelDebugScript.cpp
   Level_GameSpy_Funcs.cpp
   Level_input.cpp
+  GamepadInput.cpp
+  GamepadInput.h
   Level_load.cpp
   level_map_locations.cpp
   Level_network.cpp

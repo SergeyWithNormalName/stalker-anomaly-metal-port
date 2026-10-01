@@ -1,0 +1,11 @@
+--- a/tests/R4ActiveOcclusionCoverageOracleProbe.cpp
++++ b/tests/R4ActiveOcclusionCoverageOracleProbe.cpp
+@@ -1,7 +1,7 @@
+ // Standalone scratch CPU safety oracle for R4ActiveOcclusion::CoverageGrid.
+ // Deliberately independent reference path: full-resolution double-precision
+ // barycentric raster over original input triangles, never helper cell data.
+-#include "../draft/R4ActiveOcclusionCoverage.h"
++#include "../R4ActiveOcclusionCoverage.h"
+ 
+ #include <algorithm>
+ #include <array>

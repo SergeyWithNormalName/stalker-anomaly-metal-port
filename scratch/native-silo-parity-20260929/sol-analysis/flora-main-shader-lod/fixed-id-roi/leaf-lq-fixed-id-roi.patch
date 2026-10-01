@@ -1,0 +1,472 @@
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -30,6 +30,11 @@
+ // CB0/CB1 TLAB slots. It has no alpha discard; the adjacent shadow PS is a
+ // separate depth-only shader.
+ constexpr std::size_t kTrunkFragmentGlobalsSize = 176u;
++// The opt-in fixed-ID LQ leaf VS has the same tree matrix/wind layout as the
++// regular tree VS, ending at ssfx_wind_anim_prev (byte 464). It has no branch
++// bender CB and must not inherit the 496-byte flat-trunk padding or 1520-byte
++// HQ branch block.
++constexpr std::size_t kLeafLqVertexGlobalsSize = 464u;
+ constexpr std::size_t kTransformsSize = 256u;
+ constexpr std::size_t kTreeShadowGlobalsSize = 320u;
+ constexpr std::size_t kTreeShadowStaticGlobalsSize = 528u;
+@@ -109,6 +114,189 @@
+         return false;
+     value.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+     return input.good() || input.eof();
++}
++
++constexpr std::size_t kFixedLeafLqRoiVisualCount = 1856u;
++
++struct FixedLeafLqRoiFixture
++{
++    std::array<std::uint32_t, 16> viewBits{};
++    std::array<std::uint32_t, 16> projectionBits{};
++    std::array<std::uint32_t, 3> eyeBits{};
++    std::unordered_set<std::uint32_t> visualIds;
++};
++
++std::vector<std::string> splitCsvRow(const std::string& row)
++{
++    std::vector<std::string> fields;
++    std::size_t begin = 0;
++    for (;;)
++    {
++        const std::size_t comma = row.find(',', begin);
++        fields.emplace_back(row.substr(begin, comma == std::string::npos ? comma : comma - begin));
++        if (comma == std::string::npos)
++            break;
++        begin = comma + 1u;
++    }
++    return fields;
++}
++
++bool parseHexWord(const std::string& value, std::uint32_t& result)
++{
++    if (value.size() != 8u)
++        return false;
++    result = 0;
++    for (const char digit : value)
++    {
++        std::uint32_t nibble = 0;
++        if (digit >= '0' && digit <= '9') nibble = std::uint32_t(digit - '0');
++        else if (digit >= 'a' && digit <= 'f') nibble = std::uint32_t(digit - 'a' + 10);
++        else if (digit >= 'A' && digit <= 'F') nibble = std::uint32_t(digit - 'A' + 10);
++        else return false;
++        result = (result << 4u) | nibble;
++    }
++    return true;
++}
++
++bool parseUnsignedWord(const std::string& value, std::uint32_t& result)
++{
++    if (value.empty())
++        return false;
++    std::uint64_t parsed = 0;
++    for (const char digit : value)
++    {
++        if (digit < '0' || digit > '9')
++            return false;
++        parsed = parsed * 10u + std::uint32_t(digit - '0');
++        if (parsed > std::numeric_limits<std::uint32_t>::max())
++            return false;
++    }
++    result = std::uint32_t(parsed);
++    return true;
++}
++
++template <std::size_t N>
++bool parseBitsRow(const std::vector<std::string>& fields, const char* key,
++    std::array<std::uint32_t, N>& output)
++{
++    if (fields.size() != N + 1u || fields[0] != key)
++        return false;
++    for (std::size_t i = 0; i < N; ++i)
++        if (!parseHexWord(fields[i + 1u], output[i]))
++            return false;
++    return true;
++}
++
++bool readFixedLeafLqRoiFixture(const std::filesystem::path& path,
++    FixedLeafLqRoiFixture& fixture, std::string& error)
++{
++    std::ifstream input(path, std::ios::binary);
++    if (!input)
++    {
++        error = "fixed-ID Flora LQ fixture is unavailable";
++        return false;
++    }
++    std::string row;
++    if (!std::getline(input, row) || row != "schema,main-flora-leaf-lq-fixed-id/v1")
++    {
++        error = "fixed-ID Flora LQ fixture schema is invalid";
++        return false;
++    }
++    if (!std::getline(input, row) || row != "visual_id_count,1856")
++    {
++        error = "fixed-ID Flora LQ fixture must contain exactly 1856 IDs";
++        return false;
++    }
++    if (!std::getline(input, row) || !parseBitsRow(splitCsvRow(row), "view_bits", fixture.viewBits) ||
++        !std::getline(input, row) || !parseBitsRow(splitCsvRow(row), "projection_bits", fixture.projectionBits) ||
++        !std::getline(input, row) || !parseBitsRow(splitCsvRow(row), "eye_bits", fixture.eyeBits) ||
++        !std::getline(input, row) || row != "visual_id,material")
++    {
++        error = "fixed-ID Flora LQ fixture view header is malformed";
++        return false;
++    }
++    while (std::getline(input, row))
++    {
++        const std::vector<std::string> fields = splitCsvRow(row);
++        std::uint32_t visualId = 0;
++        if (fields.size() != 2u || fields[1] != "leaf" ||
++            !parseUnsignedWord(fields[0], visualId) || !fixture.visualIds.emplace(visualId).second)
++        {
++            error = "fixed-ID Flora LQ fixture contains an invalid, non-leaf, or duplicate ID";
++            return false;
++        }
++    }
++    if (!input.eof() || fixture.visualIds.size() != kFixedLeafLqRoiVisualCount)
++    {
++        error = "fixed-ID Flora LQ fixture read failed or its ID count changed";
++        return false;
++    }
++    return true;
++}
++
++template <std::size_t N>
++bool floatArrayMatchesBits(const std::array<float, N>& values,
++    const std::array<std::uint32_t, N>& bits)
++{
++    for (std::size_t i = 0; i < N; ++i)
++    {
++        std::uint32_t actual = 0;
++        std::memcpy(&actual, &values[i], sizeof(actual));
++        if (actual != bits[i])
++            return false;
++    }
++    return true;
++}
++
++bool fixedLeafLqRoiViewMatches(const FixedLeafLqRoiFixture& fixture,
++    const R4FloraViewState& view)
++{
++    return view.valid && view.windValid && floatArrayMatchesBits(view.view, fixture.viewBits) &&
++        floatArrayMatchesBits(view.projection, fixture.projectionBits) &&
++        floatArrayMatchesBits(view.eye, fixture.eyeBits);
++}
++
++bool validateLeafLqBundle(const std::filesystem::path& vsPath,
++    const std::filesystem::path& psPath, std::string& error)
++{
++    if (vsPath.filename() != "leaf_wave_lq.vs.metallib" ||
++        psPath.filename() != "leaf_wave_lq.ps.metallib" ||
++        vsPath.parent_path() != psPath.parent_path())
++    {
++        error = "fixed-ID Flora LQ requires the exact sibling metallib names";
++        return false;
++    }
++    std::filesystem::path vsReflection = vsPath;
++    std::filesystem::path psReflection = psPath;
++    vsReflection.replace_extension(".reflection.json");
++    psReflection.replace_extension(".reflection.json");
++    std::string vs;
++    std::string ps;
++    if (!std::filesystem::is_regular_file(vsPath) || !std::filesystem::is_regular_file(psPath) ||
++        !readText(vsReflection, vs) || !readText(psReflection, ps))
++    {
++        error = "fixed-ID Flora LQ metallib or reflection is unavailable";
++        return false;
++    }
++    static constexpr const char* Inputs =
++        "\"vertex_inputs\":[{\"columnCount\":4,\"elementType\":\"Float\",\"index\":0,\"name\":\"position0\"},{\"columnCount\":4,\"elementType\":\"Float\",\"index\":1,\"name\":\"normal0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":2,\"name\":\"tangent0\"},{\"columnCount\":3,\"elementType\":\"Float\",\"index\":3,\"name\":\"binormal0\"},{\"columnCount\":4,\"elementType\":\"Int32\",\"index\":4,\"name\":\"texcoord0\"}]";
++    static constexpr const char* VsTlab =
++        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
++    static constexpr const char* PsTlab =
++        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":96,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
++    if (vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
++        vs.find("\"ResourceCount\":2,") == std::string::npos ||
++        vs.find(VsTlab) == std::string::npos || vs.find(Inputs) == std::string::npos ||
++        ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
++        ps.find("\"ResourceCount\":5,") == std::string::npos ||
++        ps.find(PsTlab) == std::string::npos ||
++        ps.find("\"discards\":true") == std::string::npos ||
++        ps.find("\"num_render_targets\":4") == std::string::npos)
++    {
++        error = "fixed-ID Flora LQ reflection does not match the recorded 2/5-resource alpha G-buffer ABI";
++        return false;
++    }
++    return true;
+ }
+ 
+ bool hasElement(const xray::metal::R4VertexBufferSummary& buffer,
+@@ -455,7 +643,12 @@
+         std::vector<std::shared_ptr<IR4Texture>> textures;
+     };
+     std::shared_ptr<IR4GraphicsPipeline> leafPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> leafLqPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> trunkPipeline;
++    FixedLeafLqRoiFixture leafLqRoiFixture;
++    bool leafLqRoiCandidate = false;
++    bool leafLqRoiEnabled = false;
++    bool leafLqRoiActivationReported = false;
+     std::shared_ptr<IR4GraphicsPipeline> leafShadowPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaShadowPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> trunkShadowPipeline;
+@@ -564,6 +757,42 @@
+         status = m_status;
+         return true;
+     }
++    const char* leafLqRoiOptIn = std::getenv("XRAY_METAL_FLORA_LEAF_LQ_ROI");
++    if (leafLqRoiOptIn && std::strcmp(leafLqRoiOptIn, "1") == 0)
++    {
++        const char* leafLqDirectory = std::getenv("XRAY_METAL_MSC_FLORA_LQ_DIR");
++        const char* leafLqIdFile = std::getenv("XRAY_METAL_FLORA_LEAF_LQ_ID_FILE");
++        std::string leafLqError;
++        FixedLeafLqRoiFixture fixture;
++        if (!leafLqDirectory || !*leafLqDirectory || !leafLqIdFile || !*leafLqIdFile)
++            leafLqError = "LQ metallib directory or fixed-ID fixture path is missing";
++        else if (!readFixedLeafLqRoiFixture(std::filesystem::path(leafLqIdFile), fixture, leafLqError))
++            ;
++        else
++        {
++            const std::filesystem::path directory(leafLqDirectory);
++            const std::filesystem::path lqVs = directory / "leaf_wave_lq.vs.metallib";
++            const std::filesystem::path lqPs = directory / "leaf_wave_lq.ps.metallib";
++            if (validateLeafLqBundle(lqVs, lqPs, leafLqError))
++            {
++                error.clear();
++                m_impl->leafLqPipeline = makePipeline("R4 flora fixed-ID leaf_wave_lq MSC G-buffer",
++                    "r4-flora-leaf-wave-lq-fixed-id-roi-v1", lqVs, lqPs);
++                leafLqError = error;
++                error.clear();
++                if (m_impl->leafLqPipeline)
++                {
++                    m_impl->leafLqRoiFixture = std::move(fixture);
++                    m_impl->leafLqRoiCandidate = true;
++                }
++                else if (leafLqError.empty())
++                    leafLqError = "LQ leaf pipeline creation failed";
++            }
++        }
++        if (!m_impl->leafLqRoiCandidate)
++            std::fprintf(stderr, "METAL_FLORA_LEAF_LQ_ROI enabled=0 fail_open=HQ reason=\"%s\"\n",
++                leafLqError.c_str());
++    }
+     if (!options.shadowShaderDirectory.empty())
+     {
+         std::string shadowError;
+@@ -837,6 +1066,38 @@
+         }
+         m_impl->draws.emplace_back(std::move(draw));
+         ++m_telemetry.admittedVisuals;
++    }
++    if (m_impl->leafLqRoiCandidate)
++    {
++        std::unordered_set<std::uint32_t> admittedLeafIds;
++        for (const Impl::Draw& draw : m_impl->draws)
++            if (draw.material == Impl::Material::LeafBump)
++                admittedLeafIds.emplace(draw.visualId);
++        bool allFixtureIdsAdmitted = true;
++        std::uint32_t firstInvalidId = 0;
++        for (const std::uint32_t visualId : m_impl->leafLqRoiFixture.visualIds)
++        {
++            if (admittedLeafIds.find(visualId) == admittedLeafIds.end())
++            {
++                allFixtureIdsAdmitted = false;
++                firstInvalidId = visualId;
++                break;
++            }
++        }
++        if (!allFixtureIdsAdmitted)
++        {
++            std::fprintf(stderr,
++                "METAL_FLORA_LEAF_LQ_ROI enabled=0 fail_open=HQ reason=\"fixed ID %u is not an admitted leaf visual\"\n",
++                firstInvalidId);
++            m_impl->leafLqPipeline.reset();
++            m_impl->leafLqRoiFixture.visualIds.clear();
++            m_impl->leafLqRoiCandidate = false;
++        }
++        m_impl->leafLqRoiEnabled = m_impl->leafLqRoiCandidate && m_impl->leafLqPipeline;
++        if (m_impl->leafLqRoiEnabled)
++            std::fprintf(stderr,
++                "METAL_FLORA_LEAF_LQ_ROI enabled=1 ids=%zu scope=fixed-view-main-gbuffer-only\n",
++                m_impl->leafLqRoiFixture.visualIds.size());
+     }
+     for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+     {
+@@ -905,6 +1166,9 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    const bool leafLqRoiViewMatches = m_impl->leafLqRoiEnabled &&
++        fixedLeafLqRoiViewMatches(m_impl->leafLqRoiFixture, view);
++    std::size_t leafLqRoiDraws = 0;
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+@@ -918,19 +1182,22 @@
+         auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+         auto& fragmentGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleFragmentGlobals : localFragment;
+         auto& transforms = m_impl->reuseVisibleGlobals ? m_impl->visibleTransforms : localTransforms;
++        const bool leaf = draw.material == Impl::Material::LeafBump;
++        const bool leafLq = leaf && leafLqRoiViewMatches &&
++            m_impl->leafLqRoiFixture.visualIds.find(draw.visualId) !=
++                m_impl->leafLqRoiFixture.visualIds.end();
++        const bool branchLeaf = leaf && !leafLq;
+         // CPU staging only: every GPU bind still receives an immutable arena
+         // slice. assign clears the complete source CB, including unused bytes.
+-        vertexGlobals.assign(draw.material == Impl::Material::LeafBump ?
+-            kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize, 0);
+-        fragmentGlobals.assign(draw.material == Impl::Material::LeafBump ?
+-            kLeafFragmentGlobalsSize : kTrunkFragmentGlobalsSize, 0);
++        vertexGlobals.assign(branchLeaf ? kLeafVertexGlobalsSize :
++            leafLq ? kLeafLqVertexGlobalsSize : kTrunkVertexGlobalsSize, 0);
++        fragmentGlobals.assign(branchLeaf ? kLeafFragmentGlobalsSize : kTrunkFragmentGlobalsSize, 0);
+         transforms.assign(kTransformsSize, 0);
+         std::memcpy(vertexGlobals.data(), &wvp, sizeof(wvp));
+         std::memcpy(vertexGlobals.data() + 64u, &previousVp, sizeof(previousVp));
+-        const bool leaf = draw.material == Impl::Material::LeafBump;
+-        const std::size_t transformOffset = leaf ? 1216u : 160u;
+-        const std::size_t viewTransformOffset = leaf ? 1280u : 224u;
+-        const std::size_t constsOffset = leaf ? 1344u : 288u;
++        const std::size_t transformOffset = branchLeaf ? 1216u : 160u;
++        const std::size_t viewTransformOffset = branchLeaf ? 1280u : 224u;
++        const std::size_t constsOffset = branchLeaf ? 1344u : 288u;
+         std::memcpy(vertexGlobals.data() + transformOffset, &draw.model, sizeof(draw.model));
+         std::memcpy(vertexGlobals.data() + viewTransformOffset, &wv, sizeof(wv));
+         putFloat4(vertexGlobals, constsOffset, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
+@@ -938,9 +1205,9 @@
+         // r__d_tree_SBC * 1.3333 before binding c_scale/c_bias/c_sun.
+         const float treeCorrection = std::isfinite(view.treeScaleBiasCorrection) ?
+             view.treeScaleBiasCorrection * (1.3333f * 0.5f) : 0.0f;
+-        const std::size_t scaleOffset = leaf ? 1360u : 304u;
+-        const std::size_t biasOffset = leaf ? 1376u : 320u;
+-        const std::size_t sunOffset = leaf ? 1424u : 368u;
++        const std::size_t scaleOffset = branchLeaf ? 1360u : 304u;
++        const std::size_t biasOffset = branchLeaf ? 1376u : 320u;
++        const std::size_t sunOffset = branchLeaf ? 1424u : 368u;
+         putFloat4(vertexGlobals, scaleOffset, treeCorrection * draw.treeScale[0],
+             treeCorrection * draw.treeScale[1], treeCorrection * draw.treeScale[2],
+             treeCorrection * draw.treeScale[3]);
+@@ -949,7 +1216,7 @@
+             treeCorrection * draw.treeBias[3]);
+         putFloat4(vertexGlobals, sunOffset, treeCorrection * draw.treeScale[4],
+             treeCorrection * draw.treeBias[4], 0.0f, 0.0f);
+-        if (leaf)
++        if (branchLeaf)
+         {
+             if (view.windValid)
+             {
+@@ -978,18 +1245,38 @@
+         {
+             putFloat4(vertexGlobals, 336u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+             putFloat4(vertexGlobals, 352u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+-            putFloat4(vertexGlobals, 384u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+-            putFloat4(vertexGlobals, 400u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+-            putFloat4(vertexGlobals, 416u, view.windParams[0], view.windParams[1],
+-                view.windParams[2], view.windParams[3]);
+-            putFloat4(vertexGlobals, 432u, view.windSetupGrass[0], view.windSetupGrass[1],
+-                view.windSetupGrass[2], view.windSetupGrass[3]);
+-            putFloat4(vertexGlobals, 448u, view.windSetupTrees[0], view.windSetupTrees[1],
+-                view.windSetupTrees[2], view.windSetupTrees[3]);
+-            putFloat4(vertexGlobals, 464u, view.windAnimation[0], view.windAnimation[1],
+-                view.windAnimation[2], view.windAnimation[3]);
+-            putFloat4(vertexGlobals, 480u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
+-                view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++            if (leafLq)
++            {
++                // The LQ assembly declares $Globals as 464 bytes: wind_params
++                // at 384, wind setups at 400/416, and current/previous wind
++                // animation at 432/448. Do not reuse the flat-trunk 496-byte
++                // mapping, whose fields after byte 384 have a different order.
++                putFloat4(vertexGlobals, 384u, view.windParams[0], view.windParams[1],
++                    view.windParams[2], view.windParams[3]);
++                putFloat4(vertexGlobals, 400u, view.windSetupGrass[0], view.windSetupGrass[1],
++                    view.windSetupGrass[2], view.windSetupGrass[3]);
++                putFloat4(vertexGlobals, 416u, view.windSetupTrees[0], view.windSetupTrees[1],
++                    view.windSetupTrees[2], view.windSetupTrees[3]);
++                putFloat4(vertexGlobals, 432u, view.windAnimation[0], view.windAnimation[1],
++                    view.windAnimation[2], view.windAnimation[3]);
++                putFloat4(vertexGlobals, 448u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
++                    view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++            }
++            else
++            {
++                putFloat4(vertexGlobals, 384u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
++                putFloat4(vertexGlobals, 400u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
++                putFloat4(vertexGlobals, 416u, view.windParams[0], view.windParams[1],
++                    view.windParams[2], view.windParams[3]);
++                putFloat4(vertexGlobals, 432u, view.windSetupGrass[0], view.windSetupGrass[1],
++                    view.windSetupGrass[2], view.windSetupGrass[3]);
++                putFloat4(vertexGlobals, 448u, view.windSetupTrees[0], view.windSetupTrees[1],
++                    view.windSetupTrees[2], view.windSetupTrees[3]);
++                putFloat4(vertexGlobals, 464u, view.windAnimation[0], view.windAnimation[1],
++                    view.windAnimation[2], view.windAnimation[3]);
++                putFloat4(vertexGlobals, 480u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
++                    view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++            }
+         }
+         std::memcpy(fragmentGlobals.data(), &wvp, sizeof(wvp));
+         std::memcpy(fragmentGlobals.data() + 64u, &previousVp, sizeof(previousVp));
+@@ -1009,7 +1296,7 @@
+             return false;
+         R4MscStageBindings vs;
+         vs.stage = R4ShaderStage::Vertex;
+-        if (leaf)
++        if (branchLeaf)
+             vs = {R4ShaderStage::Vertex, 96u, {{R4MscResourceType::Texture, 0u, nullptr, 0u, 0u,
+                 m_impl->wavesTexture}, {R4MscResourceType::ConstantBuffer, 24u, vertexGlobalsSlice.buffer,
+                 vertexGlobalsSlice.offset, vertexGlobalsSlice.size}, {R4MscResourceType::ConstantBuffer, 48u,
+@@ -1021,7 +1308,7 @@
+                 {R4MscResourceType::ConstantBuffer, 24u, view.staticGlobals, 0u, kStaticGlobalsSize}}};
+         R4MscStageBindings ps;
+         ps.stage = R4ShaderStage::Fragment;
+-        if (leaf)
++        if (branchLeaf)
+             ps = {R4ShaderStage::Fragment, 168u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
+                 {R4MscResourceType::Texture, 24u, {}, 0, 0, draw.textures[1]},
+                 {R4MscResourceType::Texture, 48u, {}, 0, 0, draw.textures[2]},
+@@ -1029,6 +1316,14 @@
+                 {R4MscResourceType::ConstantBuffer, 96u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
+                 {R4MscResourceType::ConstantBuffer, 120u, view.staticGlobals, 0, kStaticGlobalsSize},
+                 {R4MscResourceType::Sampler, 144u, {}, 0, 0, {}, m_impl->sampler}}};
++        else if (leafLq)
++            ps = {R4ShaderStage::Fragment, 120u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
++                {R4MscResourceType::Texture, 24u, {}, 0, 0, draw.textures[1]},
++                {R4MscResourceType::ConstantBuffer, 48u, fragmentGlobalsSlice.buffer,
++                    fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 72u, transformsSlice.buffer,
++                    transformsSlice.offset, transformsSlice.size},
++                {R4MscResourceType::Sampler, 96u, {}, 0, 0, {}, m_impl->sampler}}};
+         else
+             ps = {R4ShaderStage::Fragment, 96u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
+                 {R4MscResourceType::ConstantBuffer, 24u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
+@@ -1038,13 +1333,24 @@
+         indexed.indexBuffer = draw.indices;
+         indexed.indexCount = draw.indexCount;
+         indexed.indexType = R4IndexType::UInt16;
+-        if (!backend.BindGraphicsPipeline(leaf ? m_impl->leafPipeline : m_impl->trunkPipeline, error) ||
++        const std::shared_ptr<IR4GraphicsPipeline>& pipeline = leafLq ? m_impl->leafLqPipeline :
++            leaf ? m_impl->leafPipeline : m_impl->trunkPipeline;
++        if (!backend.BindGraphicsPipeline(pipeline, error) ||
+             !backend.BindVertexBuffer(6u, draw.vertices, 0, error) ||
+             !backend.BindMscResources(vs, error) || !backend.BindMscResources(ps, error) ||
+             !backend.DrawIndexed(indexed, error))
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
++        if (leafLq)
++            ++leafLqRoiDraws;
++    }
++    if (leafLqRoiViewMatches && !m_impl->leafLqRoiActivationReported)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_LEAF_LQ_ROI view_match=1 fixture_ids=%zu submitted=%zu main_draw_count_unchanged=1\n",
++            m_impl->leafLqRoiFixture.visualIds.size(), leafLqRoiDraws);
++        m_impl->leafLqRoiActivationReported = true;
+     }
+     return true;
+ }

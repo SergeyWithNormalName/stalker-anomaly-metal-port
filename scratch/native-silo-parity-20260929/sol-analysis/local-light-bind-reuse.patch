@@ -1,0 +1,85 @@
+--- a/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.cpp
+@@ -258,6 +258,7 @@
+ 
+ struct MetalR4LocalLightAdapter::Impl
+ {
++    bool bindReuse = false;
+     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> maskFront;
+     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> maskBack;
+     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> accumulationUnshadowed;
+@@ -322,6 +323,8 @@
+ bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& options, std::string& status)
+ {
+     m_ready = false; m_status.clear(); m_telemetry = {}; m_impl = std::make_unique<Impl>();
++    const char* bindReuse = std::getenv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE");
++    m_impl->bindReuse = bindReuse && std::strcmp(bindReuse, "1") == 0;
+     const char* activeOcclusion = std::getenv("XRAY_METAL_ACTIVE_OCCLUSION");
+     m_activeOcclusionTransformsRequested = activeOcclusion && std::strcmp(activeOcclusion, "1") == 0;
+     if (options.shaderDirectory.empty()) { m_status = "local lights not configured"; status = m_status; return true; }
+@@ -644,19 +647,37 @@
+         draw.indexType = R4IndexType::UInt16;
+         const auto bindDraw = [&](const std::shared_ptr<IR4GraphicsPipeline>& pipeline,
+             const R4MscStageBindings& fragmentBindings, const std::uint32_t reference,
+-            const R4WholeLightVisibilitySample* visibilitySample) {
++            const R4WholeLightVisibilitySample* visibilitySample,
++            const bool reuseVertex, const bool reuseFragment) {
+             if (!backend.BindGraphicsPipeline(pipeline,error) || !backend.SetStencilReference(reference,error) ||
+-                !backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) ||
+-                !backend.BindMscResources(vsBindings,error) || !backend.BindMscResources(fragmentBindings,error))
++                !backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error))
+                 return false;
++            // Only the immediate front/back/accumulation triplet of this light
++            // can reuse its immutable TLABs. The first draw always binds both
++            // stages; the final draw always binds the accumulation PS layout.
++            // Pipeline changes and PS-only binds preserve VS slot 2, and the
++            // MSC indexed draw helper writes auxiliary slots 4/5 only.
++            if (!reuseVertex)
++            {
++                if (!backend.BindMscResources(vsBindings,error)) return false;
++                ++m_telemetry.mscVertexBinds;
++            }
++            else ++m_telemetry.mscVertexReuses;
++            if (!reuseFragment)
++            {
++                if (!backend.BindMscResources(fragmentBindings,error)) return false;
++                ++m_telemetry.mscFragmentBinds;
++            }
++            else ++m_telemetry.mscFragmentReuses;
+             if (!visibilitySample) return backend.DrawIndexed(draw,error);
+             bool resultEncoded = false;
+             // The observer is only attached to this final accumulation draw;
+             // query unavailability does not alter the ordinary draw result.
+             return backend.DrawIndexedWithVisibility(draw,*visibilitySample,resultEncoded,error);
+         };
+-        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker, nullptr) ||
+-            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u, nullptr)) return false;
++        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker, nullptr, false, false) ||
++            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u, nullptr,
++                m_impl->bindReuse, m_impl->bindReuse)) return false;
+         const R4WholeLightVisibilitySample* visibilitySample = nullptr;
+         if (shadowRecord && state.activeVisibilityBatch >= 0)
+         {
+@@ -673,7 +694,8 @@
+             if (found != state.visibilitySamples.end()) visibilitySample = &*found;
+         }
+         if (!bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
+-                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker, visibilitySample)) return false;
++                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker, visibilitySample,
++                m_impl->bindReuse, false)) return false;
+         ++m_telemetry.admitted; ++m_telemetry.submitted;
+         lightMarker.Increment();
+         // Match non-MSAA Windows increment_light_marker/reset_light_marker.
+--- a/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.h
+@@ -52,6 +52,10 @@
+         std::size_t admitted = 0;
+         std::size_t submitted = 0;
+         std::size_t markerResets = 0;
++        std::size_t mscVertexBinds = 0;
++        std::size_t mscFragmentBinds = 0;
++        std::size_t mscVertexReuses = 0;
++        std::size_t mscFragmentReuses = 0;
+         std::size_t culled = 0;
+         std::size_t skippedUnavailable = 0;
+         std::size_t skippedInactive = 0;

@@ -4,18 +4,24 @@
 
 #include "stdafx.h"
 #include "HOM.h"
+#include "HOMDiagnosticBounds.h"
 #include "occRasterizer.h"
 #include "../../xrEngine/GameFont.h"
 
 #include "../../xrCore/profiler.h"
 
 #include "dxRenderDeviceRender.h"
+#if (RENDER == 4) && defined(XR_PLATFORM_APPLE)
+#include "../../Include/xrRender/R4BackendSelection.h"
+#endif
+#include <cmath>
 
 float psOSSR = .001f;
 
 void __stdcall CHOM::MT_RENDER()
 {
 	PROF_EVENT("Render HOM");
+	if (diagnostic_only) return;
 
 	xrCriticalSectionGuard guard(m_mt_render_guard);
 	const u32 current_frame = Device.dwFrame;
@@ -76,20 +82,56 @@ IC float Area(Fvector& v0, Fvector& v1, Fvector& v2)
 	return _sqrt(p * (p - e1) * (p - e2) * (p - e3));
 }
 
-void CHOM::Load()
+void CHOM::Load(bool scheduleParallel)
 {
+	if (!scheduleParallel) Unload(); // A failed reload must not retain another level's map.
+	diagnostic_only = !scheduleParallel;
+	diagnostic_frame = u32(-1);
 	// Find and open file
 	string_path fName;
 	FS.update_path(fName, "$level$", "level.hom");
 	if (!FS.exist(fName))
 	{
 		Msg(" WARNING: Occlusion map '%s' not found.", fName);
+		if (!scheduleParallel) Msg("! METAL_LIGHT_HOM_LOAD status=unavailable reason=missing_file path=%s", fName);
 		return;
 	}
 	Msg("* Loading HOM: %s", fName);
 
 	IReader* fs = FS.r_open(fName);
-	IReader* S = fs->open_chunk(1);
+	IReader* S = fs ? fs->open_chunk(1) : nullptr;
+	if (!S)
+	{
+		Msg("! HOM unavailable: missing triangle chunk: %s", fName);
+		if (!scheduleParallel) Msg("! METAL_LIGHT_HOM_LOAD status=unavailable reason=missing_chunk path=%s", fName);
+		if (fs) FS.r_close(fs);
+		return;
+	}
+	// The opt-in Metal diagnostic must fail open on malformed assets rather
+	// than entering the legacy unchecked loader. 16 MiB bounds diagnostic RAM.
+	if (!scheduleParallel)
+	{
+		bool valid = S->length() && S->length() <= 16u * 1024u * 1024u &&
+			S->length() % sizeof(HOM_poly) == 0;
+		while (valid && !S->eof())
+		{
+			HOM_poly p;
+			S->r(&p, sizeof(p));
+			for (const auto& v : {p.v1, p.v2, p.v3})
+				valid = valid && std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+			Fvector a, b, n;
+			a.sub(p.v2, p.v1); b.sub(p.v3, p.v1); n.crossproduct(a, b);
+			valid = valid && std::isfinite(n.square_magnitude()) && n.square_magnitude() > EPS_S;
+		}
+		if (!valid)
+		{
+			Msg("! METAL_LIGHT_HOM_LOAD status=unavailable reason=invalid_triangle_chunk path=%s", fName);
+			S->close(); FS.r_close(fs); return;
+		}
+		S->seek(0);
+		Msg("* METAL_LIGHT_HOM_LOAD status=loaded triangles=%u geometry_verified=0 path=%s",
+			u32(S->length() / sizeof(HOM_poly)), fName);
+	}
 
 	// Load tris and merge them
 	CDB::Collector CL;
@@ -98,6 +140,11 @@ void CHOM::Load()
 		HOM_poly P;
 		S->r(&P, sizeof(P));
 		CL.add_face_packed_D(P.v1, P.v2, P.v3, P.flags, 0.01f);
+	}
+	if (!scheduleParallel && (CL.getVS() < 4 || CL.getTS() < 2))
+	{
+		Msg("! METAL_LIGHT_HOM_LOAD status=unavailable reason=insufficient_geometry");
+		S->close(); FS.r_close(fs); return;
 	}
 
 	// Determine adjacency
@@ -119,7 +166,18 @@ void CHOM::Load()
 		rT.adjacent[1] = (0xffffffff == adjacency[3 * it + 1]) ? ((occTri*)(-1)) : (m_pTris + adjacency[3 * it + 1]);
 		rT.adjacent[2] = (0xffffffff == adjacency[3 * it + 2]) ? ((occTri*)(-1)) : (m_pTris + adjacency[3 * it + 2]);
 		rT.flags = clT.dummy;
-		rT.area = Area(v0, v1, v2);
+		if (scheduleParallel) rT.area = Area(v0, v1, v2);
+		else
+		{
+			Fvector a, b, n;
+			a.sub(v1, v0); b.sub(v2, v0); n.crossproduct(a, b);
+			rT.area = .5f * std::sqrt(n.square_magnitude());
+			if (!std::isfinite(rT.area) || rT.area < EPS_L)
+			{
+				Msg("! METAL_LIGHT_HOM_LOAD status=unavailable reason=degenerate_packed_geometry");
+				xr_free(m_pTris); S->close(); FS.r_close(fs); return;
+			}
+		}
 
 		if (rT.area < EPS_L)
 		{
@@ -134,11 +192,11 @@ void CHOM::Load()
 	// Create AABB-tree
 	m_pModel = xr_new<CDB::MODEL>();
 	m_pModel->build(CL.getV(), int(CL.getVS()), CL.getT(), int(CL.getTS()));
-	bEnabled = TRUE;
+	bEnabled = diagnostic_only ? FALSE : TRUE;
 	S->close();
 	FS.r_close(fs);
 
-	if (ps_r2_ls_flags.test(R2FLAG_EXP_MT_CALC))
+	if (scheduleParallel && ps_r2_ls_flags.test(R2FLAG_EXP_MT_CALC))
 	{
 		// MT-HOM (@front)
 		Device.seqParallelRender.push_back(xr_make_delegate(this, &CHOM::MT_RENDER));
@@ -150,6 +208,8 @@ void CHOM::Unload()
 	xr_delete(m_pModel);
 	xr_free(m_pTris);
 	bEnabled = FALSE;
+	diagnostic_only = false;
+	diagnostic_frame = u32(-1);
 
 	auto I = std::find(Device.seqParallelRender.begin(), Device.seqParallelRender.end(), xr_make_delegate(this, &CHOM::MT_RENDER));
 	if (I != Device.seqParallelRender.end())
@@ -166,7 +226,7 @@ public:
 	{
 	}
 
-	pred_fb(occTri* _t, Fvector& _c) : m_pTris(_t), camera(_c)
+	pred_fb(occTri* _t, const Fvector& _c) : m_pTris(_t), camera(_c)
 	{
 	}
 
@@ -184,7 +244,8 @@ public:
 	}
 };
 
-void CHOM::Render_DB(CFrustum& base)
+void CHOM::Render_DB(CFrustum& base, const Fmatrix& fullTransform,
+	const Fvector& camera, u32 frame, bool diagnostic)
 {
 	//Update projection matrices on every frame to ensure valid HOM culling
 	float view_dim = occ_dim_0;
@@ -200,8 +261,8 @@ void CHOM::Render_DB(CFrustum& base)
 		0.0f, 0.0f, 1.0f, 0.0f,
 		1.f / 2.f + 0 + 0, 1.f / 2.f + 0 + 0, 0.0f, 1.0f
 	};
-	m_xform.mul(m_viewport, Device.mFullTransform);
-	m_xform_01.mul(m_viewport_01, Device.mFullTransform);
+	m_xform.mul(m_viewport, fullTransform);
+	m_xform_01.mul(m_viewport_01, fullTransform);
 
 	// Query DB
 	xrc.frustum_options(0);
@@ -212,15 +273,16 @@ void CHOM::Render_DB(CFrustum& base)
 	CDB::RESULT* it = xrc.r_begin();
 	CDB::RESULT* end = xrc.r_end();
 
-	Fvector COP = Device.vCameraPosition;
-	end = std::remove_if(it, end, pred_fb(m_pTris));
+	Fvector COP = camera;
+	if (!diagnostic) end = std::remove_if(it, end, pred_fb(m_pTris));
 	std::sort(it, end, pred_fb(m_pTris, COP));
 
 	// Build frustum with near plane only
 	CFrustum clip;
-	clip.CreateFromMatrix(Device.mFullTransform,FRUSTUM_P_NEAR);
+	Fmatrix clipTransform = fullTransform; // Legacy frustum API takes a mutable reference.
+	clip.CreateFromMatrix(clipTransform,FRUSTUM_P_NEAR);
 	sPoly src, dst;
-	u32 _frame = Device.dwFrame;
+	u32 _frame = frame;
 #ifdef DEBUG
 	tris_in_frame				= xrc.r_count();
 	tris_in_frame_visible		= 0;
@@ -231,12 +293,12 @@ void CHOM::Render_DB(CFrustum& base)
 	{
 		// Control skipping
 		occTri& T = m_pTris[it->id];
-		u32 next = _frame + ::Random.randI(3, 10);
+		u32 next = diagnostic ? 0u : _frame + ::Random.randI(3, 10);
 
 		// Test for good occluder - should be improved :)
 		if (!(T.flags || (T.plane.classify(COP) > 0)))
 		{
-			T.skip = next;
+			if (!diagnostic) T.skip = next;
 			continue;
 		}
 
@@ -251,7 +313,7 @@ void CHOM::Render_DB(CFrustum& base)
 		sPoly* P = clip.ClipPoly(src, dst);
 		if (0 == P)
 		{
-			T.skip = next;
+			if (!diagnostic) T.skip = next;
 			continue;
 		}
 
@@ -270,7 +332,7 @@ void CHOM::Render_DB(CFrustum& base)
 		}
 		if (0 == pixels)
 		{
-			T.skip = next;
+			if (!diagnostic) T.skip = next;
 			continue;
 		}
 	}
@@ -282,10 +344,25 @@ void CHOM::Render(CFrustum& base)
 
 	Device.Statistic->RenderCALC_HOM.Begin();
 	Raster.clear();
-	Render_DB(base);
+	Render_DB(base, Device.mFullTransform, Device.vCameraPosition, Device.dwFrame);
 	Raster.propagade();
 	MT_frame_rendered.store(Device.dwFrame, std::memory_order_release);
 	Device.Statistic->RenderCALC_HOM.End();
+}
+
+bool CHOM::RenderDiagnostic(const Fmatrix& fullTransform, const Fvector& camera, u32 frame)
+{
+	diagnostic_frame = u32(-1);
+	if (!diagnostic_only || !m_pModel || frame == u32(-1)) return false;
+	CFrustum base;
+	Fmatrix clipTransform = fullTransform;
+	base.CreateFromMatrix(clipTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+	Raster.clear();
+	Render_DB(base, fullTransform, camera, frame, true);
+	Raster.propagade();
+	diagnostic_camera = camera;
+	diagnostic_frame = frame;
+	return true;
 }
 
 ICF BOOL xform_b0(Fvector2& min, Fvector2& max, float& minz, Fmatrix& X, float _x, float _y, float _z)
@@ -337,6 +414,17 @@ BOOL CHOM::visible(Fbox3& B)
 	if (!bEnabled) return TRUE;
 	if (B.contains(Device.vCameraPosition)) return TRUE;
 	return _visible(B, m_xform_01);
+}
+
+BOOL CHOM::visibleDiagnostic(Fbox3& box, u32 frame)
+{
+	if (!diagnostic_only || !m_pModel) return TRUE;
+	std::array<float,16> xform;
+	std::memcpy(xform.data(), &m_xform_01, sizeof(m_xform_01));
+	if (!HomDiagnosticBoxCanBeTested({box.min.x,box.min.y,box.min.z},
+		{box.max.x,box.max.y,box.max.z}, {diagnostic_camera.x,diagnostic_camera.y,diagnostic_camera.z},
+		xform, frame, diagnostic_frame)) return TRUE;
+	return _visible(box, m_xform_01);
 }
 
 BOOL CHOM::visible(Fbox2& B, float depth)
@@ -408,12 +496,15 @@ void CHOM::Disable()
 
 void CHOM::Enable()
 {
-	bEnabled = m_pModel ? TRUE : FALSE;
+	bEnabled = m_pModel && !diagnostic_only ? TRUE : FALSE;
 }
 
 #ifdef DEBUG
 void CHOM::OnRender	()
 {
+#if (RENDER == 4) && defined(XR_PLATFORM_APPLE)
+	if (SelectedR4Backend() == R4BackendKind::Metal) return;
+#endif
 	Raster.on_dbg_render();
 
 	if (psDeviceFlags.is(rsOcclusionDraw)){

@@ -1,0 +1,61 @@
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -37,6 +37,47 @@
+   tests/R4ComputeSkinPoseJournalProbe.cpp
+ )
+ 
++# Strict FP is limited to the coverage/bridge arithmetic and independent probes.
++set_source_files_properties(
++  R4ActiveOcclusionCoverage.cpp
++  R4ActiveOcclusionSceneBridge.cpp
++  tests/R4ActiveOcclusionCoverageInputProbe.cpp
++  tests/R4ActiveOcclusionCoverageOracleProbe.cpp
++  tests/R4ActiveOcclusionSceneBridgeProbe.cpp
++  PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-fno-finite-math-only;-ffp-contract=off"
++)
++
++add_executable(XRay.Metal.ActiveOcclusionCoverageInputProbe
++  tests/R4ActiveOcclusionCoverageInputProbe.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionCoverageInputProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionCoverageInputProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusion.CoverageInput
++  COMMAND XRay.Metal.ActiveOcclusionCoverageInputProbe
++)
++
++add_executable(XRay.Metal.ActiveOcclusionCoverageOracleProbe
++  tests/R4ActiveOcclusionCoverageOracleProbe.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionCoverageOracleProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionCoverageOracleProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusion.CoverageOracle
++  COMMAND XRay.Metal.ActiveOcclusionCoverageOracleProbe
++)
++
++add_executable(XRay.Metal.ActiveOcclusionSceneBridgeProbe
++  tests/R4ActiveOcclusionSceneBridgeProbe.cpp
++  R4ActiveOcclusionSceneBridge.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionSceneBridgeProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionSceneBridgeProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusionSceneBridge.SelfTest
++  COMMAND XRay.Metal.ActiveOcclusionSceneBridgeProbe
++)
++
+ add_executable(XRay.Metal.WholeLightVisibilityLedgerProbe
+   tests/R4WholeLightVisibilityLedgerProbe.cpp
+ )
+@@ -125,6 +166,10 @@
+   R4DefObjectsLodFoundation.h
+   R4ComputeSkinFoundation.cpp
+   R4ComputeSkinFoundation.h
++  R4ActiveOcclusionCoverage.cpp
++  R4ActiveOcclusionCoverage.h
++  R4ActiveOcclusionSceneBridge.cpp
++  R4ActiveOcclusionSceneBridge.h
+   MetalR4EngineFs.cpp
+   MetalR4EngineFs.h
+   MetalR4UiVideo.cpp

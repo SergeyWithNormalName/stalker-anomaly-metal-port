@@ -1,0 +1,181 @@
+--- scratch/gameplay-rescue-20260929/prestate/MetalR4DefVertexAdapter.cpp	2026-09-27 15:06:07
++++ src/Layers/xrRenderMetal/MetalR4DefVertexAdapter.cpp	2026-09-29 09:55:21
+@@ -2,13 +2,16 @@
+ 
+ #include "MetalR4EngineFs.h"
+ #include "R4DefVertexFoundation.h"
++#include "R4StaticShadowIndex.h"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <numeric>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -125,6 +128,11 @@
+     std::shared_ptr<IR4Sampler> sampler;
+     std::vector<TextureAsset> textures;
+     std::vector<Draw> draws;
++    xray::metal::R4StaticShadowIndex shadowIndex;
++    bool shadowLinear = std::getenv("XRAY_METAL_DEF_VERTEX_SHADOW_LINEAR") != nullptr;
++    bool shadowOracle = std::getenv("XRAY_METAL_DEF_VERTEX_SHADOW_ORACLE") != nullptr;
++    std::uint64_t oracleViews = 0u;
++    std::uint64_t oracleCandidates = 0u;
+     bool uploaded = false;
+     bool pendingUpload = false;
+     std::uint64_t pendingUploadBytes = 0u;
+@@ -320,7 +328,17 @@
+         m_impl.reset();
+         status = m_status;
+         return true;
++    }
++    // Level geometry and models remain immutable until the adapter is prepared
++    // again. Build once, then query each light's own shadow frustum. The exact
++    // local-bounds test below remains the final admission decision.
++    for (std::size_t index = 0; index < m_impl->draws.size(); ++index)
++    {
++        const Impl::Draw& draw = m_impl->draws[index];
++        m_impl->shadowIndex.Add(draw.bounds.available, draw.bounds.minimum,
++            draw.bounds.maximum, draw.model.elements, index);
+     }
++    m_impl->shadowIndex.Finish();
+     m_ready = true;
+     m_status = m_impl->draws.empty() ? "def_vertex family has no drawable visuals" : "def_vertex MSC adapter ready";
+     status = m_status;
+@@ -491,8 +509,38 @@
+     }
+     std::shared_ptr<IR4Buffer> lastVertices;
+     std::shared_ptr<IR4GraphicsPipeline> lastPipeline;
+-    for (const Impl::Draw& draw : m_impl->draws)
++    auto& selected = m_impl->shadowIndex.candidates;
++    if (m_impl->shadowLinear)
+     {
++        selected.resize(m_impl->draws.size());
++        std::iota(selected.begin(), selected.end(), 0u);
++    }
++    else
++        m_impl->shadowIndex.Query(lvp.elements);
++    if (m_impl->shadowOracle)
++    {
++        for (std::size_t index = 0; index < m_impl->draws.size(); ++index)
++        {
++            const Impl::Draw& draw = m_impl->draws[index];
++            if (!outsideMetalClip(draw.bounds, multiply(lvp, draw.model)) &&
++                !std::binary_search(selected.begin(), selected.end(), index))
++            {
++                error = "def_vertex shadow broad phase omitted an exact-oracle caster";
++                return false;
++            }
++        }
++        m_impl->oracleCandidates += selected.size();
++        if (++m_impl->oracleViews % 1000u == 0u)
++            std::fprintf(stderr,
++                "METAL_DEF_VERTEX_SHADOW_ORACLE views=%llu total=%zu candidates=%llu misses=0 linear=%u\n",
++                static_cast<unsigned long long>(m_impl->oracleViews), m_impl->draws.size(),
++                static_cast<unsigned long long>(m_impl->oracleCandidates),
++                static_cast<unsigned>(m_impl->shadowLinear));
++    }
++    m_telemetry.shadowCulledVisuals += m_impl->draws.size() - selected.size();
++    for (const std::size_t drawIndex : selected)
++    {
++        const Impl::Draw& draw = m_impl->draws[drawIndex];
+         const Matrix4 wvp = multiply(lvp, draw.model);
+         if (outsideMetalClip(draw.bounds, wvp))
+         {
+@@ -578,6 +626,91 @@
+         error = "def_vertex transformed-bounds culling is not conservative";
+         return false;
+     }
++    // Compare the final ordered draw list with an independent full scan. The
++    // broad phase must retain every old exact-test admission, including invalid
++    // bounds/models and uncertain clip-plane boundaries.
++    xray::metal::R4StaticShadowIndex shadowIndex;
++    std::vector<Matrix4> models;
++    std::vector<xray::metal::R4PositionBounds> bounds;
++    std::uint32_t seed = 0xD3F2026u;
++    const auto random = [&seed]() {
++        seed = seed * 1664525u + 1013904223u;
++        return static_cast<float>(seed & 65535u) / 65535.0f;
++    };
++    for (std::size_t index = 0; index < 1024u; ++index)
++    {
++        Matrix4 model = identity;
++        for (std::size_t axis = 0; axis < 3u; ++axis)
++        {
++            for (std::size_t component = 0; component < 3u; ++component)
++                model.elements[component * 4u + axis] = random() * 4.0f - 2.0f;
++            model.elements[12u + axis] = random() * 2000.0f - 1000.0f;
++        }
++        xray::metal::R4PositionBounds box;
++        box.available = true;
++        box.minimum = {-random() * 10.0f, -random() * 10.0f, -random() * 10.0f};
++        box.maximum = {random() * 10.0f, random() * 10.0f, random() * 10.0f};
++        if (index == 0u) model = nonFinite;
++        if (index == 1u) model.elements[3] = 0.5f;
++        if (index == 2u) box.available = false;
++        if (index == 3u) box.minimum[0] = std::numeric_limits<float>::quiet_NaN();
++        if (index == 4u) box.minimum[0] = box.maximum[0] + 1.0f;
++        models.push_back(model);
++        bounds.push_back(box);
++        shadowIndex.Add(box.available, box.minimum, box.maximum, model.elements, index);
++    }
++    shadowIndex.Finish();
++    bool reducedExactTests = false;
++    for (std::size_t viewIndex = 0; viewIndex < 128u; ++viewIndex)
++    {
++        Matrix4 vp = identity;
++        for (float& value : vp.elements) value = (random() * 2.0f - 1.0f) * 0.01f;
++        if (viewIndex == 0u) vp = identity;
++        if (viewIndex == 1u) vp = nonFinite;
++        if (viewIndex == 2u) vp.elements[0] = std::numeric_limits<float>::max();
++        const auto& selected = shadowIndex.Query(vp.elements);
++        if (!std::is_sorted(selected.begin(), selected.end()) ||
++            std::adjacent_find(selected.begin(), selected.end()) != selected.end())
++        {
++            error = "def_vertex shadow index changed source order or duplicated a draw";
++            return false;
++        }
++        reducedExactTests |= selected.size() < models.size();
++        std::vector<std::size_t> linearAdmitted;
++        std::vector<std::size_t> indexedAdmitted;
++        for (std::size_t index = 0; index < models.size(); ++index)
++            if (!outsideMetalClip(bounds[index], multiply(vp, models[index])))
++                linearAdmitted.push_back(index);
++        for (const std::size_t index : selected)
++            if (!outsideMetalClip(bounds[index], multiply(vp, models[index])))
++                indexedAdmitted.push_back(index);
++        if (linearAdmitted != indexedAdmitted)
++        {
++            error = "def_vertex shadow index changed the exact ordered caster list";
++            return false;
++        }
++    }
++    if (!reducedExactTests)
++    {
++        error = "def_vertex shadow broad phase never reduced the full scan";
++        return false;
++    }
++    xray::metal::R4StaticShadowIndex boundaryIndex;
++    const std::array<std::array<float, 3>, 6> contacts = {{{-1.0f, 0.0f, 0.5f},
++        {1.0f, 0.0f, 0.5f}, {0.0f, -1.0f, 0.5f}, {0.0f, 1.0f, 0.5f},
++        {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
++    for (std::size_t index = 0; index < contacts.size(); ++index)
++        boundaryIndex.Add(true, contacts[index], contacts[index], identity.elements, index);
++    boundaryIndex.Add(true, {100.0f, 100.0f, 100.0f}, {101.0f, 101.0f, 101.0f},
++        identity.elements, contacts.size());
++    boundaryIndex.Finish();
++    const auto& boundarySelected = boundaryIndex.Query(identity.elements);
++    for (std::size_t index = 0; index < contacts.size(); ++index)
++        if (!std::binary_search(boundarySelected.begin(), boundarySelected.end(), index))
++        {
++            error = "def_vertex shadow index omitted a Metal clip-plane contact";
++            return false;
++        }
+     std::filesystem::path resolved;
+     if (resolveBaseTexture("../unsafe", resolved, error))
+     {

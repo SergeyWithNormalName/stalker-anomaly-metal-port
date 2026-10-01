@@ -1,0 +1,9 @@
+# V7 steady CPU profile diagnostic
+
+This entire run is marked `DIAGNOSTIC_ONLY_NOT_PERFORMANCE=1` because `/usr/bin/sample` overlapped phase 1. Do not interpret its callback counts or timing rows as performance evidence. It used the frozen V7 combined arm, canonical runtime/save clone, candidate executable `43c07e4d7a043d44f01d675554aa30a16d5bd09f76a9e99468317d5983fc2bdd`, with no UI capture, renderer instrumentation, observer, oracle, or color probe enabled.
+
+The external watcher was started before the runner. It saw `measure_start` at 10:42:25Z (engine frame 485, device wall 56,661 ms) on PID 49985 and immediately invoked `/usr/bin/sample 49985 5 1 -mayDie`. The command exited 0 and wrote [sample-during-measure.txt](<XRAY_SOURCE_ROOT>/scratch/gameplay-rescue-20260929/runs/v7-profile-combined-01-watcher/sample-during-measure.txt), 922,945 bytes. Its header time is `2026-09-29 17:42:25.537 +0700`. The watcher receipt records `measure_end_seen_before_receipt=0`, confirming sample/report completion before `measure_end`.
+
+The sample contains active gameplay stacks: 1,163 main-thread samples, with `renderProductionScene` and `MetalR4DynamicWorldAdapter::Prewarm` present. `CheckR4ComputeSkinBounds` appears 36 times, within `Prewarm`; `net_Stop`, ALife teardown, and `RepackR4DynamicWorldSkinnedVertices` do not appear. This is a bounded stack sample, not a timing or total-CPU attribution.
+
+The runner exited 0 with all phase markers. The candidate executable remains at its pinned hash; the original build executable remains `b0bcf586c65fdb8bad8034202b3df96f0786d7fefaf4f8d9e1b411c29fc323cc`. Canonical base profile/save hashes are unchanged. The cloned runtime's `user.ltx` changed only `rs_stats on` to `rs_stats off`, as requested by the Lua harness; its save hash remained equal to the canonical save. No game process remains.

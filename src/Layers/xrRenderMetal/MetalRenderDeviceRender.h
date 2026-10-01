@@ -98,5 +98,6 @@ private:
     bool passActive = false;
     bool sceneFrameLogged = false;
     bool sceneCameraLogged = false;
+    std::uint32_t consecutiveSceneRenderFailures = 0u;
     std::array<float, 3> lastLoggedSceneEye{};
 };

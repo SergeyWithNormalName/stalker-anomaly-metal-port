@@ -1,0 +1,89 @@
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -469,6 +469,19 @@
+     };
+     std::vector<ShadowGroup> shadowGroups;
+     bool shadowInstancing = false;
++    bool shadowPsoOrder = [] {
++        const char* flag = std::getenv("XRAY_METAL_FLORA_SHADOW_PSO_ORDER");
++        return flag && std::strcmp(flag, "1") == 0;
++    }();
++    std::array<std::vector<std::size_t>, 2> shadowPipelineGroupOrder;
++    const std::shared_ptr<IR4GraphicsPipeline>& ShadowPipelineFor(const Draw& draw,
++        const bool instanced, const bool ignoreAlpha) const
++    {
++        const bool leaf = draw.material == Material::LeafBump;
++        return instanced ? (leaf ? (ignoreAlpha ? leafNoAlphaInstancedShadowPipeline :
++            leafInstancedShadowPipeline) : trunkInstancedShadowPipeline) :
++            (leaf ? (ignoreAlpha ? leafNoAlphaShadowPipeline : leafShadowPipeline) : trunkShadowPipeline);
++    }
+     bool reuseVisibleGlobals = std::getenv("XRAY_METAL_E08_FLORA_REUSE_GLOBALS") != nullptr;
+     std::vector<std::uint8_t> visibleVertexGlobals;
+     std::vector<std::uint8_t> visibleFragmentGlobals;
+@@ -867,6 +880,25 @@
+     }
+     for (std::size_t g = 0; g < groupSizes.size(); ++g)
+         m_impl->shadowGroups[g].models.reserve(groupSizes[g]);
++    if (m_impl->shadowPsoOrder && m_impl->shadowInstancing)
++        for (std::size_t ignoreAlpha = 0; ignoreAlpha < 2u; ++ignoreAlpha)
++        {
++            std::vector<const IR4GraphicsPipeline*> pipelineKeys;
++            for (const auto& group : m_impl->shadowGroups)
++            {
++                const auto* pipeline = m_impl->ShadowPipelineFor(
++                    m_impl->draws[group.representative], true, ignoreAlpha != 0u).get();
++                if (std::find(pipelineKeys.begin(), pipelineKeys.end(), pipeline) == pipelineKeys.end())
++                    pipelineKeys.push_back(pipeline);
++            }
++            auto& partition = m_impl->shadowPipelineGroupOrder[ignoreAlpha];
++            partition.reserve(m_impl->shadowGroups.size());
++            for (const auto* pipeline : pipelineKeys)
++                for (std::size_t group = 0; group < m_impl->shadowGroups.size(); ++group)
++                    if (m_impl->ShadowPipelineFor(m_impl->draws[m_impl->shadowGroups[group].representative],
++                            true, ignoreAlpha != 0u).get() == pipeline)
++                        partition.push_back(group);
++        }
+     std::fprintf(stderr, "METAL_E08_FLORA_INSTANCING enabled=%d groups=%zu instances=%zu stride=64\n",
+         int(m_impl->shadowInstancing), m_impl->shadowGroups.size(), m_impl->draws.size());
+ 
+@@ -1117,11 +1149,7 @@
+         for (auto& group : m_impl->shadowGroups) group.models.clear();
+     const auto encodeCaster = [&](const Impl::Draw& draw, const std::vector<Matrix4>* models) {
+         const bool leaf = draw.material == Impl::Material::LeafBump;
+-        const auto& pipeline = models ? (leaf ?
+-            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaInstancedShadowPipeline : m_impl->leafInstancedShadowPipeline) :
+-            m_impl->trunkInstancedShadowPipeline) : (leaf ?
+-            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaShadowPipeline : m_impl->leafShadowPipeline) :
+-            m_impl->trunkShadowPipeline);
++        const auto& pipeline = m_impl->ShadowPipelineFor(draw, models != nullptr, view.shadowIgnoreAlpha);
+         std::vector<std::uint8_t> globals(kTreeShadowGlobalsSize);
+         std::memcpy(globals.data(), &lvp, sizeof(lvp));
+         std::memcpy(globals.data() + 64u, &lvp, sizeof(lvp));
+@@ -1246,10 +1274,23 @@
+             return false;
+     }
+     if (m_impl->shadowInstancing)
+-        for (const auto& group : m_impl->shadowGroups)
+-            if (!group.models.empty() &&
+-                !encodeCaster(m_impl->draws[group.representative], &group.models))
+-                return false;
++    {
++        if (m_impl->shadowPsoOrder)
++        {
++            for (const auto index : m_impl->shadowPipelineGroupOrder[view.shadowIgnoreAlpha ? 1u : 0u])
++            {
++                const auto& group = m_impl->shadowGroups[index];
++                if (!group.models.empty() &&
++                    !encodeCaster(m_impl->draws[group.representative], &group.models))
++                    return false;
++            }
++        }
++        else
++            for (const auto& group : m_impl->shadowGroups)
++                if (!group.models.empty() &&
++                    !encodeCaster(m_impl->draws[group.representative], &group.models))
++                    return false;
++    }
+     return true;
+ }
+ 

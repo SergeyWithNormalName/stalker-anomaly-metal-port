@@ -133,6 +133,11 @@ const ITEM_DATA* CSINI_IdToIndex::GetById(const T_ID& str_id, bool no_assert)
 	if (m_pItemDataVector->end() == it)
 	{
 		VERIFY3(no_assert, "item not found, id", *str_id);
+		// VERIFY3 is compiled out in release builds; without a trace an unknown
+		// or misspelt id silently becomes index -1 and the callers then index
+		// their relation tables out of bounds.
+		if (!no_assert)
+			Msg("! [%s] %s: id '%s' is not defined in the loaded table", section_name, line_name, *str_id);
 		return NULL;
 	}
 

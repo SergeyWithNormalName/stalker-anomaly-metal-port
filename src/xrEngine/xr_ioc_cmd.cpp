@@ -9,6 +9,7 @@
 #include "cameramanager.h"
 #include "environment.h"
 #include "xr_input.h"
+#include "xr_gamepad.h"
 #include "CustomHUD.h"
 
 #include "../Include/xrRender/RenderDeviceRender.h"
@@ -839,6 +840,49 @@ public:
 		F->w_printf("%s %s\r\n", cName, snd_device_name.c_str());
 	}
 };
+
+#if defined(__APPLE__)
+class CCC_AppleSpatialMode : public CCC_Integer
+{
+public:
+	CCC_AppleSpatialMode(LPCSTR N, int* V, int _min = 0, int _max = 2)
+		: CCC_Integer(N, V, _min, _max) {}
+
+	virtual void Execute(LPCSTR args) override
+	{
+		CCC_Integer::Execute(args);
+		if (Sound)
+			Sound->set_apple_spatial_mode(*value);
+	}
+
+	virtual void Info(TInfo& I) override
+	{
+		xr_sprintf(I, sizeof(I), "Apple Spatial Audio mode [0 = Off, 1 = Fixed, 2 = Head Tracked]");
+	}
+};
+
+class CCC_AppleSpatialStatus : public IConsole_Command
+{
+public:
+	CCC_AppleSpatialStatus(LPCSTR N) : IConsole_Command(N) {}
+	virtual void Execute(LPCSTR args) override
+	{
+		char buf[512] = {};
+		if (Sound && Sound->get_apple_spatial_diagnostics(buf, sizeof(buf)))
+		{
+			Msg("* [Apple Spatial Audio] %s", buf);
+		}
+		else
+		{
+			Msg("~ Apple Spatial Audio is inactive (OpenAL backend is currently in use)");
+		}
+	}
+	virtual void Info(TInfo& I) override
+	{
+		xr_sprintf(I, sizeof(I), "Prints Apple Spatial Audio backend diagnostic state");
+	}
+};
+#endif
 #endif
 
 
@@ -1202,6 +1246,21 @@ void CCC_Register()
 	psMouseSensVerticalK = 1.0f;
 	CMD4(CCC_Float, "mouse_sens_vertical", &psMouseSensVerticalK, 0.1f, 3.0f);
 
+	// Gamepad. The keyboard and the mouse keep working alongside these.
+	CMD4(CCC_Integer, "g_gamepad", &psGamepadEnabled, 0, 1);
+	CMD4(CCC_Float, "g_gamepad_move_deadzone", &psGamepadMoveDeadzone, 0.0f, 0.6f);
+	CMD4(CCC_Float, "g_gamepad_look_deadzone", &psGamepadLookDeadzone, 0.0f, 0.6f);
+	CMD4(CCC_Float, "g_gamepad_look_sens", &psGamepadLookSens, 0.05f, 5.0f);
+	CMD4(CCC_Float, "g_gamepad_look_sens_vertical", &psGamepadLookSensVertical, 0.05f, 5.0f);
+	CMD4(CCC_Float, "g_gamepad_ads_look_mult", &psGamepadAdsLookMult, 0.05f, 1.0f);
+	CMD4(CCC_Integer, "g_gamepad_invert_y", &psGamepadInvertY, 0, 1);
+	CMD4(CCC_Float, "g_gamepad_trigger_threshold", &psGamepadTriggerThreshold, 0.05f, 0.95f);
+	CMD4(CCC_Float, "g_gamepad_response", &psGamepadResponse, 0.5f, 4.0f);
+	CMD4(CCC_Float, "g_gamepad_haptics", &psGamepadHapticStrength, 0.0f, 2.0f);
+	CMD4(CCC_Float, "g_gamepad_adaptive_triggers", &psGamepadAdaptiveStrength, 0.0f, 1.0f);
+	CMD4(CCC_Integer, "g_gamepad_touchpad_ui", &psGamepadTouchpadUi, 0, 1);
+	CMD4(CCC_Integer, "g_gamepad_debug", &psGamepadDebug, 0, 1);
+
 	// Camera
 	CMD2(CCC_Float, "cam_inert", &psCamInert);
 	CMD2(CCC_Float, "cam_slide_inert", &psCamSlideInert);
@@ -1210,6 +1269,10 @@ void CCC_Register()
 
 #ifndef DEDICATED_SERVER
 	CMD1(CCC_soundDevice, "snd_device");
+#if defined(__APPLE__)
+	CMD4(CCC_AppleSpatialMode, "snd_apple_spatial_mode", &psSoundAppleSpatialMode, 0, 2);
+	CMD1(CCC_AppleSpatialStatus, "snd_apple_status");
+#endif
 #endif
 	//psSoundRolloff = pSettings->r_float ("sound","rolloff"); clamp(psSoundRolloff, EPS_S, 2.f);
 	psSoundOcclusionScale = pSettings->r_float("sound", "occlusion_scale");

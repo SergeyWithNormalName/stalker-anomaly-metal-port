@@ -105,18 +105,6 @@ bool resolveTexture(const std::string& identity, std::filesystem::path& path, st
     return ResolveMetalR4EngineTextureDdsPath(relative, path, error);
 }
 
-bool makeUniform(IR4Resources& resources, std::size_t size, const char* label,
-    std::shared_ptr<IR4Buffer>& result, std::string& error)
-{
-    R4BufferDesc desc;
-    desc.size = size;
-    desc.storage = R4ResourceStorage::Shared;
-    desc.usage = R4BufferUsage::Uniform;
-    desc.label = label;
-    result = resources.CreateBuffer(desc, nullptr, 0u, error);
-    return static_cast<bool>(result);
-}
-
 bool isIdentity(const Matrix4& matrix)
 {
     for (std::size_t index = 0; index < 16; ++index)
@@ -146,7 +134,7 @@ struct MetalR4StaticForwardAdapter::Impl
         xray::metal::R4PositionBounds bounds;
         R4StaticWaterDrawRecord::VertexLayout vertexLayout;
         std::string baseTextureIdentity, normalTextureIdentity;
-        std::shared_ptr<IR4Buffer> vertices, indices, transforms;
+        std::shared_ptr<IR4Buffer> vertices, indices;
         std::shared_ptr<IR4Texture> base, lmap, hemi, normalMap;
         std::shared_ptr<IR4GraphicsPipeline> pipeline;
         float sortDistanceSquared = 0.0f;
@@ -397,17 +385,11 @@ bool MetalR4StaticForwardAdapter::Prepare(IR4Backend& backend,
         }
         else if (family == xray::metal::R4StaticForwardFamily::VertexColor)
         {
-            if (!makeUniform(backend.Resources(), DynamicTransformsSize,
-                    "R4 def_trans_v dynamic transforms", draw.transforms, error))
-            { ++m_telemetry.rejectedVisuals; break; }
             ++m_telemetry.vertexColorVisuals;
             if (!isIdentity(draw.model)) ++m_telemetry.transformedVertexColorVisuals;
         }
         else if (family == xray::metal::R4StaticForwardFamily::Wallmark)
         {
-            if (!makeUniform(backend.Resources(), 16u,
-                    "R4 wallmark eye direction", draw.transforms, error))
-            { ++m_telemetry.rejectedVisuals; break; }
             ++m_telemetry.wallmarkVisuals;
         }
         else if (family == xray::metal::R4StaticForwardFamily::Water)
@@ -422,9 +404,6 @@ bool MetalR4StaticForwardAdapter::Prepare(IR4Backend& backend,
             draw.vertexLayout = {sourceVertices.stride, sourceVertices.positionOffset,
                 normal->offset, tangent->offset, binormal->offset, color->offset,
                 texcoord->offset};
-            if (!makeUniform(backend.Resources(), DynamicTransformsSize,
-                    "R4 water dynamic transforms", draw.transforms, error))
-            { ++m_telemetry.rejectedVisuals; break; }
             const std::string normalMapName = (shader.textures.size() > 1 && !shader.textures[1].empty())
                 ? shader.textures[1] : "fx\\water_normal";
             draw.normalTextureIdentity = normalMapName;
@@ -437,9 +416,6 @@ bool MetalR4StaticForwardAdapter::Prepare(IR4Backend& backend,
         }
         else
         {
-            if (!makeUniform(backend.Resources(), DynamicTransformsSize,
-                    "R4 lightplanes dynamic transforms", draw.transforms, error))
-            { ++m_telemetry.rejectedVisuals; break; }
             ++m_telemetry.lightplaneVisuals;
         }
         m_impl->draws.emplace_back(std::move(draw));
@@ -547,10 +523,11 @@ bool MetalR4StaticForwardAdapter::DrawIntoActiveForward(IR4Backend& backend,
             std::memcpy(transforms.data() + 128u, &draw->model, sizeof(draw->model));
             const float material[4] = {0.0f, 0.0f, 0.0f, 0.25f};
             std::memcpy(transforms.data() + 192u, material, sizeof(material));
-            if (!backend.Resources().UpdateBuffer(draw->transforms, 0u,
-                    transforms.data(), transforms.size(), error)) return false;
+            R4FrameBufferSlice transformSlice;
+            if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                    transformSlice, error)) return false;
             R4MscStageBindings vs{R4ShaderStage::Vertex, 48u,
-                {{R4MscResourceType::ConstantBuffer,0u,draw->transforms,0u,DynamicTransformsSize},
+                {{R4MscResourceType::ConstantBuffer,0u,transformSlice.buffer,transformSlice.offset,DynamicTransformsSize},
                  {R4MscResourceType::ConstantBuffer,24u,staticGlobals,0u,StaticGlobalsSize}}};
             R4MscStageBindings ps{R4ShaderStage::Fragment, 72u,
                 {{R4MscResourceType::Texture,0u,nullptr,0u,0u,draw->base},
@@ -567,10 +544,11 @@ bool MetalR4StaticForwardAdapter::DrawIntoActiveForward(IR4Backend& backend,
             const float eyeDirection[4] = {-viewMatrix.values[2] * inverseLength,
                 -viewMatrix.values[6] * inverseLength,
                 -viewMatrix.values[10] * inverseLength, 0.0f};
-            if (!backend.Resources().UpdateBuffer(draw->transforms, 0u,
-                    eyeDirection, sizeof(eyeDirection), error)) return false;
+            R4FrameBufferSlice transformSlice;
+            if (!backend.UploadFrameData(eyeDirection, sizeof(eyeDirection), 256u,
+                    transformSlice, error)) return false;
             R4MscStageBindings vs{R4ShaderStage::Vertex, 48u,
-                {{R4MscResourceType::ConstantBuffer,0u,draw->transforms,0u,sizeof(eyeDirection)},
+                {{R4MscResourceType::ConstantBuffer,0u,transformSlice.buffer,transformSlice.offset,sizeof(eyeDirection)},
                  {R4MscResourceType::ConstantBuffer,24u,staticGlobals,0u,StaticGlobalsSize}}};
             R4MscStageBindings ps{R4ShaderStage::Fragment, 48u,
                 {{R4MscResourceType::Texture,0u,nullptr,0u,0u,draw->base},
@@ -587,10 +565,11 @@ bool MetalR4StaticForwardAdapter::DrawIntoActiveForward(IR4Backend& backend,
             std::memcpy(transforms.data() + 128u, &draw->model, sizeof(draw->model));
             const float material[4] = {0.0f, 0.0f, 0.0f, 0.25f};
             std::memcpy(transforms.data() + 192u, material, sizeof(material));
-            if (!backend.Resources().UpdateBuffer(draw->transforms, 0u,
-                    transforms.data(), transforms.size(), error)) return false;
+            R4FrameBufferSlice transformSlice;
+            if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                    transformSlice, error)) return false;
             R4MscStageBindings vs{R4ShaderStage::Vertex, 48u,
-                {{R4MscResourceType::ConstantBuffer,0u,draw->transforms,0u,DynamicTransformsSize},
+                {{R4MscResourceType::ConstantBuffer,0u,transformSlice.buffer,transformSlice.offset,DynamicTransformsSize},
                  {R4MscResourceType::ConstantBuffer,24u,staticGlobals,0u,StaticGlobalsSize}}};
             R4MscStageBindings ps{R4ShaderStage::Fragment, 144u,
                 {{R4MscResourceType::Texture,0u,nullptr,0u,0u,draw->base},
@@ -611,10 +590,11 @@ bool MetalR4StaticForwardAdapter::DrawIntoActiveForward(IR4Backend& backend,
             std::memcpy(transforms.data() + 128u, &draw->model, sizeof(draw->model));
             const float material[4] = {0.0f, 0.0f, 0.0f, 0.25f};
             std::memcpy(transforms.data() + 192u, material, sizeof(material));
-            if (!backend.Resources().UpdateBuffer(draw->transforms, 0u,
-                    transforms.data(), transforms.size(), error)) return false;
+            R4FrameBufferSlice transformSlice;
+            if (!backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                    transformSlice, error)) return false;
             R4MscStageBindings vs{R4ShaderStage::Vertex, 48u,
-                {{R4MscResourceType::ConstantBuffer,0u,draw->transforms,0u,DynamicTransformsSize},
+                {{R4MscResourceType::ConstantBuffer,0u,transformSlice.buffer,transformSlice.offset,DynamicTransformsSize},
                  {R4MscResourceType::ConstantBuffer,24u,staticGlobals,0u,StaticGlobalsSize}}};
             R4MscStageBindings ps{R4ShaderStage::Fragment, 48u,
                 {{R4MscResourceType::Texture,0u,nullptr,0u,0u,draw->base},

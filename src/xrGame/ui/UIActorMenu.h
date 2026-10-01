@@ -65,6 +65,7 @@ enum EMenuMode
 class CUIActorMenu : public CUIDialogWnd,
                      public CUIWndCallback
 {
+	friend class CGamepadInput;
 	typedef CUIDialogWnd inherited;
 	typedef inventory::upgrade::Upgrade Upgrade_type;
 

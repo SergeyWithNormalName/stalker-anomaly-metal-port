@@ -1,0 +1,11 @@
+# V9 active-occlusion observer result
+
+Execution integrity passed; the observer data are inconclusive because the catalog was disabled. The single bounded run reached the full frame 300–311 window, drained at frame 342, and exited 0 with timeout 0. Runner/parser status 2 correctly records the inconclusive observation. No retry was performed.
+
+The executable was candidate V9 (`1c2cfc02958b3ea6ad3b175490b6eb5c755e42175a6bf85ee89af00b954d9f2c`), manifest `dd21b562ebe6e7e2604d716921f80c7174d8da3677fa4da5cdd9f889b3c62210`. Compute skin, dynamic shadow index, active CPU observer, and whole-light GPU observer were enabled; static constant groups, pixel/OS capture, performance timers, and other probes were off. Display was 1920×1200, device factor 1, game factor 6, fixed camera `(-221.082565,-18.284866,-168.182037)` facing +Z. The observed window used `w_clear2`; its actual calendar marker was 08:13 (sun time was a separate 08:03 setting).
+
+Catalog preparation emitted `status=disabled reason=catalog-validation-failed`: 1,960 candidate visuals / 554,377 candidate triangles, zero retained catalog visuals/triangles/bytes, zero reported omissions, zero invalid visuals, zero cap visuals, and 92 excluded materials. Consequently, all 12 grid records were `skipped reason=static-source-not-enabled` with scope 0, no source draw receipts, no selected triangles, and no marked cells. The 516 CPU face rows were `prediction=unknown`.
+
+The independent GPU observer emitted 96 complete group receipts, all with scope 0: 88 reported zero deferred receiver samples; 8 reported nonzero samples, totaling 15,076. Nonzero groups occurred at frames 300 (1 group, 1,890 samples), 301 (1, 1,893), 302 (2, 3,755), 307 (2, 3,783), and 308 (2, 3,755). The parser could not correlate any group with a valid CPU catalog/grid scope; zero correlated CPU/GPU groups and zero false-hidden findings were produced.
+
+This run did not exercise current-view catalog selection, CPU coverage usefulness, culling, visual correctness, or performance. The raw engine/marker logs and machine summary remain preserved beside this report. The original app and bare executable were restored after the build; the recursive restore and V4–V8 preservation receipt is [v9-build-restore-receipt.json](../../../../active-occlusion-stage/v9-transaction/attempt-02/v9-build-restore-receipt.json).

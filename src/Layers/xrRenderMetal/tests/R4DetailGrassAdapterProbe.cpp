@@ -1,9 +1,22 @@
 #include "MetalR4DetailGrassAdapter.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
+
+class xrMemory
+{
+public:
+    xrMemory() {}
+    void mem_free(void* p);
+};
+xrMemory Memory;
+void xrMemory::mem_free(void* p)
+{
+    std::free(p);
+}
 
 int main(int argc, char** argv)
 {

@@ -1,0 +1,756 @@
+--- a/MetalBootstrap.mm
++++ b/MetalBootstrap.mm
+@@ -15,10 +15,12 @@
+ #include <cmath>
+ #include <cstring>
+ #include <errno.h>
++#include <exception>
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
+ #include <limits.h>
++#include <new>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -514,6 +516,52 @@
+ 
+ struct LevelScene
+ {
++    static constexpr std::size_t ActiveOcclusionMaxTriangles = 32768u;
++    static constexpr std::uint32_t ActiveOcclusionMaxScopes = 12u;
++    static constexpr std::uint32_t ActiveOcclusionFirstFrame = 300u;
++    static constexpr std::uint32_t ActiveOcclusionLastFrame = 311u;
++
++    struct ActiveOcclusionSourceTriangle
++    {
++        std::uint32_t visualId = 0;
++        std::uint32_t triangleId = 0;
++        // Visual-local UInt16 source indices, in the original draw's index order.
++        std::array<std::uint32_t, 3> sourceVertexIds{};
++        std::array<std::array<float, 3>, 3> positions{};
++    };
++
++    struct ActiveOcclusionDrawReceipt
++    {
++        std::uint64_t drawId = 0;
++        std::uint64_t scopeId = 0;
++        std::uint32_t engineFrame = 0;
++        std::uint32_t visualId = 0;
++        std::size_t firstTriangle = 0;
++        std::uint32_t triangleCount = 0;
++        std::uint32_t viewportWidth = 0;
++        std::uint32_t viewportHeight = 0;
++        bool clockwiseFrontFace = false;
++        bool backFaceCull = false;
++        bool depthLess = false;
++        bool opaque = false;
++        bool writesDepth = false;
++        bool stencilPassGuaranteed = false;
++        // Bytes copied from the exact b1/b0 upload staging arrays, not rebuilt.
++        std::array<float, 16> uploadedWvp{};
++        std::array<float, 2> uploadedJitter{};
++    };
++
++    struct ActiveOcclusionObservation
++    {
++        std::uint64_t scopeId = 0;
++        std::uint32_t engineFrame = UINT32_MAX;
++        std::uint32_t viewportWidth = 0;
++        std::uint32_t viewportHeight = 0;
++        bool complete = false;
++        bool failed = false;
++        std::vector<ActiveOcclusionDrawReceipt> admittedDraws;
++    };
++
+     struct TextureAsset
+     {
+         xray::metal::R4DdsTexture ddsTexture;
+@@ -536,6 +584,7 @@
+         std::size_t textureAssetIndex = 0;
+         std::size_t hemiTextureAssetIndex = std::numeric_limits<std::size_t>::max();
+         std::uint32_t visualId = 0;
++        std::uint8_t visualType = 0;
+         std::uint16_t shaderId = 0;
+         std::uint32_t vertexBufferId = 0;
+         std::uint32_t vertexBase = 0;
+@@ -543,6 +592,13 @@
+         std::uint32_t indexBufferId = 0;
+         std::uint32_t indexBase = 0;
+         std::uint32_t indexCount = 0;
++        std::size_t activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
++        std::uint32_t activeOcclusionTriangleCount = 0;
++        std::array<float, 16> activeOcclusionUploadedWvp{};
++        std::array<float, 2> activeOcclusionUploadedJitter{};
++        std::uint64_t activeOcclusionConstantsScopeId = 0;
++        std::uint32_t activeOcclusionConstantsFrame = UINT32_MAX;
++        bool activeOcclusionConstantsValid = false;
+         std::uint32_t uvOffset = 0;
+         std::uint32_t hemiUvOffset = 0;
+         std::uint32_t normalOffset = 0;
+@@ -593,6 +649,21 @@
+     std::vector<TextureAsset> textureAssets;
+     std::vector<TextureMaterial> textureMaterials;
+     std::unordered_map<std::uint32_t, std::size_t> textureMaterialByVisual;
++    bool activeOcclusionRequested = false;
++    bool activeOcclusionEnabled = false;
++    const char* activeOcclusionDisableReason = nullptr;
++    std::vector<ActiveOcclusionSourceTriangle> activeOcclusionSourceTriangles;
++    ActiveOcclusionObservation activeOcclusionObservation;
++    std::uint64_t activeOcclusionNextScopeId = 1;
++    std::uint32_t activeOcclusionScopesBegun = 0u;
++    bool activeOcclusionScopeCapLogged = false;
++    std::size_t activeOcclusionSourceVisuals = 0;
++    std::size_t activeOcclusionOmittedVisuals = 0;
++    std::size_t activeOcclusionOmittedTriangles = 0;
++    std::size_t activeOcclusionExcludedMaterials = 0;
++    std::size_t activeOcclusionExcludedTrees = 0;
++    std::size_t activeOcclusionInvalidVisuals = 0;
++    std::size_t activeOcclusionCapVisuals = 0;
+     std::shared_ptr<IR4Sampler> baseSampler;
+     std::shared_ptr<IR4Sampler> hemiSampler;
+     std::shared_ptr<IR4GraphicsPipeline> gBufferDisplayPipeline;
+@@ -697,6 +768,25 @@
+         return false;
+     text.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+     return stream.good() || stream.eof();
++}
++
++bool readActiveOcclusionTextFileBounded(const std::filesystem::path& path,
++    const std::size_t maximumBytes, std::string& text)
++{
++    std::ifstream stream(path, std::ios::binary);
++    if (!stream)
++        return false;
++    stream.seekg(0, std::ios::end);
++    const std::streamoff length = stream.tellg();
++    if (length < 0 || static_cast<std::uint64_t>(length) > maximumBytes)
++        return false;
++    stream.seekg(0, std::ios::beg);
++    if (!stream)
++        return false;
++    text.resize(static_cast<std::size_t>(length));
++    if (length != 0)
++        stream.read(text.data(), length);
++    return stream.gcount() == length;
+ }
+ 
+ bool fileSha256(const std::filesystem::path& path, std::string& digest)
+@@ -748,8 +838,407 @@
+         lineStart = receipt.find(prefix, lineEnd + 1);
+     }
+     return false;
++}
++
++bool receiptHasLineToken(const std::string& receipt, const char* token)
++{
++    return receipt.find(token) != std::string::npos;
++}
++
++bool activeOcclusionShaderPairQualified(
++    const std::filesystem::path& vertexMetallibPath,
++    const std::filesystem::path& fragmentMetallibPath,
++    const char*& reason)
++{
++    // This observer admits one previously qualified shader/source/define set.
++    // Generic receipt self-consistency is not enough to admit a mod-updated shader.
++    if (vertexMetallibPath.filename() != "deffer_base_lmh_flat.vs.metallib" ||
++        fragmentMetallibPath.filename() != "deffer_base_lmh_flat.ps.metallib" ||
++        vertexMetallibPath.parent_path() != fragmentMetallibPath.parent_path())
++    {
++        reason = "shader-pair-name-or-path-mismatch";
++        return false;
++    }
++
++    std::filesystem::path vertexReflection = vertexMetallibPath;
++    std::filesystem::path fragmentReflection = fragmentMetallibPath;
++    vertexReflection.replace_extension(".json");
++    fragmentReflection.replace_extension(".json");
++    std::string vertexMetallibHash, fragmentMetallibHash;
++    std::string vertexReflectionHash, fragmentReflectionHash;
++    std::string vertexJson, fragmentJson, receipt;
++    const std::filesystem::path receiptPath =
++        vertexMetallibPath.parent_path() / "lmh-msc-receipt.txt";
++    if (!fileSha256(vertexMetallibPath, vertexMetallibHash) ||
++        !fileSha256(fragmentMetallibPath, fragmentMetallibHash) ||
++        !fileSha256(vertexReflection, vertexReflectionHash) ||
++        !fileSha256(fragmentReflection, fragmentReflectionHash) ||
++        !readActiveOcclusionTextFileBounded(vertexReflection, 64u * 1024u, vertexJson) ||
++        !readActiveOcclusionTextFileBounded(fragmentReflection, 64u * 1024u, fragmentJson) ||
++        !readActiveOcclusionTextFileBounded(receiptPath, 64u * 1024u, receipt))
++    {
++        reason = "qualified-shader-evidence-unavailable";
++        return false;
++    }
++
++    static constexpr const char* VertexMetallibHash =
++        "06415f649e216a95acf82a2940c7c9523332559705e644f5649b4a8bbde3d605";
++    static constexpr const char* FragmentMetallibHash =
++        "7c8078287baf8842389301b350681c9bd445067449bce314515a26aef296ebab";
++    static constexpr const char* VertexReflectionHash =
++        "54784344ece2100723a89b585edef118f0551688518b906eb07d95a1982e1001";
++    static constexpr const char* FragmentReflectionHash =
++        "e7383445db4e7a8672147b323a986a51c83db19746eeeedc319869904bb24ce0";
++    static constexpr const char* CommonDefines =
++        "common_define_args=-D SMAP_size=2048 -D FP16_FILTER=1 -D FP16_BLEND=1 "
++        "-D USE_HWSMAP=1 -D USE_HWSMAP_PCF=1 -D USE_BRANCHING=1 -D USE_VTF=1 "
++        "-D SM_5=1 -D SSFX_INT_GRASS=8 -D SSFX_SSR_QUALITY=0 -D SSFX_WATER_QUALITY=1 "
++        "-D SSFX_WATER_PARALLAX=2 -D SSFX_IL_QUALITY=16 -D SSFX_AO_QUALITY=2 "
++        "-D SSFX_POM_REFINE=0 -D SSFX_TERRA_POM_REFINE=0 -D SSFX_SSS_DIR_QUALITY=6 "
++        "-D SSFX_SSS_OMNI_QUALITY=2 -D SSFX_MODEXE=1 -D SKIN_NONE=1";
++    if (vertexMetallibHash != VertexMetallibHash ||
++        fragmentMetallibHash != FragmentMetallibHash ||
++        vertexReflectionHash != VertexReflectionHash ||
++        fragmentReflectionHash != FragmentReflectionHash ||
++        !receiptAdmitsArtifact(receipt, "vs", vertexMetallibHash, vertexReflectionHash) ||
++        !receiptAdmitsArtifact(receipt, "ps", fragmentMetallibHash, fragmentReflectionHash) ||
++        !receiptHasLineToken(receipt, "evidence_scope=exact_deffer_base_lmh_flat_dxc_msc_artifacts") ||
++        !receiptHasLineToken(receipt, "source_tree_sha256=bc502abe6276487148978a7423c102079d7120a12ed8359c87eff7f1047b8494") ||
++        !receiptHasLineToken(receipt, "entry_point=main") ||
++        !receiptHasLineToken(receipt, "permutation=non_msaa_skin_none_use_lm_hemi") ||
++        !receiptHasLineToken(receipt, CommonDefines) ||
++        !receiptHasLineToken(receipt, "stage=vs\tsource_sha256=dc054e39ed652cea6f8a4e7ace6b65e7aaef9d2927209f99a7f5954286a888a3") ||
++        !receiptHasLineToken(receipt, "stage=ps\tsource_sha256=2e52ee96c4f587671f8a4a3fcfaee3745f6e688f3a29cefb97e38f7cf97fb4db") ||
++        vertexJson.find("\"EntryPoint\":\"main\"") == std::string::npos ||
++        fragmentJson.find("\"EntryPoint\":\"main\"") == std::string::npos ||
++        fragmentJson.find("\"discards\":false") == std::string::npos)
++    {
++        reason = "shader-identity-not-in-qualified-allowlist";
++        return false;
++    }
++    return true;
+ }
+ 
++bool activeOcclusionOptedIn()
++{
++    const char* value = std::getenv("XRAY_METAL_ACTIVE_OCCLUSION");
++    return value && std::strcmp(value, "1") == 0;
++}
++
++bool activeOcclusionFrameInWindow(const std::uint32_t engineFrame)
++{
++    return engineFrame >= LevelScene::ActiveOcclusionFirstFrame &&
++        engineFrame <= LevelScene::ActiveOcclusionLastFrame;
++}
++
++bool activeOcclusionCheckedAdd(const std::size_t left, const std::size_t right,
++    std::size_t& result)
++{
++    if (right > std::numeric_limits<std::size_t>::max() - left)
++        return false;
++    result = left + right;
++    return true;
++}
++
++bool activeOcclusionCheckedMultiply(const std::size_t left, const std::size_t right,
++    std::size_t& result)
++{
++    if (left != 0u && right > std::numeric_limits<std::size_t>::max() / left)
++        return false;
++    result = left * right;
++    return true;
++}
++
++bool activeOcclusionReadFloat3(const std::vector<std::uint8_t>& bytes,
++    const std::size_t offset, std::array<float, 3>& output)
++{
++    std::size_t end = 0;
++    if (!activeOcclusionCheckedAdd(offset, sizeof(float) * output.size(), end) ||
++        end > bytes.size())
++        return false;
++    for (std::size_t axis = 0; axis != output.size(); ++axis)
++    {
++        const std::size_t componentOffset = offset + axis * sizeof(float);
++        const std::uint32_t bits =
++            std::uint32_t(bytes[componentOffset + 0u]) |
++            (std::uint32_t(bytes[componentOffset + 1u]) << 8u) |
++            (std::uint32_t(bytes[componentOffset + 2u]) << 16u) |
++            (std::uint32_t(bytes[componentOffset + 3u]) << 24u);
++        std::memcpy(&output[axis], &bits, sizeof(bits));
++        if (!std::isfinite(output[axis]))
++            return false;
++    }
++    return true;
++}
++
++bool appendActiveOcclusionSource(LevelScene& scene,
++    const std::filesystem::path& vertexMetallibPath,
++    const std::filesystem::path& fragmentMetallibPath,
++    const char*& reason)
++{
++    if (!scene.activeOcclusionRequested)
++        return true;
++
++    try
++    {
++        if (!scene.productionMsc || !scene.hemiDiagnostic)
++        {
++            reason = "production-lmh-path-not-active";
++            return false;
++        }
++        if (!activeOcclusionShaderPairQualified(vertexMetallibPath,
++                fragmentMetallibPath, reason))
++            return false;
++        scene.activeOcclusionSourceTriangles.clear();
++        scene.activeOcclusionSourceTriangles.reserve(LevelScene::ActiveOcclusionMaxTriangles);
++        std::size_t candidateVisualCount = 0;
++        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
++        {
++            if (material.shaderName != "default")
++            {
++                ++scene.activeOcclusionExcludedMaterials;
++                continue;
++            }
++            if (material.visualType == 7u || material.visualType == 11u)
++            {
++                ++scene.activeOcclusionExcludedTrees;
++                continue;
++            }
++            if (material.vertexBufferId >= scene.geometry.vertexBuffers.size() ||
++                material.indexBufferId >= scene.geometry.indexBuffers.size() ||
++                material.indexCount == 0u || material.indexCount % 3u != 0u)
++            {
++                ++scene.activeOcclusionInvalidVisuals;
++                scene.activeOcclusionOmittedTriangles += material.indexCount / 3u;
++                continue;
++            }
++
++            const xray::metal::R4VertexBufferSummary& vertexBuffer =
++                scene.geometry.vertexBuffers[material.vertexBufferId];
++            const xray::metal::R4IndexBufferSummary& indexBuffer =
++                scene.geometry.indexBuffers[material.indexBufferId];
++            std::size_t vertexBufferEnd = 0;
++            std::size_t indexBufferEnd = 0;
++            if (!vertexBuffer.hasPositionFloat3 || vertexBuffer.stride == 0u ||
++                material.vertexBase > vertexBuffer.vertexCount ||
++                material.vertexCount > vertexBuffer.vertexCount - material.vertexBase ||
++                material.indexBase > indexBuffer.indexCount ||
++                material.indexCount > indexBuffer.indexCount - material.indexBase ||
++                !activeOcclusionCheckedAdd(vertexBuffer.dataOffset, vertexBuffer.dataSize,
++                    vertexBufferEnd) || vertexBufferEnd > scene.geometryBytes.size() ||
++                !activeOcclusionCheckedAdd(indexBuffer.dataOffset, indexBuffer.dataSize,
++                    indexBufferEnd) || indexBufferEnd > scene.geometryBytes.size())
++            {
++                ++scene.activeOcclusionInvalidVisuals;
++                scene.activeOcclusionOmittedTriangles += material.indexCount / 3u;
++                continue;
++            }
++
++            const std::size_t triangleCount = material.indexCount / 3u;
++            if (triangleCount > LevelScene::ActiveOcclusionMaxTriangles -
++                    scene.activeOcclusionSourceTriangles.size())
++            {
++                ++scene.activeOcclusionCapVisuals;
++                ++scene.activeOcclusionOmittedVisuals;
++                scene.activeOcclusionOmittedTriangles += triangleCount;
++                continue;
++            }
++
++            const std::size_t firstTriangle = scene.activeOcclusionSourceTriangles.size();
++            bool visualValid = true;
++            std::vector<LevelScene::ActiveOcclusionSourceTriangle> visualTriangles;
++            visualTriangles.reserve(triangleCount);
++            for (std::uint32_t index = 0; index < material.indexCount; index += 3u)
++            {
++                LevelScene::ActiveOcclusionSourceTriangle triangle;
++                triangle.visualId = material.visualId;
++                triangle.triangleId = index / 3u;
++                for (std::uint32_t corner = 0; corner != 3u; ++corner)
++                {
++                    std::size_t indexNumber = 0;
++                    std::size_t indexRelativeOffset = 0;
++                    std::size_t indexOffset = 0;
++                    std::size_t indexEnd = 0;
++                    if (!activeOcclusionCheckedAdd(material.indexBase, index, indexNumber) ||
++                        !activeOcclusionCheckedAdd(indexNumber, corner, indexNumber) ||
++                        !activeOcclusionCheckedMultiply(indexNumber, sizeof(std::uint16_t),
++                            indexRelativeOffset) ||
++                        !activeOcclusionCheckedAdd(indexBuffer.dataOffset, indexRelativeOffset,
++                            indexOffset) ||
++                        !activeOcclusionCheckedAdd(indexOffset, sizeof(std::uint16_t), indexEnd) ||
++                        indexEnd > scene.geometryBytes.size() ||
++                        indexEnd > indexBufferEnd)
++                    {
++                        visualValid = false;
++                        break;
++                    }
++                    const std::uint16_t localIndex =
++                        std::uint16_t(scene.geometryBytes[indexOffset]) |
++                        (std::uint16_t(scene.geometryBytes[indexOffset + 1u]) << 8u);
++                    if (localIndex >= material.vertexCount)
++                    {
++                        visualValid = false;
++                        break;
++                    }
++                    std::size_t sourceVertex = 0;
++                    std::size_t vertexRelativeOffset = 0;
++                    std::size_t positionOffset = 0;
++                    std::size_t positionEnd = 0;
++                    if (!activeOcclusionCheckedAdd(material.vertexBase, localIndex, sourceVertex) ||
++                        !activeOcclusionCheckedMultiply(sourceVertex, vertexBuffer.stride,
++                            vertexRelativeOffset) ||
++                        !activeOcclusionCheckedAdd(vertexBuffer.dataOffset, vertexRelativeOffset,
++                            positionOffset) ||
++                        !activeOcclusionCheckedAdd(positionOffset, vertexBuffer.positionOffset,
++                            positionOffset) ||
++                        !activeOcclusionCheckedAdd(positionOffset, sizeof(float) * 3u,
++                            positionEnd) || positionEnd > vertexBufferEnd ||
++                        !activeOcclusionReadFloat3(scene.geometryBytes, positionOffset,
++                            triangle.positions[corner]))
++                    {
++                        visualValid = false;
++                        break;
++                    }
++                    triangle.sourceVertexIds[corner] = localIndex;
++                }
++                if (!visualValid)
++                    break;
++                visualTriangles.emplace_back(std::move(triangle));
++            }
++            if (!visualValid || visualTriangles.size() != triangleCount)
++            {
++                ++scene.activeOcclusionInvalidVisuals;
++                ++scene.activeOcclusionOmittedVisuals;
++                scene.activeOcclusionOmittedTriangles += triangleCount;
++                continue;
++            }
++            material.activeOcclusionFirstTriangle = firstTriangle;
++            material.activeOcclusionTriangleCount = static_cast<std::uint32_t>(triangleCount);
++            scene.activeOcclusionSourceTriangles.insert(scene.activeOcclusionSourceTriangles.end(),
++                visualTriangles.begin(), visualTriangles.end());
++            ++candidateVisualCount;
++        }
++        scene.activeOcclusionSourceVisuals = candidateVisualCount;
++        scene.activeOcclusionObservation.admittedDraws.reserve(candidateVisualCount);
++        scene.activeOcclusionEnabled = true;
++        return true;
++    }
++    catch (const std::exception&)
++    {
++        scene.activeOcclusionSourceTriangles.clear();
++        scene.activeOcclusionObservation.admittedDraws.clear();
++        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
++        {
++            material.activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
++            material.activeOcclusionTriangleCount = 0;
++        }
++        reason = "observer-resource-or-metadata-failure";
++        return false;
++    }
++}
++
++LevelScene::ActiveOcclusionObservation* beginActiveOcclusionObservation(
++    LevelScene& scene, const std::uint32_t engineFrame, const bool viewValid)
++{
++    if (!scene.activeOcclusionEnabled || !activeOcclusionFrameInWindow(engineFrame))
++        return nullptr;
++
++    LevelScene::ActiveOcclusionObservation& observation = scene.activeOcclusionObservation;
++    if (scene.activeOcclusionScopesBegun >= LevelScene::ActiveOcclusionMaxScopes)
++    {
++        observation.complete = true;
++        observation.failed = true;
++        observation.scopeId = 0u;
++        observation.engineFrame = UINT32_MAX;
++        observation.admittedDraws.clear();
++        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
++        {
++            if (material.activeOcclusionTriangleCount != 0u)
++            {
++                material.activeOcclusionConstantsValid = false;
++                material.activeOcclusionConstantsScopeId = 0u;
++                material.activeOcclusionConstantsFrame = UINT32_MAX;
++            }
++        }
++        if (!scene.activeOcclusionScopeCapLogged)
++        {
++            std::fprintf(stderr,
++                "METAL_ACTIVE_OCCLUSION_FRAME frame=%u status=skipped "
++                "reason=observation-scope-cap scopes=%u\n",
++                engineFrame, LevelScene::ActiveOcclusionMaxScopes);
++            scene.activeOcclusionScopeCapLogged = true;
++        }
++        return nullptr;
++    }
++    ++scene.activeOcclusionScopesBegun;
++    observation.admittedDraws.clear();
++    observation.engineFrame = engineFrame;
++    observation.scopeId = scene.activeOcclusionNextScopeId++;
++    if (observation.scopeId == 0u)
++        observation.scopeId = scene.activeOcclusionNextScopeId++;
++    if (scene.activeOcclusionNextScopeId == 0u)
++        scene.activeOcclusionNextScopeId = 1u;
++    observation.complete = false;
++    observation.failed = !viewValid;
++    observation.viewportWidth = 0u;
++    observation.viewportHeight = 0u;
++    for (LevelScene::TextureMaterial& material : scene.textureMaterials)
++    {
++        if (material.activeOcclusionTriangleCount != 0u)
++        {
++            material.activeOcclusionConstantsValid = false;
++            material.activeOcclusionConstantsScopeId = 0u;
++            material.activeOcclusionConstantsFrame = UINT32_MAX;
++        }
++    }
++    if (scene.gBufferTargets.empty() || !scene.gBufferTargets.front())
++    {
++        observation.failed = true;
++        return &observation;
++    }
++    observation.viewportWidth = scene.gBufferTargets.front()->Descriptor().width;
++    observation.viewportHeight = scene.gBufferTargets.front()->Descriptor().height;
++    if (observation.viewportWidth == 0u || observation.viewportHeight == 0u)
++        observation.failed = true;
++    return &observation;
++}
++
++LevelScene::ActiveOcclusionObservation* currentActiveOcclusionObservation(
++    LevelScene& scene, const std::uint32_t engineFrame)
++{
++    LevelScene::ActiveOcclusionObservation& observation = scene.activeOcclusionObservation;
++    if (!scene.activeOcclusionEnabled || !activeOcclusionFrameInWindow(engineFrame) ||
++        observation.scopeId == 0u || observation.engineFrame != engineFrame ||
++        observation.complete)
++        return nullptr;
++    return &observation;
++}
++
++void completeActiveOcclusionObservation(LevelScene& scene,
++    LevelScene::ActiveOcclusionObservation* const observation)
++{
++    if (!observation || observation != &scene.activeOcclusionObservation ||
++        observation->scopeId == 0u)
++        return;
++    if (observation->failed)
++    {
++        std::fprintf(stderr,
++            "METAL_ACTIVE_OCCLUSION_FRAME frame=%u scope=%llu status=skipped "
++            "reason=invalid-view-or-receipt-allocation-failure\n",
++            observation->engineFrame,
++            static_cast<unsigned long long>(observation->scopeId));
++        return;
++    }
++    observation->complete = true;
++    std::fprintf(stderr,
++        "METAL_ACTIVE_OCCLUSION_FRAME frame=%u scope=%llu status=complete "
++        "admitted_draws=%zu source_triangles=%zu viewport=%ux%u\n",
++        observation->engineFrame,
++        static_cast<unsigned long long>(observation->scopeId),
++        observation->admittedDraws.size(), scene.activeOcclusionSourceTriangles.size(),
++        observation->viewportWidth, observation->viewportHeight);
++}
++
+ std::string automaticLinearTlab(
+     const std::vector<std::pair<std::uint32_t, const char*>>& entries)
+ {
+@@ -1137,6 +1626,7 @@
+         return false;
+ 
+     scene.productionMsc = !vertexMetallibPath.empty() && !fragmentMetallibPath.empty();
++    scene.activeOcclusionRequested = activeOcclusionOptedIn();
+     if (scene.productionMsc &&
+         !validateLmhMscReflection(vertexMetallibPath, fragmentMetallibPath, error))
+         return false;
+@@ -1354,6 +1844,7 @@
+             if (!addTextureAsset(input.baseDdsPath, material.textureAssetIndex))
+                 return false;
+             material.visualId = found->visualId;
++            material.visualType = found->visualType;
+             material.shaderId = found->shaderId;
+             material.vertexBufferId = found->vertexBufferId;
+             material.vertexBase = found->vertexBase;
+@@ -1417,6 +1908,27 @@
+         scene.hemiDiagnostic = everyMaterialHasHemi;
+     }
+ 
++    if (scene.activeOcclusionRequested)
++    {
++        const char* activeOcclusionReason = nullptr;
++        if (!appendActiveOcclusionSource(scene, vertexMetallibPath,
++                fragmentMetallibPath, activeOcclusionReason))
++            scene.activeOcclusionDisableReason = activeOcclusionReason;
++        std::fprintf(stderr,
++            "METAL_ACTIVE_OCCLUSION_PREP status=%s reason=%s source_visuals=%zu "
++            "source_triangles=%zu omitted_visuals=%zu omitted_triangles=%zu "
++            "excluded_materials=%zu excluded_trees=%zu invalid_visuals=%zu cap_visuals=%zu max_triangles=%zu\n",
++            scene.activeOcclusionEnabled ? "enabled" : "disabled",
++            scene.activeOcclusionEnabled ? "qualified-source-snapshot" :
++                (scene.activeOcclusionDisableReason ? scene.activeOcclusionDisableReason :
++                    "no-candidates"),
++            scene.activeOcclusionSourceVisuals, scene.activeOcclusionSourceTriangles.size(),
++            scene.activeOcclusionOmittedVisuals, scene.activeOcclusionOmittedTriangles,
++            scene.activeOcclusionExcludedMaterials, scene.activeOcclusionExcludedTrees,
++            scene.activeOcclusionInvalidVisuals, scene.activeOcclusionCapVisuals,
++            LevelScene::ActiveOcclusionMaxTriangles);
++    }
++
+     if (scene.productionMsc)
+     {
+         if ((!scene.hemiDiagnostic && !scene.textureMaterials.empty()) ||
+@@ -3386,7 +3898,8 @@
+     return true;
+ }
+ 
+-bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
++bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error,
++    LevelScene::ActiveOcclusionObservation* const activeOcclusionObservation = nullptr)
+ {
+     if (scene.textureMaterials.empty() &&
+         !backend.BindVertexBuffer(1, scene.uniforms, 0, error))
+@@ -3411,6 +3924,7 @@
+         std::shared_ptr<IR4GraphicsPipeline> selectedPipeline =
+             scene.pipelines[visual.vertexBufferId];
+         bool alphaTested = false;
++        const LevelScene::TextureMaterial* activeOcclusionMaterial = nullptr;
+         if (!scene.textureMaterials.empty())
+         {
+             const auto material = scene.textureMaterialByVisual.find(visual.visualId);
+@@ -3437,6 +3951,15 @@
+                     ++automaticLmhArefCulled;
+                 continue;
+             }
++            if (activeOcclusionObservation && !activeOcclusionObservation->failed &&
++                binding.shaderName == "default" && binding.visualType != 7u &&
++                binding.visualType != 11u && binding.activeOcclusionTriangleCount != 0u &&
++                binding.activeOcclusionFirstTriangle != std::numeric_limits<std::size_t>::max() &&
++                selectedPipeline == scene.pipelines[visual.vertexBufferId] &&
++                binding.activeOcclusionConstantsValid &&
++                binding.activeOcclusionConstantsFrame == activeOcclusionObservation->engineFrame &&
++                binding.activeOcclusionConstantsScopeId == activeOcclusionObservation->scopeId)
++                activeOcclusionMaterial = &binding;
+             if (scene.productionMsc)
+             {
+                 R4MscStageBindings vertexBindings;
+@@ -3519,6 +4042,58 @@
+         draw.baseVertex = static_cast<std::int32_t>(visual.vertexBase);
+         if (!backend.DrawIndexed(draw, error))
+             return false;
++        if (activeOcclusionMaterial && activeOcclusionObservation &&
++            !activeOcclusionObservation->failed)
++        {
++            const std::size_t firstTriangle =
++                activeOcclusionMaterial->activeOcclusionFirstTriangle;
++            const std::size_t triangleCount =
++                activeOcclusionMaterial->activeOcclusionTriangleCount;
++            if (firstTriangle > scene.activeOcclusionSourceTriangles.size() ||
++                triangleCount > scene.activeOcclusionSourceTriangles.size() - firstTriangle ||
++                activeOcclusionObservation->admittedDraws.size() >=
++                    scene.activeOcclusionSourceVisuals)
++            {
++                activeOcclusionObservation->failed = true;
++                activeOcclusionObservation->admittedDraws.clear();
++            }
++            else
++            {
++                try
++                {
++                    LevelScene::ActiveOcclusionDrawReceipt receipt;
++                    receipt.drawId = activeOcclusionObservation->admittedDraws.size() + 1u;
++                    receipt.scopeId = activeOcclusionObservation->scopeId;
++                    receipt.engineFrame = activeOcclusionObservation->engineFrame;
++                    receipt.visualId = activeOcclusionMaterial->visualId;
++                    receipt.firstTriangle = firstTriangle;
++                    receipt.triangleCount = static_cast<std::uint32_t>(triangleCount);
++                    receipt.viewportWidth = activeOcclusionObservation->viewportWidth;
++                    receipt.viewportHeight = activeOcclusionObservation->viewportHeight;
++                    // The exact qualified production descriptor for this path:
++                    // opaque flat MSC, Clockwise front, Back cull, Less/write,
++                    // and G-buffer stencil Always/Replace under reference 1.
++                    receipt.clockwiseFrontFace = true;
++                    receipt.backFaceCull = true;
++                    receipt.depthLess = true;
++                    receipt.opaque = true;
++                    receipt.writesDepth = true;
++                    receipt.stencilPassGuaranteed = true;
++                    std::memcpy(receipt.uploadedWvp.data(),
++                        activeOcclusionMaterial->activeOcclusionUploadedWvp.data(),
++                        sizeof(receipt.uploadedWvp));
++                    std::memcpy(receipt.uploadedJitter.data(),
++                        activeOcclusionMaterial->activeOcclusionUploadedJitter.data(),
++                        sizeof(receipt.uploadedJitter));
++                    activeOcclusionObservation->admittedDraws.emplace_back(std::move(receipt));
++                }
++                catch (const std::bad_alloc&)
++                {
++                    activeOcclusionObservation->failed = true;
++                    activeOcclusionObservation->admittedDraws.clear();
++                }
++            }
++        }
+         if (scene.automaticLmhFrustumCulling)
+         {
+             ++automaticLmhSubmitted;
+--- a/MetalR4EngineScene.mm
++++ b/MetalR4EngineScene.mm
+@@ -2309,8 +2309,20 @@
+         return resources.UpdateBuffer(
+             scene.uniforms, 0, &scene.uniformData, sizeof(scene.uniformData), error);
+ 
++    const bool captureActiveOcclusionConstants = scene.activeOcclusionEnabled &&
++        state.valid && activeOcclusionFrameInWindow(state.engineFrame) &&
++        scene.activeOcclusionObservation.scopeId != 0u &&
++        scene.activeOcclusionObservation.engineFrame == state.engineFrame &&
++        !scene.activeOcclusionObservation.complete &&
++        !scene.activeOcclusionObservation.failed;
+     for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+     {
++        if (captureActiveOcclusionConstants && material.activeOcclusionTriangleCount != 0u)
++        {
++            material.activeOcclusionConstantsValid = false;
++            material.activeOcclusionConstantsScopeId = 0u;
++            material.activeOcclusionConstantsFrame = UINT32_MAX;
++        }
+         std::array<std::uint8_t, 160> vertexGlobals{};
+         std::array<std::uint8_t, 256> transforms{};
+         const Matrix4 worldViewProjection = multiply(
+@@ -2332,6 +2344,18 @@
+             !resources.UpdateBuffer(material.mscFragmentTransforms, 0,
+                 transforms.data(), transforms.size(), error))
+             return false;
++        if (captureActiveOcclusionConstants && material.activeOcclusionTriangleCount != 0u)
++        {
++            // Keep the exact bytes submitted to the two shader constant buffers.
++            std::memcpy(material.activeOcclusionUploadedWvp.data(), transforms.data(),
++                sizeof(material.activeOcclusionUploadedWvp));
++            std::memcpy(material.activeOcclusionUploadedJitter.data(), vertexGlobals.data() + 128u,
++                sizeof(material.activeOcclusionUploadedJitter));
++            material.activeOcclusionConstantsScopeId =
++                scene.activeOcclusionObservation.scopeId;
++            material.activeOcclusionConstantsFrame = state.engineFrame;
++            material.activeOcclusionConstantsValid = true;
++        }
+     }
+     std::uint32_t width = 0;
+     std::uint32_t height = 0;
+@@ -4151,9 +4175,12 @@
+         attachment.clearColor = {0.0, 0.0, 0.0, 0.0};
+         gBufferPass.colorAttachments.emplace_back(std::move(attachment));
+     }
++    LevelScene::ActiveOcclusionObservation* activeOcclusionObservation = nullptr;
++    if (scene.activeOcclusionEnabled && activeOcclusionFrameInWindow(view.engineFrame))
++        activeOcclusionObservation = currentActiveOcclusionObservation(scene, view.engineFrame);
+     if (!backend.BeginRenderPass(gBufferPass, error) ||
+         !backend.SetStencilReference(1, error) ||
+-        !drawLevelScene(backend, scene, error))
++        !drawLevelScene(backend, scene, error, activeOcclusionObservation))
+         return false;
+     if (defVertex)
+     {
+@@ -4211,6 +4238,7 @@
+     }
+     if (!backend.EndRenderPass(error))
+         return false;
++    completeActiveOcclusionObservation(scene, activeOcclusionObservation);
+     if (!captureColorPhase(backend, view, "gbuffer_world", scene.gBufferTargets,
+             {"position_packed_normal", "diffuse", "auxiliary", "motion"}, error)) return false;
+     if (!runStaticMotionProbe(backend, scene, terrain, defVertex, defObjectsLod,
+@@ -6890,6 +6918,8 @@
+     // Reallocate producers before preparing temporal consumers. Otherwise AO
+     // would bind the old-sized history on the first frame after a resize.
+     if (!ensureLevelDepthTarget(backend, impl->scene, error)) return false;
++    if (impl->scene.activeOcclusionEnabled && activeOcclusionFrameInWindow(view.engineFrame))
++        beginActiveOcclusionObservation(impl->scene, view.engineFrame, view.valid);
+     impl->floraEnvironment = environment;
+     if (view.valid && environment.valid)
+     {

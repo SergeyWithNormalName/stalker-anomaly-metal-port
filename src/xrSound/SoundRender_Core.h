@@ -104,6 +104,7 @@ public:
 	virtual void set_listener(const CSoundRender_Environment& env)=0;
 	virtual void get_listener(CSoundRender_Environment& env)=0;
 	virtual void commit()=0;
+	virtual void start_deferred_target(CSoundRender_Target* target);
 
 #ifdef _EDITOR
 	virtual SoundEnvironment_LIB*		get_env_library			()																{ return s_environment; }

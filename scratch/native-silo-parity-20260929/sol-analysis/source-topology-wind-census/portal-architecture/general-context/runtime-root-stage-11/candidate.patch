@@ -1,0 +1,639 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -2620,6 +2620,9 @@
+     const bool motionSnapshotFresh,
+     const bool environmentSnapshotFresh,
+     const bool immutablePopulationQualified,
++    const bool forcePreparedMotion,
++    const bool populationOnly,
++    std::vector<const R4FloraRestRecord*>* deferredRecordByVisualId,
+     MetalR4EngineScene::MainFloraPortalCandidateSet& result)
+ {
+     result = {};
+@@ -2636,25 +2639,30 @@
+         std::memcmp(frozenView.projection.data(), input.currentProjection.data(), sizeof(float) * 16u) != 0)
+     { result.reason = "stale-generation-or-primary-source-view-mismatch"; return false; }
+ 
+-    flora_wind::Motion motion;
+-    motion.valid = frozenView.windValid;
+-    motion.windParams = frozenView.windParams;
+-    motion.treeSetup = frozenView.windSetupTrees;
+-    motion.benderSetup = frozenView.bendersSetup;
+-    motion.animationCurrent = frozenView.windAnimation;
+-    motion.animationPrevious = frozenView.windAnimationPrevious;
+-    for (std::size_t i = 0; i < motion.currentBenders.size(); ++i)
+-    {
+-        motion.currentBenders[i] = {frozenView.currentBenders[i][0], frozenView.currentBenders[i][1],
+-            frozenView.currentBenders[i][2], frozenView.currentBenders[i][3]};
+-        motion.previousBenders[i] = {frozenView.previousBenders[i][0], frozenView.previousBenders[i][1],
+-            frozenView.previousBenders[i][2], frozenView.previousBenders[i][3]};
+-    }
+-
+-    const char* preparedWind = std::getenv("XRAY_METAL_FLORA_PORTAL_PREPARED_MOTION");
+-    const bool usePreparedMotion = preparedWind && std::strcmp(preparedWind, "1") == 0;
+-    flora_wind::PreparedMotion preparedMotion;
+-    if (usePreparedMotion) preparedMotion = flora_wind::prepareMotion(motion);
++    flora_wind::Motion motion{};
++    flora_wind::PreparedMotion preparedMotion{};
++    bool usePreparedMotion = false;
++    if (!populationOnly)
++    {
++        motion.valid = frozenView.windValid;
++        motion.windParams = frozenView.windParams;
++        motion.treeSetup = frozenView.windSetupTrees;
++        motion.benderSetup = frozenView.bendersSetup;
++        motion.animationCurrent = frozenView.windAnimation;
++        motion.animationPrevious = frozenView.windAnimationPrevious;
++        for (std::size_t i = 0; i < motion.currentBenders.size(); ++i)
++        {
++            motion.currentBenders[i] = {frozenView.currentBenders[i][0], frozenView.currentBenders[i][1],
++                frozenView.currentBenders[i][2], frozenView.currentBenders[i][3]};
++            motion.previousBenders[i] = {frozenView.previousBenders[i][0], frozenView.previousBenders[i][1],
++                frozenView.previousBenders[i][2], frozenView.previousBenders[i][3]};
++        }
++
++        const char* preparedWind = std::getenv("XRAY_METAL_FLORA_PORTAL_PREPARED_MOTION");
++        usePreparedMotion = forcePreparedMotion ||
++            (preparedWind && std::strcmp(preparedWind, "1") == 0);
++        if (usePreparedMotion) preparedMotion = flora_wind::prepareMotion(motion);
++    }
+ 
+     // The Scene Prepare/Reset lifecycle owns immutable geometry, material flags,
+     // graph and rest records. A caller may reuse ONLY the completed population
+@@ -2740,7 +2748,25 @@
+         }
+         if (seen.size() != restRecords.size() || seen != expectedFloraIds)
+         { result.reason = "rest-record-id-set-does-not-match-complete-source-flora-join"; return false; }
+-    
++
++    }
++
++    if (deferredRecordByVisualId)
++    {
++        deferredRecordByVisualId->assign(cache.graph.visualNodes.size(), nullptr);
++        for (const R4FloraRestRecord& record : restRecords)
++        {
++            if (record.visualId >= deferredRecordByVisualId->size() ||
++                (*deferredRecordByVisualId)[record.visualId])
++            { result.reason = "deferred-rest-lookup-id-invalid-or-duplicate"; return false; }
++            (*deferredRecordByVisualId)[record.visualId] = &record;
++        }
++    }
++    if (populationOnly)
++    {
++        result.qualified = true;
++        result.reason.clear();
++        return true;
+     }
+ 
+     for (const R4FloraRestRecord& record : restRecords)
+@@ -2789,6 +2815,126 @@
+     result.qualified = true;
+     result.reason.clear();
+     return true;
++}
++
++struct MainFloraDeferredPortalContext
++{
++    const xray::metal::R4PortalGenerationCache* cache = nullptr;
++    const xray::metal::R4PortalContextFrameInput* input = nullptr;
++    const xray::metal::R4PortalContextFrameOutput* portal = nullptr;
++    const std::vector<const R4FloraRestRecord*>* restByVisualId = nullptr;
++    flora_wind::PreparedMotion preparedMotion;
++    bool valid = false;
++};
++
++flora_wind::Motion makeFloraMotion(const R4FloraViewState& view)
++{
++    flora_wind::Motion motion;
++    motion.valid = view.windValid;
++    motion.windParams = view.windParams;
++    motion.treeSetup = view.windSetupTrees;
++    motion.benderSetup = view.bendersSetup;
++    motion.animationCurrent = view.windAnimation;
++    motion.animationPrevious = view.windAnimationPrevious;
++    for (std::size_t i = 0; i < motion.currentBenders.size(); ++i)
++    {
++        motion.currentBenders[i] = {view.currentBenders[i][0], view.currentBenders[i][1],
++            view.currentBenders[i][2], view.currentBenders[i][3]};
++        motion.previousBenders[i] = {view.previousBenders[i][0], view.previousBenders[i][1],
++            view.previousBenders[i][2], view.previousBenders[i][3]};
++    }
++    return motion;
++}
++
++bool prepareMainFloraDeferredPortalContext(
++    const xray::metal::R4PortalGenerationCache& cache,
++    const xray::metal::R4PortalContextFrameInput& input,
++    const xray::metal::R4PortalContextFrameOutput& portal,
++    const std::vector<const R4FloraRestRecord*>& restByVisualId,
++    const R4FloraViewState& view,
++    const bool motionSnapshotFresh,
++    const bool environmentSnapshotFresh,
++    MainFloraDeferredPortalContext& output)
++{
++    output = {};
++    if (!cache.qualified || !portal.valid || !view.valid || !view.windValid ||
++        !motionSnapshotFresh || !environmentSnapshotFresh || input.generation == 0u ||
++        input.generation != cache.generation || portal.generation != input.generation ||
++        portal.frameID != input.frameID || view.engineFrame != input.frameID ||
++        restByVisualId.size() != cache.graph.visualNodes.size() ||
++        restByVisualId.size() > portal.graph.rawVisualVisible.size() ||
++        std::memcmp(view.view.data(), input.currentView.data(), sizeof(float) * 16u) != 0 ||
++        std::memcmp(view.projection.data(), input.currentProjection.data(), sizeof(float) * 16u) != 0 ||
++        !portalFullTransformMatchesSourceOrder(input))
++        return false;
++    output.cache = &cache;
++    output.input = &input;
++    output.portal = &portal;
++    output.restByVisualId = &restByVisualId;
++    output.preparedMotion = flora_wind::prepareMotion(makeFloraMotion(view));
++    if (output.preparedMotion.validationError)
++    { output = {}; return false; }
++    output.valid = true;
++    return true;
++}
++
++bool shouldSkipMainFloraVisualAfterCameraClip(void* opaque, const std::uint32_t visualId,
++    R4FloraDeferredPortalStats& stats) noexcept
++{
++    auto* context = static_cast<MainFloraDeferredPortalContext*>(opaque);
++    if (!context || !context->valid || !context->cache || !context->input ||
++        !context->portal || !context->restByVisualId)
++    { ++stats.unknownKeptVisible; return false; }
++    try
++    {
++        const auto& restById = *context->restByVisualId;
++        const auto& portal = *context->portal;
++        const auto& cache = *context->cache;
++        if (visualId >= restById.size() || visualId >= portal.graph.rawVisualVisible.size() ||
++            visualId >= cache.graph.portalMetadata.visualOwnerSectors.size())
++        { ++stats.unknownKeptVisible; return false; }
++        const R4FloraRestRecord* record = restById[visualId];
++        if (!record || !record->known || !record->eligible)
++        { ++stats.unknownKeptVisible; return false; }
++        if (portal.graph.rawVisualVisible[visualId] != 0u)
++            return false;
++
++        ++stats.portalCandidateDraws;
++        flora_wind::Rest rest;
++        rest.center = {record->worldSphereCenter[0], record->worldSphereCenter[1], record->worldSphereCenter[2]};
++        rest.radius = record->radius;
++        rest.hMin = record->minH;
++        rest.hMax = record->maxH;
++        rest.uvAbsMax = record->maxAbsOneMinusUvY;
++        rest.material = record->leaf ? flora_wind::Material::Leaf : flora_wind::Material::Trunk;
++        ++stats.windBoundCalls;
++        const flora_wind::Bound bound = flora_wind::compute(rest, context->preparedMotion);
++        if (!bound.known || !std::isfinite(bound.unionRadius) || bound.unionRadius <= 0.0f)
++        { ++stats.windBoundUnknown; ++stats.unknownKeptVisible; return false; }
++
++        const auto& owners = cache.graph.portalMetadata.visualOwnerSectors[visualId];
++        if (owners.empty())
++        { ++stats.ownerFrustumUnknown; ++stats.unknownKeptVisible; return false; }
++        ++stats.ownerRecordChecks;
++        Fvector center; center.set(record->worldSphereCenter[0], record->worldSphereCenter[1], record->worldSphereCenter[2]);
++        bool allOwnerFrustaMiss = true;
++        for (const std::uint32_t owner : owners)
++        {
++            if (owner >= portal.graph.reached.size() || portal.graph.reached[owner].values.empty())
++            { ++stats.ownerFrustumUnknown; ++stats.unknownKeptVisible; return false; }
++            for (const CFrustum& frustum : portal.graph.reached[owner].values)
++            {
++                ++stats.ownerFrustumTests;
++                Fvector testCenter = center;
++                if (frustum.testSphere_dirty(testCenter, bound.unionRadius))
++                { allOwnerFrustaMiss = false; break; }
++            }
++            if (!allOwnerFrustaMiss) break;
++        }
++        return allOwnerFrustaMiss;
++    }
++    catch (...)
++    { ++stats.unknownKeptVisible; return false; }
+ }
+ 
+ R4DetailGrassViewState makeDetailView(const MetalR4EngineScene::ViewState& view,
+@@ -4872,6 +5018,15 @@
+             << "  \"candidate_actually_skipped\": " << actualSkips[1] << ",\n"
+             << "  \"candidate_wind_bound_unknown\": " << candidates.windBoundUnknown << ",\n"
+             << "  \"candidate_owner_frustum_unknown\": " << candidates.ownerFrustumUnknown << ",\n"
++            << "  \"deferred_after_clip_enabled\": " << (sampled[1].portalDeferredDecisionUsed ? "true" : "false") << ",\n"
++            << "  \"deferred_portal_candidate_draws\": " << sampled[1].portalCandidateDraws << ",\n"
++            << "  \"deferred_wind_bound_calls\": " << sampled[1].portalWindBoundCalls << ",\n"
++            << "  \"deferred_owner_record_checks\": " << sampled[1].portalOwnerRecordChecks << ",\n"
++            << "  \"deferred_owner_frustum_tests\": " << sampled[1].portalOwnerFrustumTests << ",\n"
++            << "  \"deferred_wind_unknown_kept_visible\": " << sampled[1].portalWindBoundUnknown << ",\n"
++            << "  \"deferred_owner_unknown_kept_visible\": " << sampled[1].portalOwnerFrustumUnknown << ",\n"
++            << "  \"deferred_unknown_kept_visible\": " << sampled[1].portalUnknownKeptVisible << ",\n"
++            << "  \"deferred_expected_set_mismatches\": " << sampled[1].portalExpectedSetMismatches << ",\n"
+             << "  \"source_portal_flags_are_gpu_wind_proof\": false,\n"
+             << "  \"time_seconds\": " << frozenFloraView.timeSeconds << ",\n"
+             << "  \"wind_valid\": " << (frozenFloraView.windValid ? "true" : "false") << ",\n"
+@@ -6886,9 +7041,15 @@
+     bool portalPerFrameSuppress = false;
+     bool portalPerFrameReady = false;
+     bool portalCachePopulation = false;
++    bool portalDeferAfterClip = false;
+     std::uint64_t portalPopulationGeneration = 0u;
+     const R4FloraRestRecord* portalPopulationRecords = nullptr;
+     std::size_t portalPopulationCount = 0u;
++    bool portalDeferredPopulationQualified = false;
++    std::uint64_t portalDeferredPopulationGeneration = 0u;
++    const R4FloraRestRecord* portalDeferredPopulationRecords = nullptr;
++    std::size_t portalDeferredPopulationCount = 0u;
++    std::vector<const R4FloraRestRecord*> portalDeferredRestByVisualId;
+     xray::metal::R4PortalContextFrameInput portalPerFrameInput;
+     xray::metal::R4PortalContextFrameOutput portalPerFrameOutput;
+     std::ofstream portalPerFrameLog;
+@@ -7308,13 +7469,15 @@
+     impl->portalPerFrameSuppress = portalPerFrame && std::strcmp(portalPerFrame, "on") == 0;
+     const char* cachePopulation = std::getenv("XRAY_METAL_FLORA_PORTAL_CACHE_POPULATION");
+     impl->portalCachePopulation = cachePopulation && std::strcmp(cachePopulation, "1") == 0;
++    const char* deferAfterClip = std::getenv("XRAY_METAL_FLORA_PORTAL_DEFER_AFTER_CLIP");
++    impl->portalDeferAfterClip = deferAfterClip && std::strcmp(deferAfterClip, "1") == 0;
+     if (impl->portalPerFrameEnabled)
+     {
+         const char* logPath = std::getenv("XRAY_METAL_FLORA_PORTAL_PERFRAME_FILE");
+         if (logPath && logPath[0] == '/')
+         {
+             impl->portalPerFrameLog.open(logPath, std::ios::trunc);
+-            impl->portalPerFrameLog << "frame,generation,mode,qualified,start_sector,graph_cpu_ms,mask_cpu_ms,excluded,actual_skips,draws,camera_culled,wind_unknown,owner_unknown,reason\n";
++            impl->portalPerFrameLog << "frame,generation,mode,method,qualified,start_sector,graph_cpu_ms,mask_cpu_ms,prepared_exclusions,actual_skips,draws,camera_culled,full_raw_candidates,full_wind_unknown,full_owner_unknown,lazy_portal_candidates,lazy_wind_calls,lazy_owner_records,lazy_owner_frustum_tests,lazy_wind_unknown,lazy_owner_unknown,lazy_unknown_keeps,expected_id_mismatches,reason\n";
+         }
+     }
+     if (impl->portalObserverEnabled || impl->portalPerFrameEnabled)
+@@ -7774,11 +7937,23 @@
+             const std::size_t admittedDraws = floraTelemetry.admittedVisuals;
+             if (restRecords.empty() || admittedDraws == 0u || admittedDraws != restRecords.size())
+             { candidates.reason = "rest-record-population-does-not-match-admitted-draws"; callbackError = candidates.reason; return false; }
++            std::vector<const R4FloraRestRecord*> deferredLookup;
++            const bool makeDeferredLookup = impl->portalDeferAfterClip;
+             if (!buildMainFloraPortalCandidateSet(impl->portalCache, impl->portalInput,
+                     impl->portalOutput, impl->scene.geometry, impl->portalFloraShaderMaterials,
+                     restRecords, frozenView,
+-                    impl->portalSelectedViewMatches, motionSnapshotFresh, environmentSnapshotFresh, false, candidates))
++                    impl->portalSelectedViewMatches, motionSnapshotFresh, environmentSnapshotFresh,
++                    false, impl->portalDeferAfterClip, false,
++                    makeDeferredLookup ? &deferredLookup : nullptr, candidates))
+             { callbackError = candidates.reason; return false; }
++            if (makeDeferredLookup)
++            {
++                impl->portalDeferredRestByVisualId = std::move(deferredLookup);
++                impl->portalDeferredPopulationQualified = true;
++                impl->portalDeferredPopulationGeneration = impl->portalInput.generation;
++                impl->portalDeferredPopulationRecords = restRecords.data();
++                impl->portalDeferredPopulationCount = restRecords.size();
++            }
+             return true;
+         });
+     impl->portalOracleDraw = std::make_shared<const MainFloraPortalOracleDrawCallback>(
+@@ -7790,9 +7965,35 @@
+             { sampledTelemetry = {}; actuallySkipped = 0u; return true; }
+             if (applyPortalMask)
+             {
+-                // Deliberately unresolved until root joins the scratch adapter seam. The
+-                // required callback keeps source order and all uniforms, skips only these
+-                // stable visual IDs after normal camera clipping, and reports actual skips.
++                if (impl->portalDeferAfterClip)
++                {
++                    const auto& records = impl->flora->RestRecordsForValidation();
++                    const bool populationMatches = impl->portalDeferredPopulationQualified &&
++                        impl->portalDeferredPopulationGeneration == impl->portalInput.generation &&
++                        impl->portalDeferredPopulationRecords == records.data() &&
++                        impl->portalDeferredPopulationCount == records.size() &&
++                        impl->portalDeferredRestByVisualId.size() == impl->portalCache.graph.visualNodes.size();
++                    const bool motionFresh = impl->floraMotion.valid &&
++                        impl->floraMotion.engineFrame == frozenView.engineFrame;
++                    const bool environmentFresh = impl->floraEnvironment.valid &&
++                        impl->floraEnvironment.engineFrame == frozenView.engineFrame;
++                    MainFloraDeferredPortalContext deferredContext;
++                    if (!populationMatches || !prepareMainFloraDeferredPortalContext(
++                            impl->portalCache, impl->portalInput, impl->portalOutput,
++                            impl->portalDeferredRestByVisualId, frozenView,
++                            motionFresh, environmentFresh, deferredContext))
++                    { callbackError = "deferred portal pixel-pair context is stale or incomplete"; return false; }
++                    R4FloraDeferredPortalDecision decision;
++                    decision.context = &deferredContext;
++                    decision.shouldSkip = shouldSkipMainFloraVisualAfterCameraClip;
++                    decision.expectedExcludedIds = &excludedVisualIds;
++                    decision.compareExpectedSet = true;
++                    return impl->flora->DrawIntoActiveGBufferWithDeferredPortalDecision(
++                        callbackBackend, frozenView, decision, true, &sampledTelemetry,
++                        actuallySkipped, callbackError);
++                }
++                // Default-off full prepared-set path. The deferred branch above is
++                // scratch-only and compares decisions against this exact expected set.
+                 return impl->flora->DrawIntoActiveGBufferForPortalValidation(callbackBackend,
+                     frozenView, excludedVisualIds, sampledTelemetry, actuallySkipped, callbackError);
+             }
+@@ -7966,7 +8167,9 @@
+                 MainFloraPortalCandidateSet perFrameCandidates;
+                 double maskCpuMs = 0.0;
+                 bool qualified = false;
++                bool deferredAfterClipQualified = false;
+                 std::size_t portalSkipped = 0u;
++                MainFloraDeferredPortalContext deferredContext;
+                 if (impl->portalPerFrameEnabled)
+                 {
+                     const auto maskStart = std::chrono::steady_clock::now();
+@@ -7993,17 +8196,53 @@
+                             input.generation != 0u && impl->portalPopulationGeneration == input.generation &&
+                             impl->portalPopulationRecords == records.data() &&
+                             impl->portalPopulationCount == records.size();
++                        const bool deferredPopulationStored = impl->portalDeferredPopulationQualified &&
++                            populationComplete && input.generation != 0u &&
++                            impl->portalDeferredPopulationGeneration == input.generation &&
++                            impl->portalDeferredPopulationRecords == records.data() &&
++                            impl->portalDeferredPopulationCount == records.size() &&
++                            impl->portalDeferredRestByVisualId.size() == impl->portalCache.graph.visualNodes.size();
+                         if (populationComplete && matchingView && extentMatches)
+                         {
+-                            qualified = buildMainFloraPortalCandidateSet(impl->portalCache, input,
+-                                impl->portalPerFrameOutput, impl->scene.geometry,
+-                                impl->portalFloraShaderMaterials, records, floraView,
+-                                matchingView, motionFresh, environmentFresh, storedPopulation, perFrameCandidates);
+-                            if (qualified && impl->portalCachePopulation && !storedPopulation)
++                            if (impl->portalDeferAfterClip && impl->portalPerFrameSuppress)
+                             {
+-                                impl->portalPopulationGeneration = input.generation;
+-                                impl->portalPopulationRecords = records.data();
+-                                impl->portalPopulationCount = records.size();
++                                std::vector<const R4FloraRestRecord*> deferredLookup;
++                                qualified = buildMainFloraPortalCandidateSet(impl->portalCache, input,
++                                    impl->portalPerFrameOutput, impl->scene.geometry,
++                                    impl->portalFloraShaderMaterials, records, floraView,
++                                    matchingView, motionFresh, environmentFresh, deferredPopulationStored,
++                                    true, true, deferredPopulationStored ? nullptr : &deferredLookup, perFrameCandidates);
++                                if (qualified)
++                                {
++                                    if (!deferredPopulationStored)
++                                    {
++                                        impl->portalDeferredRestByVisualId = std::move(deferredLookup);
++                                        impl->portalDeferredPopulationQualified = true;
++                                        impl->portalDeferredPopulationGeneration = input.generation;
++                                        impl->portalDeferredPopulationRecords = records.data();
++                                        impl->portalDeferredPopulationCount = records.size();
++                                    }
++                                    deferredAfterClipQualified = prepareMainFloraDeferredPortalContext(
++                                        impl->portalCache, input, impl->portalPerFrameOutput,
++                                        impl->portalDeferredRestByVisualId, floraView,
++                                        motionFresh, environmentFresh, deferredContext);
++                                    if (!deferredAfterClipQualified)
++                                    { qualified = false; perFrameCandidates.reason = "deferred-frame-context-invalid"; }
++                                }
++                            }
++                            else
++                            {
++                                qualified = buildMainFloraPortalCandidateSet(impl->portalCache, input,
++                                    impl->portalPerFrameOutput, impl->scene.geometry,
++                                    impl->portalFloraShaderMaterials, records, floraView,
++                                    matchingView, motionFresh, environmentFresh, storedPopulation,
++                                    false, false, nullptr, perFrameCandidates);
++                                if (qualified && impl->portalCachePopulation && !storedPopulation)
++                                {
++                                    impl->portalPopulationGeneration = input.generation;
++                                    impl->portalPopulationRecords = records.data();
++                                    impl->portalPopulationCount = records.size();
++                                }
+                             }
+                         }
+                         else perFrameCandidates.reason = "frame-view-extent-or-population-mismatch";
+@@ -8013,29 +8252,49 @@
+                     maskCpuMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - maskStart).count();
+                 }
+-                const bool drawn = qualified && impl->portalPerFrameSuppress ?
+-                    impl->flora->DrawIntoActiveGBufferWithPortalMask(callbackBackend, floraView,
+-                        perFrameCandidates.excludedVisualIds, portalSkipped, callbackError) :
+-                    impl->flora->DrawIntoActiveGBuffer(callbackBackend, floraView, callbackError);
++                bool drawn = true;
++                if (qualified && impl->portalPerFrameSuppress && deferredAfterClipQualified)
++                {
++                    R4FloraDeferredPortalDecision decision;
++                    decision.context = &deferredContext;
++                    decision.shouldSkip = shouldSkipMainFloraVisualAfterCameraClip;
++                    drawn = impl->flora->DrawIntoActiveGBufferWithDeferredPortalDecision(
++                        callbackBackend, floraView, decision, false, nullptr, portalSkipped, callbackError);
++                }
++                else if (qualified && impl->portalPerFrameSuppress)
++                    drawn = impl->flora->DrawIntoActiveGBufferWithPortalMask(callbackBackend, floraView,
++                        perFrameCandidates.excludedVisualIds, portalSkipped, callbackError);
++                else
++                    drawn = impl->flora->DrawIntoActiveGBuffer(callbackBackend, floraView, callbackError);
+                 if (!drawn) return false;
+                 if (impl->portalPerFrameEnabled)
+                 {
+                     const auto& telemetry = impl->flora->LastTelemetry();
+                     if (impl->portalPerFrameLog)
+                         impl->portalPerFrameLog << callbackView.engineFrame << ',' << impl->portalPerFrameInput.generation << ','
+-                            << (impl->portalPerFrameSuppress ? "on" : "observe") << ',' << qualified << ','
++                            << (impl->portalPerFrameSuppress ? "on" : "observe") << ','
++                            << (telemetry.portalDeferredDecisionUsed ? "deferred_after_clip" : "full_set") << ',' << qualified << ','
+                             << impl->portalPerFrameOutput.startSector << ',' << impl->portalPerFrameOutput.frameCpuMs << ','
+                             << maskCpuMs << ',' << perFrameCandidates.excludedVisualIds.size() << ',' << portalSkipped << ','
+                             << telemetry.draws << ',' << telemetry.culledVisuals << ','
++                            << perFrameCandidates.rawPortalCandidates << ','
+                             << perFrameCandidates.windBoundUnknown << ',' << perFrameCandidates.ownerFrustumUnknown << ','
++                            << telemetry.portalCandidateDraws << ',' << telemetry.portalWindBoundCalls << ','
++                            << telemetry.portalOwnerRecordChecks << ',' << telemetry.portalOwnerFrustumTests << ','
++                            << telemetry.portalWindBoundUnknown << ',' << telemetry.portalOwnerFrustumUnknown << ','
++                            << telemetry.portalUnknownKeptVisible << ',' << telemetry.portalExpectedSetMismatches << ','
+                             << perFrameCandidates.reason << '\n';
+                     if (callbackView.engineFrame % 120u == 0u)
+                     {
+                         if (impl->portalPerFrameLog) impl->portalPerFrameLog.flush();
+-                        std::fprintf(stderr, "METAL_FLORA_PORTAL_PERFRAME frame=%u mode=%s qualified=%d graph_ms=%.6f mask_ms=%.6f excluded=%zu skipped=%zu draws=%zu reason=%s\n",
+-                            callbackView.engineFrame, impl->portalPerFrameSuppress ? "on" : "observe", int(qualified),
++                        std::fprintf(stderr, "METAL_FLORA_PORTAL_PERFRAME frame=%u mode=%s method=%s qualified=%d graph_ms=%.6f mask_ms=%.6f prepared_exclusions=%zu raw=%zu lazy_candidates=%zu wind_calls=%zu owner_records=%zu owner_tests=%zu skipped=%zu draws=%zu reason=%s\n",
++                            callbackView.engineFrame, impl->portalPerFrameSuppress ? "on" : "observe",
++                            telemetry.portalDeferredDecisionUsed ? "deferred_after_clip" : "full_set", int(qualified),
+                             impl->portalPerFrameOutput.frameCpuMs, maskCpuMs, perFrameCandidates.excludedVisualIds.size(),
+-                            portalSkipped, telemetry.draws, perFrameCandidates.reason.c_str());
++                            perFrameCandidates.rawPortalCandidates, telemetry.portalCandidateDraws,
++                            telemetry.portalWindBoundCalls, telemetry.portalOwnerRecordChecks,
++                            telemetry.portalOwnerFrustumTests, portalSkipped, telemetry.draws,
++                            perFrameCandidates.reason.c_str());
+                     }
+                 }
+                 const MetalR4FloraAdapter::Telemetry& flora = impl->flora->LastTelemetry();
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -48,6 +48,29 @@
+     float maxH = 0.0f;
+     float maxAbsOneMinusUvY = 0.0f;
+     std::string status;
++};
++
++// Scratch-only lazy portal decision seam. The caller owns a same-frame context
++// for the duration of the synchronous draw call; a missing or throwing
++// decision always keeps the source draw.
++struct R4FloraDeferredPortalStats
++{
++    std::size_t portalCandidateDraws = 0u;
++    std::size_t windBoundCalls = 0u;
++    std::size_t ownerRecordChecks = 0u;
++    std::size_t ownerFrustumTests = 0u;
++    std::size_t windBoundUnknown = 0u;
++    std::size_t ownerFrustumUnknown = 0u;
++    std::size_t unknownKeptVisible = 0u;
++    std::size_t expectedSetMismatches = 0u;
++};
++
++struct R4FloraDeferredPortalDecision
++{
++    void* context = nullptr;
++    bool (*shouldSkip)(void*, std::uint32_t, R4FloraDeferredPortalStats&) noexcept = nullptr;
++    const std::vector<std::uint32_t>* expectedExcludedIds = nullptr;
++    bool compareExpectedSet = false;
+ };
+ 
+ struct R4FloraViewState
+@@ -146,6 +169,15 @@
+         std::size_t shadowSubmittedVisuals = 0;
+         std::size_t shadowCulledVisuals = 0;
+         std::size_t shadowDraws = 0;
++        std::size_t portalCandidateDraws = 0;
++        std::size_t portalWindBoundCalls = 0;
++        std::size_t portalOwnerRecordChecks = 0;
++        std::size_t portalOwnerFrustumTests = 0;
++        std::size_t portalWindBoundUnknown = 0;
++        std::size_t portalOwnerFrustumUnknown = 0;
++        std::size_t portalUnknownKeptVisible = 0;
++        std::size_t portalExpectedSetMismatches = 0;
++        bool portalDeferredDecisionUsed = false;
+     };
+ 
+     MetalR4FloraAdapter();
+@@ -172,6 +204,10 @@
+     // Experimental default-off source-order mask; all shader/upload contracts remain identical.
+     bool DrawIntoActiveGBufferWithPortalMask(IR4Backend& backend, const R4FloraViewState& view,
+         const std::vector<std::uint32_t>& excludeVisualIds, std::size_t& actuallySkipped, std::string& error);
++    bool DrawIntoActiveGBufferWithDeferredPortalDecision(IR4Backend& backend,
++        const R4FloraViewState& view, const R4FloraDeferredPortalDecision& decision,
++        bool validationOnly, Telemetry* sampledTelemetry,
++        std::size_t& actuallySkipped, std::string& error);
+     bool DrawIntoActiveGBufferForValidation(IR4Backend& backend,
+         const R4FloraViewState& view, bool groupExactKeys,
+         Telemetry& sampledTelemetry, std::size_t& unusedGroups, std::string& error);
+@@ -202,7 +238,8 @@
+ private:
+     bool DrawIntoActiveGBufferCommon(IR4Backend& backend, const R4FloraViewState& view,
+         const std::vector<std::uint32_t>* excludeVisualIds, bool validationOnly,
+-        Telemetry* sampledTelemetry, std::size_t* actuallySkipped, std::string& error);
++        Telemetry* sampledTelemetry, std::size_t* actuallySkipped, std::string& error,
++        const R4FloraDeferredPortalDecision* deferredDecision = nullptr);
+     struct Impl;
+     std::unique_ptr<Impl> m_impl;
+     bool m_ready = false;
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -1074,6 +1074,28 @@
+         nullptr, &actuallySkipped, error);
+ }
+ 
++bool MetalR4FloraAdapter::DrawIntoActiveGBufferWithDeferredPortalDecision(IR4Backend& backend,
++    const R4FloraViewState& view, const R4FloraDeferredPortalDecision& decision,
++    const bool validationOnly, Telemetry* sampledTelemetry,
++    std::size_t& actuallySkipped, std::string& error)
++{
++    actuallySkipped = 0u;
++    if (!decision.shouldSkip || !decision.context ||
++        (decision.compareExpectedSet && !decision.expectedExcludedIds))
++    {
++        if (validationOnly)
++        { error = "deferred portal decision context is incomplete"; return false; }
++        return DrawIntoActiveGBuffer(backend, view, error);
++    }
++    if (decision.compareExpectedSet &&
++        (!std::is_sorted(decision.expectedExcludedIds->begin(), decision.expectedExcludedIds->end()) ||
++            std::adjacent_find(decision.expectedExcludedIds->begin(), decision.expectedExcludedIds->end()) !=
++                decision.expectedExcludedIds->end()))
++    { error = "deferred portal expected IDs must be sorted and unique"; return false; }
++    return DrawIntoActiveGBufferCommon(backend, view, nullptr, validationOnly,
++        sampledTelemetry, &actuallySkipped, error, &decision);
++}
++
+ bool MetalR4FloraAdapter::DrawIntoActiveGBufferForValidation(IR4Backend& backend,
+     const R4FloraViewState& view, const bool groupExactKeys,
+     Telemetry& sampledTelemetry, std::size_t& unusedGroups, std::string& error)
+@@ -1108,7 +1130,8 @@
+ bool MetalR4FloraAdapter::DrawIntoActiveGBufferCommon(IR4Backend& backend,
+     const R4FloraViewState& view, const std::vector<std::uint32_t>* excludeVisualIds,
+     const bool validationOnly, Telemetry* sampledTelemetry,
+-    std::size_t* actuallySkipped, std::string& error)
++    std::size_t* actuallySkipped, std::string& error,
++    const R4FloraDeferredPortalDecision* deferredDecision)
+ {
+     if (!m_ready || !view.valid)
+         return true;
+@@ -1141,6 +1164,13 @@
+         m_telemetry.shadowCulledVisuals = 0u;
+         m_telemetry.shadowDraws = 0u;
+     }
++    m_telemetry.portalCandidateDraws = 0u;
++    m_telemetry.portalWindBoundCalls = 0u;
++    m_telemetry.portalOwnerRecordChecks = 0u;
++    m_telemetry.portalOwnerFrustumTests = 0u;
++    m_telemetry.portalUnknownKeptVisible = 0u;
++    m_telemetry.portalExpectedSetMismatches = 0u;
++    m_telemetry.portalDeferredDecisionUsed = deferredDecision != nullptr;
+     if (!view.staticGlobals)
+     {
+         error = "flora requires the live scene static_globals buffer";
+@@ -1186,6 +1216,43 @@
+             if (validationRestore) ++validationRestore->skipped;
+             else if (actuallySkipped) ++*actuallySkipped;
+             continue;
++        }
++        if (deferredDecision)
++        {
++            R4FloraDeferredPortalStats stats;
++            bool shouldSkip = false;
++            try
++            {
++                shouldSkip = deferredDecision->shouldSkip(
++                    deferredDecision->context, draw.visualId, stats);
++            }
++            catch (...)
++            {
++                ++stats.unknownKeptVisible;
++                shouldSkip = false;
++            }
++            if (deferredDecision->compareExpectedSet)
++            {
++                const bool expected = std::binary_search(
++                    deferredDecision->expectedExcludedIds->begin(),
++                    deferredDecision->expectedExcludedIds->end(), draw.visualId);
++                if (expected != shouldSkip)
++                    ++stats.expectedSetMismatches;
++            }
++            m_telemetry.portalCandidateDraws += stats.portalCandidateDraws;
++            m_telemetry.portalWindBoundCalls += stats.windBoundCalls;
++            m_telemetry.portalOwnerRecordChecks += stats.ownerRecordChecks;
++            m_telemetry.portalOwnerFrustumTests += stats.ownerFrustumTests;
++            m_telemetry.portalWindBoundUnknown += stats.windBoundUnknown;
++            m_telemetry.portalOwnerFrustumUnknown += stats.ownerFrustumUnknown;
++            m_telemetry.portalUnknownKeptVisible += stats.unknownKeptVisible;
++            m_telemetry.portalExpectedSetMismatches += stats.expectedSetMismatches;
++            if (shouldSkip)
++            {
++                if (validationRestore) ++validationRestore->skipped;
++                else if (actuallySkipped) ++*actuallySkipped;
++                continue;
++            }
+         }
+         std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
+         auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
+@@ -1328,6 +1395,11 @@
+                 (writeMainFloraIds(captureConfig, view, captured, m_telemetry.culledVisuals) ?
+                     "encode_complete" : "write_failed"),
+             m_telemetry.submittedVisuals, m_telemetry.culledVisuals);
++    if (validationOnly && deferredDecision && m_telemetry.portalExpectedSetMismatches != 0u)
++    {
++        error = "deferred portal actual camera-survivor ID set differs from full helper";
++        return false;
++    }
+     return true;
+ }
+ 

@@ -1,0 +1,112 @@
+--- a/FloraWindEnvelope.h
++++ b/FloraWindEnvelopePrepared.h
+@@ -8,7 +8,7 @@
+ #include <limits>
+ #include <string>
+ 
+-namespace flora_wind
++namespace flora_wind_prepared
+ {
+ struct Vec3 { double x = 0.0, y = 0.0, z = 0.0; };
+ struct Vec4 { float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f; };
+@@ -36,6 +36,50 @@
+     std::array<Vec4, 32> previousBenders{};
+ };
+ 
++inline bool finite4(const Vec4& v);
++inline double saturate(double v);
++
++// Owns one immutable frame snapshot so no pointer can outlive its source.
++// A cached motion error is reported only after each Rest's original validation
++// point, preserving compute(Rest, Motion)'s per-record failure precedence.
++struct PreparedMotion
++{
++    Motion motion{};
++    const char* validationError = nullptr;
++    double speed = 0.0;
++    double wSpeed = 0.0;
++    double tWaveAbs = 0.0;
++    double trunkZ = 0.0;
++};
++
++inline PreparedMotion prepareMotion(const Motion& motion)
++{
++    PreparedMotion prepared;
++    prepared.motion = motion;
++    if (!motion.valid) { prepared.validationError = "invalid_motion_snapshot"; return prepared; }
++    for (float v : motion.windParams)
++        if (!std::isfinite(v)) { prepared.validationError = "nonfinite_wind_params"; return prepared; }
++    for (float v : motion.treeSetup)
++        if (!std::isfinite(v)) { prepared.validationError = "nonfinite_tree_setup"; return prepared; }
++    for (float v : motion.benderSetup)
++        if (!std::isfinite(v)) { prepared.validationError = "nonfinite_bender_setup"; return prepared; }
++    for (float v : motion.animationCurrent)
++        if (!std::isfinite(v)) { prepared.validationError = "nonfinite_current_animation"; return prepared; }
++    for (float v : motion.animationPrevious)
++        if (!std::isfinite(v)) { prepared.validationError = "nonfinite_previous_animation"; return prepared; }
++    for (const Vec4& v : motion.currentBenders)
++        if (!finite4(v)) { prepared.validationError = "nonfinite_current_bender"; return prepared; }
++    for (const Vec4& v : motion.previousBenders)
++        if (!finite4(v)) { prepared.validationError = "nonfinite_previous_bender"; return prepared; }
++
++    prepared.speed = std::max(static_cast<double>(motion.treeSetup[3]),
++        saturate(static_cast<double>(motion.windParams[1]) * 0.001));
++    prepared.wSpeed = saturate(std::sqrt(prepared.speed * 1.66) * 1.5);
++    prepared.tWaveAbs = 1.5 * std::abs(static_cast<double>(motion.treeSetup[2])) * (1.0 + 2e-6);
++    prepared.trunkZ = saturate((1.0 + prepared.tWaveAbs) * 0.5);
++    return prepared;
++}
++
+ struct Bound
+ {
+     bool known = false;
+@@ -149,8 +193,9 @@
+     return true;
+ }
+ 
+-inline Bound compute(const Rest& rest, const Motion& motion)
++inline Bound compute(const Rest& rest, const PreparedMotion& prepared)
+ {
++    const Motion& motion = prepared.motion;
+     Bound out;
+     const auto fail = [&](const char* why) { out.reason = why; return out; };
+     if (!motion.valid) return fail("invalid_motion_snapshot");
+@@ -158,20 +203,12 @@
+         !std::isfinite(rest.radius) || rest.radius <= 0.0 || !std::isfinite(rest.uvAbsMax) ||
+         rest.uvAbsMax < 0.0 || !std::isfinite(rest.hMin) || !std::isfinite(rest.hMax) || rest.hMin > rest.hMax)
+         return fail("invalid_rest_extrema");
+-    for (float v : motion.windParams) if (!std::isfinite(v)) return fail("nonfinite_wind_params");
+-    for (float v : motion.treeSetup) if (!std::isfinite(v)) return fail("nonfinite_tree_setup");
+-    for (float v : motion.benderSetup) if (!std::isfinite(v)) return fail("nonfinite_bender_setup");
+-    for (float v : motion.animationCurrent) if (!std::isfinite(v)) return fail("nonfinite_current_animation");
+-    for (float v : motion.animationPrevious) if (!std::isfinite(v)) return fail("nonfinite_previous_animation");
+-    for (const Vec4& v : motion.currentBenders) if (!finite4(v)) return fail("nonfinite_current_bender");
+-    for (const Vec4& v : motion.previousBenders) if (!finite4(v)) return fail("nonfinite_previous_bender");
+-
+-    const double speed = std::max(static_cast<double>(motion.treeSetup[3]),
+-        saturate(static_cast<double>(motion.windParams[1]) * 0.001));
++    if (prepared.validationError) return fail(prepared.validationError);
++    const double speed = prepared.speed;
++    const double wSpeed = prepared.wSpeed;
++    const double tWaveAbs = prepared.tWaveAbs;
++    const double trunkZ = prepared.trunkZ;
+     if (speed < 0.0) return fail("negative_wind_speed");
+-    const double wSpeed = saturate(std::sqrt(speed * 1.66) * 1.5);
+-    const double tWaveAbs = 1.5 * std::abs(static_cast<double>(motion.treeSetup[2])) * (1.0 + 2e-6);
+-    const double trunkZ = saturate((1.0 + tWaveAbs) * 0.5);
+     double wind = 0.0;
+     if (!trunkBound(rest, wSpeed, tWaveAbs, wind)) return fail("trunk_wind_bound_unknown");
+     if (rest.material == Material::Leaf)
+@@ -210,4 +247,11 @@
+     out.known = true;
+     return out;
+ }
+-} // namespace flora_wind
++
++// Compatibility overload. Frame loops should call prepareMotion once, then
++// reuse the value overload above for every visual.
++inline Bound compute(const Rest& rest, const Motion& motion)
++{
++    return compute(rest, prepareMotion(motion));
++}
++} // namespace flora_wind_prepared

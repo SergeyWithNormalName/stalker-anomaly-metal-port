@@ -207,6 +207,11 @@ void CRender::create()
 	{
 		m_MSAASample = -1;
 		o.smapsize = 2048;
+        // CPU rain simulation/capture uses the same installed-shader selector
+        // as Windows. Metal skips hardware creation, not this content policy.
+        string_path rainShader;
+        o.ssfx_rain = FS.exist(rainShader, "$game_shaders$", "r3\\effects_rain_splash", ".ps") ? 1 : 0;
+        Msg("* METAL_SSFX_RAIN_POLICY installed=%u", unsigned(o.ssfx_rain));
 		m_bMakeAsyncSS = false;
 		Models = xr_new<CModelPool>(true);
 		PSLibrary.OnCreate();

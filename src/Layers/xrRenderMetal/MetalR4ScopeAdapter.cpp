@@ -56,19 +56,6 @@ bool uploadDds(IR4Resources& resources, const xray::metal::R4DdsTexture& dds,
     return true;
 }
 
-bool updateUniform(IR4Resources& resources, std::shared_ptr<IR4Buffer>& buffer,
-    std::size_t size, const void* data, const char* label, std::string& error)
-{
-    if (!buffer)
-    {
-        const R4BufferDesc descriptor{
-            size, R4ResourceStorage::Shared, R4BufferUsage::Uniform, label};
-        buffer = resources.CreateBuffer(descriptor, data, size, error);
-        return bool(buffer);
-    }
-    return resources.UpdateBuffer(buffer, 0u, data, size, error);
-}
-
 } // namespace
 
 struct MetalR4ScopeAdapter::Impl
@@ -82,11 +69,11 @@ struct MetalR4ScopeAdapter::Impl
 
     struct FrameSlot
     {
-        std::shared_ptr<IR4Buffer> vertices;
-        std::shared_ptr<IR4Buffer> vertexGlobals;
-        std::shared_ptr<IR4Buffer> transforms;
-        std::shared_ptr<IR4Buffer> hudFragmentGlobals;
-        std::shared_ptr<IR4Buffer> scopeFragmentGlobals;
+        R4FrameBufferSlice vertices;
+        R4FrameBufferSlice vertexGlobals;
+        R4FrameBufferSlice transforms;
+        R4FrameBufferSlice hudFragmentGlobals;
+        R4FrameBufferSlice scopeFragmentGlobals;
     };
 
     Options options;
@@ -347,14 +334,8 @@ bool MetalR4ScopeAdapter::Prewarm(IR4Backend& backend,
             Impl::FrameSlot& buffers = m_impl->frameSlots[instanceKey];
             const std::size_t vertexBytes =
                 vertices.size() * sizeof(R4DynamicWorldSkinnedVertex);
-            if (!buffers.vertices)
-            {
-                const R4BufferDesc descriptor{vertexBytes, R4ResourceStorage::Private,
-                    R4BufferUsage::Vertex, "R4 3DSS CPU-skinned SKIN_0"};
-                buffers.vertices = resources.CreateBuffer(descriptor, nullptr, 0u, localError);
-            }
-            if (!buffers.vertices || !resources.UpdateBuffer(buffers.vertices, 0u,
-                    vertices.data(), vertexBytes, localError))
+            if (!backend.UploadFrameData(vertices.data(), vertexBytes, 16u,
+                    buffers.vertices, localError))
             {
                 ++m_telemetry.rejected;
                 continue;
@@ -406,16 +387,14 @@ bool MetalR4ScopeAdapter::Prewarm(IR4Backend& backend,
             for (std::size_t value = 0u; value < scopeValues.size(); ++value)
                 std::memcpy(scopeFragmentGlobals.data() + 160u + value * 16u,
                     scopeValues[value].data(), sizeof(scopeValues[value]));
-            if (!updateUniform(resources, buffers.vertexGlobals, vertexGlobals.size(),
-                    vertexGlobals.data(), "R4 3DSS vertex globals", localError) ||
-                !updateUniform(resources, buffers.transforms, transforms.size(),
-                    transforms.data(), "R4 3DSS dynamic transforms", localError) ||
-                !updateUniform(resources, buffers.hudFragmentGlobals,
-                    hudFragmentGlobals.size(), hudFragmentGlobals.data(),
-                    "R4 3DSS back globals", localError) ||
-                !updateUniform(resources, buffers.scopeFragmentGlobals,
-                    scopeFragmentGlobals.size(), scopeFragmentGlobals.data(),
-                    "R4 3DSS precise globals", localError))
+            if (!backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u,
+                    buffers.vertexGlobals, localError) ||
+                !backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                    buffers.transforms, localError) ||
+                !backend.UploadFrameData(hudFragmentGlobals.data(), hudFragmentGlobals.size(), 256u,
+                    buffers.hudFragmentGlobals, localError) ||
+                !backend.UploadFrameData(scopeFragmentGlobals.data(), scopeFragmentGlobals.size(), 256u,
+                    buffers.scopeFragmentGlobals, localError))
             {
                 ++m_telemetry.rejected;
                 continue;
@@ -462,16 +441,16 @@ bool MetalR4ScopeAdapter::DrawRole(IR4Backend& backend,
             {
                 vertex.tlabSize = 24u;
                 vertex.resources = {{R4MscResourceType::ConstantBuffer, 0u,
-                    buffers.transforms, 0u, kTransformsSize}};
+                    buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize}};
             }
             else
             {
                 vertex.tlabSize = 48u;
                 vertex.resources = {
-                    {R4MscResourceType::ConstantBuffer, 0u, buffers.vertexGlobals,
-                        0u, kVertexGlobalsSize},
-                    {R4MscResourceType::ConstantBuffer, 24u, buffers.transforms,
-                        0u, kTransformsSize}};
+                    {R4MscResourceType::ConstantBuffer, 0u, buffers.vertexGlobals.buffer,
+                        buffers.vertexGlobals.offset, kVertexGlobalsSize},
+                    {R4MscResourceType::ConstantBuffer, 24u, buffers.transforms.buffer,
+                        buffers.transforms.offset, kTransformsSize}};
             }
             R4MscStageBindings fragment;
             fragment.stage = R4ShaderStage::Fragment;
@@ -481,9 +460,9 @@ bool MetalR4ScopeAdapter::DrawRole(IR4Backend& backend,
                 fragment.resources = {
                     {R4MscResourceType::Texture, 0u, {}, 0u, 0u, cached.base},
                     {R4MscResourceType::ConstantBuffer, 24u,
-                        buffers.hudFragmentGlobals, 0u, kHudFragmentGlobalsSize},
+                        buffers.hudFragmentGlobals.buffer, buffers.hudFragmentGlobals.offset, kHudFragmentGlobalsSize},
                     {R4MscResourceType::ConstantBuffer, 48u,
-                        buffers.transforms, 0u, kTransformsSize},
+                        buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize},
                     {R4MscResourceType::Sampler, 72u, {}, 0u, 0u, {},
                         m_impl->baseSampler}};
             }
@@ -519,9 +498,9 @@ bool MetalR4ScopeAdapter::DrawRole(IR4Backend& backend,
                     {R4MscResourceType::Texture, 168u, {}, 0u, 0u, m_impl->heatMap},
                     {R4MscResourceType::Texture, 192u, {}, 0u, 0u, m_impl->reflection},
                     {R4MscResourceType::ConstantBuffer, 216u,
-                        buffers.scopeFragmentGlobals, 0u, kScopeFragmentGlobalsSize},
+                        buffers.scopeFragmentGlobals.buffer, buffers.scopeFragmentGlobals.offset, kScopeFragmentGlobalsSize},
                     {R4MscResourceType::ConstantBuffer, 240u,
-                        buffers.transforms, 0u, kTransformsSize},
+                        buffers.transforms.buffer, buffers.transforms.offset, kTransformsSize},
                     {R4MscResourceType::ConstantBuffer, 264u,
                         inputs->staticGlobals, 0u, kStaticGlobalsSize},
                     {R4MscResourceType::Sampler, 288u, {}, 0u, 0u, {},
@@ -539,7 +518,7 @@ bool MetalR4ScopeAdapter::DrawRole(IR4Backend& backend,
             if (!backend.BindGraphicsPipeline(pipeline, error) ||
                 !backend.BindMscResources(vertex, error) ||
                 !backend.BindMscResources(fragment, error) ||
-                !backend.BindVertexBuffer(6u, buffers.vertices, 0u, error) ||
+                !backend.BindVertexBuffer(6u, buffers.vertices.buffer, buffers.vertices.offset, error) ||
                 !backend.SetStencilReference(2u, error) ||
                 !backend.DrawIndexed(draw, error))
                 return false;

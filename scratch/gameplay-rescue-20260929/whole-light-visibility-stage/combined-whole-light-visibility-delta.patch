@@ -1,0 +1,1703 @@
+--- a/src/Layers/xrRenderMetal/IR4Backend.h
++++ b/src/Layers/xrRenderMetal/IR4Backend.h
+@@ -174,6 +174,27 @@
+     std::uint32_t height = 0;
+ };
+ 
++enum class R4WholeLightVisibilityGroupKind : std::uint8_t
++{
++    SingleRecord,
++    OmniParent,
++};
++
++// Metadata for one actual local-light accumulation draw. The native backend
++// may attach an asynchronous depth/stencil visibility count to this draw.
++// Results describe deferred receiver samples only and never grant culling.
++struct R4WholeLightVisibilitySample
++{
++    std::uint32_t engineFrame = 0u;
++    std::int32_t batchId = -1;
++    std::uint64_t lightId = 0u;
++    std::uint64_t parentLightId = 0u;
++    std::uint32_t face = 0u;
++    R4WholeLightVisibilityGroupKind groupKind =
++        R4WholeLightVisibilityGroupKind::SingleRecord;
++    std::uint8_t expectedFaceCount = 1u;
++};
++
+ struct R4RenderPassDesc
+ {
+     const char* label = nullptr;
+@@ -185,6 +206,9 @@
+     R4Viewport viewport;
+     bool hasScissor = false;
+     R4ScissorRect scissor;
++    // Enables a bounded, backend-owned visibility-result buffer for this pass.
++    // Default false keeps every existing pass on its current path.
++    bool enableVisibilityResultCounts = false;
+ };
+ 
+ enum class R4ShaderStage
+@@ -653,6 +677,14 @@
+         std::string& error) = 0;
+     virtual bool SetStencilReference(std::uint32_t reference, std::string& error) = 0;
+     virtual bool DrawIndexed(const R4IndexedDrawDesc& descriptor, std::string& error) = 0;
++    // Draws normally and optionally records a depth/stencil visibility count.
++    // Unsupported backends preserve output while reporting no receipt.
++    virtual bool DrawIndexedWithVisibility(const R4IndexedDrawDesc& descriptor,
++        const R4WholeLightVisibilitySample&, bool& resultEncoded, std::string& error)
++    {
++        resultEncoded = false;
++        return DrawIndexed(descriptor, error);
++    }
+     virtual bool SubmitEngineWorldRenderables(
+ 		const std::vector<R4EngineWorldRenderable>& renderables,
+ 		std::uint32_t engineFrame,
+@@ -699,6 +731,7 @@
+ // the pre-submit Shared-buffer overwrite is reproduced.
+ bool RunMetalR4FrameUploadGpuProbe(bool oldPath, std::string& error);
+ bool RunMetalR4ComputeSkinBackendGpuProbe(std::string& error);
++bool RunMetalR4WholeLightVisibilityGpuProbe(std::string& error);
+ // Small offscreen regression for abort/replay ownership and bounded recovery.
+ bool RunMetalR4PrivateUploadRecoveryProbe(std::string& error);
+ 
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -45,6 +45,7 @@
+ #include "R4ComputeSkinFoundation.h"
+ #include "R4ComputeSkinMetal.h"
+ #include "R4ComputeSkinSource.h"
++#include "R4WholeLightVisibilityLedger.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -76,6 +77,9 @@
+ constexpr std::size_t MaxFramesInFlight = 3;
+ constexpr std::size_t MaxPrivateUploadRecoveryFailures = 3;
+ constexpr std::size_t MaxComputeSkinOracleBytesPerFrame = 4u * 1024u * 1024u;
++constexpr std::size_t WholeLightVisibilityBufferBytes =
++    xray::metal::R4WholeLightVisibilityMaxSlots * sizeof(std::uint64_t);
++constexpr std::uint32_t MaxWholeLightVisibilityAcquisitions = 12u;
+ 
+ enum class ComputeSkinOracleOutcome
+ {
+@@ -164,6 +168,76 @@
+         static_cast<unsigned long long>(request.poseHash),
+         static_cast<unsigned long long>(request.outputWriteSerial), request.expectedBytes.size(),
+         reason, xray::metal::R4ComputeSkinSourceSha256);
++}
++
++void reportWholeLightVisibilityCompletion(
++    const std::vector<xray::metal::R4WholeLightVisibilityRecord>& records,
++    id<MTLBuffer> resultBuffer, const bool ledgerOverflow,
++    const std::uint64_t serial, const std::uint64_t acquireEpoch,
++    const MTLCommandBufferStatus status)
++{
++    if (records.empty() && !ledgerOverflow)
++        return;
++    const bool completed = status == MTLCommandBufferStatusCompleted && !ledgerOverflow &&
++        resultBuffer && resultBuffer.contents && resultBuffer.length >= WholeLightVisibilityBufferBytes;
++    const auto* values = completed ? static_cast<const std::uint64_t*>(resultBuffer.contents) : nullptr;
++    const auto groups = xray::metal::R4ClassifyWholeLightVisibility(records, values,
++        resultBuffer ? resultBuffer.length / sizeof(std::uint64_t) : 0u, completed);
++    const bool allGroupsComplete = completed && !groups.empty() &&
++        std::all_of(groups.begin(), groups.end(), [](const auto& group) { return group.complete; });
++    if (ledgerOverflow)
++        std::fprintf(stderr,
++            "METAL_WHOLE_LIGHT_VISIBILITY status=INVALID reason=capacity-overflow submitted_serial=%llu acquire_epoch=%llu\n",
++            static_cast<unsigned long long>(serial), static_cast<unsigned long long>(acquireEpoch));
++    for (const auto& group : groups)
++    {
++        const bool valid = completed && group.complete;
++        if (valid)
++        {
++            const bool zero = group.passedSamples == 0u;
++            std::fprintf(stderr,
++                "METAL_WHOLE_LIGHT_VISIBILITY status=complete submitted_serial=%llu acquire_epoch=%llu "
++                "engine_frame=%u group_kind=%s group_id=%llu expected_faces=%u "
++                "deferred_receiver_samples=%llu zero_deferred_receiver_samples=%s\n",
++                static_cast<unsigned long long>(serial), static_cast<unsigned long long>(acquireEpoch),
++                group.engineFrame,
++                group.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
++                static_cast<unsigned long long>(group.groupId), group.expectedFaceCount,
++                static_cast<unsigned long long>(group.passedSamples), zero ? "true" : "false");
++        }
++        else
++        {
++            std::fprintf(stderr,
++                "METAL_WHOLE_LIGHT_VISIBILITY status=invalid submitted_serial=%llu acquire_epoch=%llu "
++                "engine_frame=%u group_kind=%s group_id=%llu expected_faces=%u "
++                "deferred_receiver_samples=NA zero_deferred_receiver_samples=NA reason=%s\n",
++                static_cast<unsigned long long>(serial), static_cast<unsigned long long>(acquireEpoch),
++                group.engineFrame,
++                group.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
++                static_cast<unsigned long long>(group.groupId), group.expectedFaceCount,
++                status != MTLCommandBufferStatusCompleted ? "command-buffer-not-completed" :
++                    (ledgerOverflow ? "capacity-overflow" : "missing-duplicate-or-invalid-face"));
++        }
++    }
++    for (const auto& record : records)
++    {
++        const auto& sample = record.sample;
++        const bool hasValue = allGroupsComplete && record.encoded &&
++            xray::metal::R4WholeLightVisibilitySampleValid(sample) && values &&
++            record.slot < resultBuffer.length / sizeof(std::uint64_t) &&
++            record.slot < xray::metal::R4WholeLightVisibilityMaxSlots;
++        const std::string sampleValue = hasValue ? std::to_string(values[record.slot]) : "NA";
++        std::fprintf(stderr,
++            "METAL_WHOLE_LIGHT_VISIBILITY_FACE status=%s submitted_serial=%llu acquire_epoch=%llu "
++            "engine_frame=%u batch_id=%d light_id=%llu parent_light_id=%llu face=%u "
++            "group_kind=%s expected_faces=%u deferred_receiver_samples=%s\n",
++            hasValue ? "VALID" : "INVALID", static_cast<unsigned long long>(serial),
++            static_cast<unsigned long long>(acquireEpoch), sample.engineFrame, sample.batchId,
++            static_cast<unsigned long long>(sample.lightId),
++            static_cast<unsigned long long>(sample.parentLightId), sample.face,
++            sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
++            sample.expectedFaceCount, sampleValue.c_str());
++    }
+ }
+ 
+ static std::size_t GetConfiguredFramesInFlight()
+@@ -1056,12 +1130,17 @@
+     ~MetalR4Backend() override { Shutdown(); }
+     static bool ProbePrivateUploadRecovery(std::string& error);
+     static bool ProbeComputeSkinBackendGpu(std::string& error);
++    static bool ProbeWholeLightVisibilityGpu(std::string& error);
+ 
+     bool Initialize(SDL_Window* window, const std::uint32_t preferredWidth,
+         const std::uint32_t preferredHeight, std::string& error) override
+     {
+         const char* computeSkinEnv = std::getenv("XRAY_METAL_COMPUTE_SKIN");
+         m_computeSkinEnabled = computeSkinEnv && std::strcmp(computeSkinEnv, "1") == 0;
++        const char* visibilityEnv = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
++        m_wholeLightVisibilityEnabled = visibilityEnv && std::strcmp(visibilityEnv, "1") == 0;
++        m_wholeLightVisibilitySelectedAcquisitions = 0u;
++        m_wholeLightVisibilityCapNoticeEmitted = false;
+         if (m_window || !window)
+         {
+             error = m_window ? "Metal R4 backend is already initialized" : "SDL window is null";
+@@ -1439,6 +1518,56 @@
+         }
+ 
+         MTLRenderPassDescriptor* descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
++        if (pass.enableVisibilityResultCounts && m_wholeLightVisibilityEnabled &&
++            !context.visibilityAdmissionResolved)
++        {
++            context.visibilityAdmissionResolved = true;
++            if (m_wholeLightVisibilitySelectedAcquisitions < MaxWholeLightVisibilityAcquisitions)
++            {
++                ++m_wholeLightVisibilitySelectedAcquisitions;
++                context.visibilityAdmissionGranted = true;
++                try
++                {
++                    context.visibilityRecords.reserve(xray::metal::R4WholeLightVisibilityMaxSlots);
++                }
++                catch (...)
++                {
++                    context.visibilityAdmissionGranted = false;
++                    context.visibilityLedgerOverflow = true;
++                }
++                if (context.visibilityAdmissionGranted)
++                {
++                    if (!context.visibilityResultBuffer)
++                        context.visibilityResultBuffer = [m_device newBufferWithLength:WholeLightVisibilityBufferBytes
++                            options:MTLResourceStorageModeShared];
++                    if (context.visibilityResultBuffer && context.visibilityResultBuffer.contents)
++                    {
++                        // Reset exactly once for this acquired context before its first query pass.
++                        std::memset(context.visibilityResultBuffer.contents, 0, WholeLightVisibilityBufferBytes);
++                        context.visibilityBufferReset = true;
++                    }
++                    else
++                    {
++                        context.visibilityAdmissionGranted = false;
++                        context.visibilityLedgerOverflow = true;
++                    }
++                }
++            }
++            else
++            {
++                context.visibilityDeniedByCap = true;
++                if (!m_wholeLightVisibilityCapNoticeEmitted)
++                {
++                    m_wholeLightVisibilityCapNoticeEmitted = true;
++                    std::fprintf(stderr,
++                        "METAL_WHOLE_LIGHT_VISIBILITY status=SKIPPED reason=12-acquisition-cap\n");
++                }
++            }
++        }
++        if (pass.enableVisibilityResultCounts && m_wholeLightVisibilityEnabled &&
++            context.visibilityAdmissionGranted &&
++            context.visibilityBufferReset && context.visibilityResultBuffer)
++            descriptor.visibilityResultBuffer = context.visibilityResultBuffer;
+         if (pass.colorAttachments.size() > 8 ||
+             (pass.useDrawable && !pass.colorAttachments.empty()))
+         {
+@@ -2276,6 +2405,10 @@
+         id<MTLBuffer> thumbnailBuffer = context.thumbnailBuffer;
+         const std::shared_ptr<ComputeSkinOracleReceipt> computeSkinOracleReceipt =
+             std::move(context.computeSkinOracleReceipt);
++        const auto visibilityRecords = std::move(context.visibilityRecords);
++        const id<MTLBuffer> visibilityResultBuffer = context.visibilityResultBuffer;
++        const bool visibilityLedgerOverflow = context.visibilityLedgerOverflow;
++        const std::uint64_t visibilityAcquireEpoch = context.acquireEpoch;
+         id<CAMetalDrawable> e01Drawable = e01 ? context.drawable : nil;
+         if (e01 && m_e01Presentation && m_e01Presentation->file)
+         {
+@@ -2366,6 +2499,8 @@
+                 if (computeSkinOracleReceipt)
+                     finishComputeSkinOracleReceipt(computeSkinOracleReceipt,
+                         commandBuffer.status, serial, false);
++                reportWholeLightVisibilityCompletion(visibilityRecords, visibilityResultBuffer,
++                    visibilityLedgerOverflow, serial, visibilityAcquireEpoch, commandBuffer.status);
+                 std::uint64_t observed = completedSerial->load(std::memory_order_relaxed);
+                 while (observed < serial &&
+                        !completedSerial->compare_exchange_weak(
+@@ -2998,6 +3133,82 @@
+         return true;
+     }
+ 
++    bool DrawIndexedWithVisibility(const R4IndexedDrawDesc& descriptor,
++        const R4WholeLightVisibilitySample& sample, bool& resultEncoded,
++        std::string& error) override
++    {
++        resultEncoded = false;
++        FrameContext* context = activeRenderContext(error);
++        if (!context)
++            return false;
++        if (!m_wholeLightVisibilityEnabled || !context->activePass.enableVisibilityResultCounts)
++            return DrawIndexed(descriptor, error);
++        if (!context->visibilityAdmissionResolved || context->visibilityDeniedByCap)
++            return DrawIndexed(descriptor, error);
++        if (!context->visibilityAdmissionGranted || !context->visibilityBufferReset ||
++            !context->visibilityResultBuffer)
++        {
++            context->visibilityLedgerOverflow = true;
++            return DrawIndexed(descriptor, error);
++        }
++
++        auto recordInvalid = [&]() {
++            context->visibilityLedgerOverflow = true;
++            return DrawIndexed(descriptor, error);
++        };
++        if (context->visibilityRecords.size() >= xray::metal::R4WholeLightVisibilityMaxSlots ||
++            !xray::metal::R4WholeLightVisibilitySampleValid(sample))
++            return recordInvalid();
++
++        const std::uint64_t groupKey = sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ?
++            sample.parentLightId : sample.lightId;
++        std::array<std::pair<R4WholeLightVisibilityGroupKind, std::uint64_t>,
++            xray::metal::R4WholeLightVisibilityMaxGroups> seenGroups{};
++        std::size_t seenGroupCount = 0u;
++        bool foundGroup = false;
++        for (const auto& existing : context->visibilityRecords)
++        {
++            const auto& prior = existing.sample;
++            const std::uint64_t priorKey = prior.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ?
++                prior.parentLightId : prior.lightId;
++            const auto key = std::make_pair(prior.groupKind, priorKey);
++            if (std::find(seenGroups.begin(), seenGroups.begin() + seenGroupCount, key) ==
++                seenGroups.begin() + seenGroupCount)
++            {
++                if (seenGroupCount < seenGroups.size())
++                    seenGroups[seenGroupCount++] = key;
++                else
++                    return recordInvalid();
++            }
++            if (priorKey == groupKey && prior.groupKind == sample.groupKind)
++                foundGroup = true;
++        }
++        if (!foundGroup && seenGroupCount >= xray::metal::R4WholeLightVisibilityMaxGroups)
++            return recordInvalid();
++
++        const std::uint32_t slot = static_cast<std::uint32_t>(context->visibilityRecords.size());
++        try
++        {
++            context->visibilityRecords.push_back({sample, slot, false});
++        }
++        catch (...)
++        {
++            // Allocation failure is an observation miss. Leave the draw on the
++            // normal path and ensure this acquisition can never yield a zero.
++            context->visibilityLedgerOverflow = true;
++            return DrawIndexed(descriptor, error);
++        }
++        [context->encoder setVisibilityResultMode:MTLVisibilityResultModeCounting
++            offset:static_cast<NSUInteger>(slot) * sizeof(std::uint64_t)];
++        const bool drawn = DrawIndexed(descriptor, error);
++        [context->encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
++        if (!drawn)
++            return false;
++        context->visibilityRecords.back().encoded = true;
++        resultEncoded = true;
++        return true;
++    }
++
+     bool SubmitEngineWorldRenderables(
+         const std::vector<R4EngineWorldRenderable>& renderables,
+         std::uint32_t engineFrame,
+@@ -3686,6 +3897,13 @@
+             context.retainedOwners.clear();
+             context.indirectReads.clear();
+             context.computeSkinOracleReceipt.reset();
++            context.visibilityRecords.clear();
++            context.visibilityResultBuffer = nil;
++            context.visibilityBufferReset = false;
++            context.visibilityAdmissionResolved = false;
++            context.visibilityAdmissionGranted = false;
++            context.visibilityDeniedByCap = false;
++            context.visibilityLedgerOverflow = false;
+             // Balance the drain wait before ARC releases the dispatch object;
+             // libdispatch traps if a semaphore is destroyed while consumed.
+             dispatch_semaphore_signal(context.available);
+@@ -4216,6 +4434,14 @@
+         id<MTLBuffer> thumbnailBuffer = nil;
+         id<MTLCommandBuffer> commandBuffer = nil;
+         id<MTLRenderCommandEncoder> encoder = nil;
++        id<MTLBuffer> visibilityResultBuffer = nil;
++        std::vector<xray::metal::R4WholeLightVisibilityRecord> visibilityRecords;
++        std::uint64_t acquireEpoch = 0u;
++        bool visibilityBufferReset = false;
++        bool visibilityAdmissionResolved = false;
++        bool visibilityAdmissionGranted = false;
++        bool visibilityDeniedByCap = false;
++        bool visibilityLedgerOverflow = false;
+         id<MTLBlitCommandEncoder> uploadBlit = nil;
+         R4RenderPassDesc activePass;
+         id<MTLCounterSampleBuffer> e08Counters = nil;
+@@ -4267,6 +4493,13 @@
+         }
+         const std::uint64_t epoch = ++m_nextFrameAcquireEpoch;
+         context.uploadArena.BeginAcquisition(epoch, m_computeSkinEnabled);
++        context.acquireEpoch = epoch;
++        context.visibilityRecords.clear();
++        context.visibilityLedgerOverflow = false;
++        context.visibilityBufferReset = false;
++        context.visibilityAdmissionResolved = false;
++        context.visibilityAdmissionGranted = false;
++        context.visibilityDeniedByCap = false;
+         return true;
+     }
+ 
+@@ -4587,6 +4820,12 @@
+         context.retainedOwners.clear();
+         context.indirectReads.clear();
+         context.computeSkinOracleReceipt.reset();
++        context.visibilityRecords.clear();
++        context.visibilityBufferReset = false;
++        context.visibilityAdmissionResolved = false;
++        context.visibilityAdmissionGranted = false;
++        context.visibilityDeniedByCap = false;
++        context.visibilityLedgerOverflow = false;
+         const bool hadUploads = !context.privateUploads.empty();
+         prunePrivateUploads(context.privateUploads);
+         if (hadUploads && ++m_privateUploadRecoveryFailures >= MaxPrivateUploadRecoveryFailures)
+@@ -4632,6 +4871,12 @@
+         const char* value = std::getenv("XRAY_METAL_COMPUTE_SKIN");
+         return value && std::strcmp(value, "1") == 0;
+     }();
++    bool m_wholeLightVisibilityEnabled = [] {
++        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    std::uint32_t m_wholeLightVisibilitySelectedAcquisitions = 0u;
++    bool m_wholeLightVisibilityCapNoticeEmitted = false;
+     bool m_computeSkinOracleEnabled = [] {
+         const char* value = std::getenv("XRAY_METAL_COMPUTE_SKIN_ORACLE");
+         return value && std::strcmp(value, "1") == 0;
+@@ -5374,6 +5619,285 @@
+     }
+ }
+ 
++bool MetalR4Backend::ProbeWholeLightVisibilityGpu(std::string& error)
++{
++    @autoreleasepool
++    {
++            MetalR4Backend backend;
++            backend.m_device = MTLCreateSystemDefaultDevice();
++            backend.m_commandQueue = backend.m_device ? [backend.m_device newCommandQueue] : nil;
++            backend.m_wholeLightVisibilityEnabled = true;
++            FrameContext& context = backend.m_frames[0];
++            context.available = dispatch_semaphore_create(1);
++            bool contextLocked = false;
++            auto fail = [&](const std::string& message) {
++                if (backend.m_frameActive)
++                {
++                    backend.DiscardFrame();
++                    contextLocked = false;
++                }
++                else if (contextLocked)
++                {
++                    dispatch_semaphore_signal(context.available);
++                    contextLocked = false;
++                }
++                context.commandBuffer = nil;
++                context.visibilityResultBuffer = nil;
++                context.available = nullptr;
++                error = message;
++                return false;
++            };
++            if (!backend.m_device || !backend.m_commandQueue || !context.available)
++                return fail("visibility probe could not create a Metal device, queue, or semaphore");
++
++            static const char* source =
++                "#include <metal_stdlib>\nusing namespace metal;\n"
++                "vertex float4 vis_probe_vertex(uint id [[vertex_id]]) {\n"
++                "  if (id == 0) return float4(-1.0, -1.0, 0.5, 1.0);\n"
++                "  if (id == 1) return float4( 3.0, -1.0, 0.5, 1.0);\n"
++                "  return float4(-1.0, 3.0, 0.5, 1.0);\n}\n"
++                "fragment float4 vis_probe_fragment() { return float4(1,0,0,1); }\n";
++            NSError* compileError = nil;
++            id<MTLLibrary> library = [backend.m_device newLibraryWithSource:
++                [NSString stringWithUTF8String:source] options:nil error:&compileError];
++            id<MTLFunction> vertex = [library newFunctionWithName:@"vis_probe_vertex"];
++            id<MTLFunction> fragment = [library newFunctionWithName:@"vis_probe_fragment"];
++            MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
++            pipelineDesc.vertexFunction = vertex;
++            pipelineDesc.fragmentFunction = fragment;
++            pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
++            pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
++            pipelineDesc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
++            NSError* pipelineError = nil;
++            id<MTLRenderPipelineState> pipeline = [backend.m_device
++                newRenderPipelineStateWithDescriptor:pipelineDesc error:&pipelineError];
++            MTLDepthStencilDescriptor* depthDesc = [[MTLDepthStencilDescriptor alloc] init];
++            depthDesc.depthCompareFunction = MTLCompareFunctionAlways;
++            depthDesc.depthWriteEnabled = NO;
++            MTLStencilDescriptor* stencilDesc = [[MTLStencilDescriptor alloc] init];
++            stencilDesc.stencilCompareFunction = MTLCompareFunctionEqual;
++            stencilDesc.stencilFailureOperation = MTLStencilOperationKeep;
++            stencilDesc.depthFailureOperation = MTLStencilOperationKeep;
++            stencilDesc.depthStencilPassOperation = MTLStencilOperationKeep;
++            stencilDesc.readMask = 0xff;
++            stencilDesc.writeMask = 0;
++            depthDesc.frontFaceStencil = stencilDesc;
++            depthDesc.backFaceStencil = stencilDesc;
++            id<MTLDepthStencilState> depthState = [backend.m_device
++                newDepthStencilStateWithDescriptor:depthDesc];
++            if (!library || !vertex || !fragment || !pipeline || !depthState)
++                return fail(std::string("visibility probe pipeline setup failed: ") +
++                    (pipelineError.localizedDescription.UTF8String ?:
++                     compileError.localizedDescription.UTF8String ?: "unknown"));
++
++            constexpr std::uint32_t Width = 32u, Height = 32u;
++            R4Texture2DDesc colorDesc;
++            colorDesc.width = Width; colorDesc.height = Height;
++            colorDesc.format = R4PixelFormat::RGBA8Unorm;
++            colorDesc.storage = R4ResourceStorage::Shared;
++            colorDesc.usage = R4TextureUsage::RenderTarget;
++            auto color = backend.CreateTexture2D(colorDesc, error);
++            R4Texture2DDesc depthTextureDesc = colorDesc;
++            depthTextureDesc.format = R4PixelFormat::Depth32FloatStencil8;
++            auto depth = backend.CreateTexture2D(depthTextureDesc, error);
++            const std::array<std::uint16_t, 3> indices{{0, 1, 2}};
++            R4BufferDesc indexDesc;
++            indexDesc.size = sizeof(indices);
++            indexDesc.storage = R4ResourceStorage::Shared;
++            indexDesc.usage = R4BufferUsage::Index;
++            auto indexBuffer = backend.CreateBuffer(indexDesc, indices.data(), sizeof(indices), error);
++            if (!color || !depth || !indexBuffer)
++                return fail("visibility probe offscreen attachment/index allocation failed: " + error);
++
++            struct Capture
++            {
++                std::array<std::uint8_t, Width * Height * 4u> color{};
++                std::array<float, Width * Height> depth{};
++                std::array<std::uint8_t, Width * Height> stencil{};
++                std::array<std::uint64_t, 2> counts{};
++            } queried, ordinary;
++            constexpr std::size_t ReadbackRowBytes = 256u;
++            constexpr std::size_t ReadbackPlaneBytes = ReadbackRowBytes * Height;
++            constexpr std::size_t ColorReadbackOffset = 0u;
++            constexpr std::size_t DepthReadbackOffset = ReadbackPlaneBytes;
++            constexpr std::size_t StencilReadbackOffset = 2u * ReadbackPlaneBytes;
++            constexpr std::size_t ReadbackBytes = 3u * ReadbackPlaneBytes;
++            auto drawFrame = [&](const bool query, const bool expectEncoded, Capture& capture) {
++                dispatch_semaphore_wait(context.available, DISPATCH_TIME_FOREVER);
++                contextLocked = true;
++                context.commandBuffer = [backend.m_commandQueue commandBuffer];
++                backend.m_activeFrameIndex = 0;
++                if (!context.commandBuffer || !backend.beginAcquiredContext(context, error))
++                    return false;
++                backend.m_frameActive = true;
++                R4RenderPassDesc pass;
++                pass.label = query ? "whole-light visibility query probe" : "whole-light ordinary probe";
++                pass.useDrawable = false;
++                pass.enableVisibilityResultCounts = query;
++                pass.colorAttachments.push_back({color, R4LoadAction::Clear, R4StoreAction::Store,
++                    {0.0, 0.0, 0.0, 0.0}});
++                pass.depthStencilAttachment.texture = depth;
++                pass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
++                pass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
++                pass.depthStencilAttachment.clearDepth = 1.0;
++                pass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Clear;
++                pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
++                pass.depthStencilAttachment.clearStencil = 1u;
++                pass.hasViewport = true;
++                pass.viewport = {0, 0, Width, Height, 0, 1};
++                if (!backend.BeginRenderPass(pass, error))
++                {
++                    if (!backend.m_frameActive)
++                        contextLocked = false; // BeginRenderPass failure abandons and signals.
++                    return false;
++                }
++                [context.encoder setRenderPipelineState:pipeline];
++                [context.encoder setDepthStencilState:depthState];
++                R4IndexedDrawDesc draw;
++                draw.indexBuffer = indexBuffer;
++                draw.indexCount = 3;
++                draw.indexType = R4IndexType::UInt16;
++                for (std::uint64_t id = 1u; id <= 2u; ++id)
++                {
++                    R4WholeLightVisibilitySample sample;
++                    sample.engineFrame = 1u;
++                    sample.batchId = static_cast<std::int32_t>(id);
++                    sample.lightId = id;
++                    sample.face = 0u;
++                    bool encoded = false;
++                    [context.encoder setStencilReferenceValue:id == 1u ? 1u : 2u];
++                    if (!backend.DrawIndexedWithVisibility(draw, sample, encoded, error) ||
++                        (expectEncoded && !encoded) || (!expectEncoded && encoded))
++                        return false;
++                }
++                if (query && !expectEncoded &&
++                    (!context.visibilityDeniedByCap || !context.visibilityRecords.empty()))
++                {
++                    error = "visibility cap did not fail open to ordinary drawing";
++                    return false;
++                }
++                if (!backend.EndRenderPass(error))
++                    return false;
++                id<MTLBuffer> readback = [backend.m_device newBufferWithLength:ReadbackBytes
++                    options:MTLResourceStorageModeShared];
++                id<MTLBlitCommandEncoder> blit = [context.commandBuffer blitCommandEncoder];
++                auto colorNative = std::dynamic_pointer_cast<MetalTexture>(color)->Native();
++                auto depthNative = std::dynamic_pointer_cast<MetalTexture>(depth)->Native();
++                if (!readback || !blit)
++                {
++                    error = "visibility probe aspect readback allocation/encoder failed";
++                    return false;
++                }
++                const MTLOrigin origin = MTLOriginMake(0, 0, 0);
++                const MTLSize extent = MTLSizeMake(Width, Height, 1);
++                [blit copyFromTexture:colorNative sourceSlice:0 sourceLevel:0 sourceOrigin:origin
++                    sourceSize:extent toBuffer:readback destinationOffset:ColorReadbackOffset
++                    destinationBytesPerRow:ReadbackRowBytes destinationBytesPerImage:0];
++                [blit copyFromTexture:depthNative sourceSlice:0 sourceLevel:0 sourceOrigin:origin
++                    sourceSize:extent toBuffer:readback destinationOffset:DepthReadbackOffset
++                    destinationBytesPerRow:ReadbackRowBytes destinationBytesPerImage:0
++                    options:MTLBlitOptionDepthFromDepthStencil];
++                [blit copyFromTexture:depthNative sourceSlice:0 sourceLevel:0 sourceOrigin:origin
++                    sourceSize:extent toBuffer:readback destinationOffset:StencilReadbackOffset
++                    destinationBytesPerRow:ReadbackRowBytes destinationBytesPerImage:0
++                    options:MTLBlitOptionStencilFromDepthStencil];
++                [blit endEncoding];
++                [context.commandBuffer commit];
++                [context.commandBuffer waitUntilCompleted]; // Probe-only synchronization.
++                const bool completed = context.commandBuffer.status == MTLCommandBufferStatusCompleted;
++                if (completed)
++                {
++                    const auto* bytes = static_cast<const std::uint8_t*>(readback.contents);
++                    for (std::size_t y = 0; y < Height; ++y)
++                    {
++                        std::memcpy(capture.color.data() + y * Width * 4u,
++                            bytes + ColorReadbackOffset + y * ReadbackRowBytes, Width * 4u);
++                        std::memcpy(capture.depth.data() + y * Width,
++                            bytes + DepthReadbackOffset + y * ReadbackRowBytes, Width * sizeof(float));
++                        std::memcpy(capture.stencil.data() + y * Width,
++                            bytes + StencilReadbackOffset + y * ReadbackRowBytes, Width);
++                    }
++                    if (query && expectEncoded && context.visibilityResultBuffer.contents)
++                    {
++                        std::memcpy(capture.counts.data(), context.visibilityResultBuffer.contents,
++                            sizeof(capture.counts));
++                    }
++                }
++                context.commandBuffer = nil;
++                context.visibilityRecords.clear();
++                context.visibilityBufferReset = false;
++                context.retainedResources.clear();
++                context.retainedOwners.clear();
++                backend.m_frameActive = false;
++                dispatch_semaphore_signal(context.available);
++                contextLocked = false;
++                if (!completed)
++                    error = "visibility probe command buffer did not complete";
++                return completed;
++            };
++            if (!drawFrame(true, true, queried) || !drawFrame(false, false, ordinary))
++                return fail("visibility probe draw/readback failed: " + error);
++            if (queried.counts[0] == 0u || queried.counts[1] != 0u)
++                return fail("visibility counter did not distinguish stencil-qualified pass/reject");
++            if (queried.color != ordinary.color || queried.depth != ordinary.depth ||
++                queried.stencil != ordinary.stencil)
++                return fail("enabling visibility counts changed offscreen color/depth attachments");
++
++            dispatch_semaphore_wait(context.available, DISPATCH_TIME_FOREVER);
++            contextLocked = true;
++            context.commandBuffer = [backend.m_commandQueue commandBuffer];
++            backend.m_activeFrameIndex = 0;
++            if (!context.commandBuffer || !backend.beginAcquiredContext(context, error))
++                return fail("visibility abort probe could not acquire a context");
++            backend.m_frameActive = true;
++            R4RenderPassDesc abortPass;
++            abortPass.useDrawable = false;
++            abortPass.enableVisibilityResultCounts = true;
++            abortPass.colorAttachments.push_back({color, R4LoadAction::Clear, R4StoreAction::Store,
++                {0.0, 0.0, 0.0, 0.0}});
++            abortPass.depthStencilAttachment.texture = depth;
++            abortPass.depthStencilAttachment.depthLoadAction = R4LoadAction::Clear;
++            abortPass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
++            abortPass.depthStencilAttachment.stencilLoadAction = R4LoadAction::Clear;
++            abortPass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
++            abortPass.depthStencilAttachment.clearStencil = 1u;
++            if (!backend.BeginRenderPass(abortPass, error))
++            {
++                if (!backend.m_frameActive)
++                    contextLocked = false;
++                return fail("visibility abort probe pass setup failed");
++            }
++            [context.encoder setRenderPipelineState:pipeline];
++            [context.encoder setDepthStencilState:depthState];
++            bool abortEncoded = false;
++            R4WholeLightVisibilitySample abortSample;
++            abortSample.engineFrame = 2u; abortSample.batchId = 1; abortSample.lightId = 3u;
++            R4IndexedDrawDesc abortDraw;
++            abortDraw.indexBuffer = indexBuffer;
++            abortDraw.indexCount = 3u;
++            abortDraw.indexType = R4IndexType::UInt16;
++            [context.encoder setStencilReferenceValue:1u];
++            if (!backend.DrawIndexedWithVisibility(abortDraw, abortSample, abortEncoded, error) || !abortEncoded)
++                return fail("visibility abort probe could not encode its query draw");
++            backend.DiscardFrame();
++            contextLocked = false;
++            if (!context.visibilityRecords.empty() || context.visibilityBufferReset)
++                return fail("discard retained a visibility receipt from an unsubmitted command");
++            Capture repeatedFrame;
++            for (std::uint32_t i = 0u; i < 10u; ++i)
++                if (!drawFrame(true, true, repeatedFrame))
++                    return fail("visibility probe failed before the 12-acquisition observation cap: " + error);
++            Capture cappedFrame;
++            if (!drawFrame(true, false, cappedFrame) ||
++                backend.m_wholeLightVisibilitySelectedAcquisitions != MaxWholeLightVisibilityAcquisitions ||
++                !backend.m_wholeLightVisibilityCapNoticeEmitted)
++                return fail("13th query acquisition did not remain ordinary after the backend cap");
++            context.available = nullptr;
++            error.clear();
++            return true;
++    }
++}
++
+ bool RunMetalR4PrivateUploadRecoveryProbe(std::string& error)
+ {
+     return MetalR4Backend::ProbePrivateUploadRecovery(error);
+@@ -5416,6 +5940,11 @@
+         return false;
+     }
+     return passed;
++}
++
++bool RunMetalR4WholeLightVisibilityGpuProbe(std::string& error)
++{
++    return MetalR4Backend::ProbeWholeLightVisibilityGpu(error);
+ }
+ 
+ std::unique_ptr<IR4Backend> CreateMetalR4Backend()
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -35,6 +35,26 @@
+ 
+ add_executable(XRay.Metal.ComputeSkinPoseJournalProbe
+   tests/R4ComputeSkinPoseJournalProbe.cpp
++)
++
++add_executable(XRay.Metal.WholeLightVisibilityLedgerProbe
++  tests/R4WholeLightVisibilityLedgerProbe.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilityLedgerProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.WholeLightVisibilityLedgerProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.WholeLightVisibilityLedger.SelfTest
++  COMMAND XRay.Metal.WholeLightVisibilityLedgerProbe
++)
++
++add_executable(XRay.Metal.WholeLightVisibilitySelectionProbe
++  tests/R4WholeLightVisibilitySelectionProbe.cpp
++  R4WholeLightVisibilitySelection.cpp
++  R4LocalShadowBatchPlan.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilitySelectionProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.WholeLightVisibilitySelectionProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.WholeLightVisibilitySelection.SelfTest
++  COMMAND XRay.Metal.WholeLightVisibilitySelectionProbe
+ )
+ target_compile_features(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE cxx_std_17)
+ target_include_directories(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+@@ -132,6 +152,9 @@
+   IR4Pipeline.h
+   IR4Resources.h
+   R4ComputeSkinMetal.h
++  R4WholeLightVisibilityLedger.h
++  R4WholeLightVisibilitySelection.cpp
++  R4WholeLightVisibilitySelection.h
+   "${R4_COMPUTE_SKIN_GENERATED_DIR}/R4ComputeSkinSource.h"
+ )
+ target_compile_options(XRay.Metal.R4Backend PRIVATE -fobjc-arc)
+@@ -328,6 +351,18 @@
+ )
+ add_test(NAME XRay.Metal.ComputeSkin.BackendGpu
+   COMMAND XRay.Metal.ComputeSkinBackendGpuProbe --self-test
++)
++
++add_executable(XRay.Metal.WholeLightVisibilityBackendGpuProbe
++  tests/R4WholeLightVisibilityBackendGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilityBackendGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.WholeLightVisibilityBackendGpuProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.WholeLightVisibility.BackendGpu
++  COMMAND XRay.Metal.WholeLightVisibilityBackendGpuProbe --self-test
+ )
+ 
+ add_executable(XRay.Metal.FloraAdapterProbe
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -1,6 +1,7 @@
+ #include "MetalR4EngineScene.h"
+ 
+ #include "IR4Backend.h"
++#include "R4WholeLightVisibilitySelection.h"
+ #include "MetalR4EngineFs.h"
+ #include "MetalR4LightHomDiagnostic.h"
+ #include "MetalR4FogScatteringAdapter.h"
+@@ -28,6 +29,7 @@
+ #include <iomanip>
+ #include <limits>
+ #include <mutex>
++#include <new>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -380,6 +382,30 @@
+         return false;
+     result = static_cast<std::uint32_t>(parsed);
+     return true;
++}
++
++bool wholeLightVisibilityEnabled()
++{
++    static const bool enabled = [] {
++        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++std::uint32_t wholeLightVisibilityFirstFrame()
++{
++    static const std::uint32_t firstFrame = [] {
++        std::uint32_t parsedFrame = 300u;
++        const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY_START_FRAME");
++        if (value && *value && !parseUnsigned(value, parsedFrame))
++        {
++            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=disabled reason=invalid_start_frame\n");
++            return UINT32_MAX;
++        }
++        return parsedFrame;
++    }();
++    return firstFrame;
+ }
+ 
+ bool parseControlledMaterials(
+@@ -2778,6 +2804,7 @@
+     MetalR4FloraAdapter* flora, const R4FloraViewState& floraView,
+     MetalR4DetailGrassAdapter* detail, const R4DetailGrassViewState& detailView,
+     const R4EnvironmentSnapshot& environment,
++    const std::vector<R4WholeLightVisibilitySample>* visibilitySamples,
+     const R4LightHomDiagnosticFrame* homDiagnostic,
+     std::string& error)
+ {
+@@ -3111,6 +3138,24 @@
+                 (unsigned long long)(light.parentLightId?light.parentLightId:light.lightId),unsigned(hidden),unsigned(eligible),
+                 homPrepMs[tile],ms,materialEntries[tile].size(),shadows.mergedEncodedDraws-homStaticBefore,
+                 shadows.submittedDynamicCasters-homDynamicBefore,materialEntries[tile].size()*256u);
++        }
++        if (visibilitySamples && indices[tile] < snapshot->lights.size())
++        {
++            const auto& visibilityLight = snapshot->lights[indices[tile]];
++            const auto selected = std::find_if(visibilitySamples->begin(), visibilitySamples->end(),
++                [&](const auto& sample) {
++                    return sample.engineFrame == view.engineFrame && sample.batchId == static_cast<std::int32_t>(batchId) &&
++                        sample.lightId == visibilityLight.lightId && sample.parentLightId == visibilityLight.parentLightId &&
++                        sample.face == (visibilityLight.type == R4EngineLocalLightType::OmniFace ? visibilityLight.omniFace : 0u);
++                });
++            if (selected != visibilitySamples->end())
++                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_TILE frame=%u batch=%u light=%llu parent=%llu face=%u kind=%u static_rows=%zu static_encoded_draws=%zu dynamic_submitted_draws=%zu static_transform_bytes=%zu\n",
++                    view.engineFrame, batchId, (unsigned long long)visibilityLight.lightId,
++                    (unsigned long long)visibilityLight.parentLightId, selected->face,
++                    static_cast<unsigned>(selected->groupKind), materialEntries[tile].size(),
++                    shadows.mergedEncodedDraws - homStaticBefore,
++                    shadows.submittedDynamicCasters - homDynamicBefore,
++                    materialEntries[tile].size() * 256u);
+         }
+     }
+     if (std::getenv("XRAY_METAL_FLORA_SHADOW_PIXEL_ORACLE_DIR"))
+@@ -4515,6 +4560,31 @@
+         const bool e08PlanTiming = std::getenv("XRAY_METAL_E08_GPU_PASSES") && view.engineFrame % 120u == 0u;
+         const auto e08PlanStart = e08PlanTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         if (!planLocalShadowBatches(view,snapshot,environment,batches,unshadowed,error)) return false;
++        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
++        xray::metal::R4WholeLightVisibilitySelectionStats visibilityStats;
++        const bool visibilityOptIn = wholeLightVisibilityEnabled();
++        const std::uint32_t visibilityFirstFrame = visibilityOptIn ?
++            wholeLightVisibilityFirstFrame() : UINT32_MAX;
++        const char* visibilityFailureReason = nullptr;
++        std::string visibilitySelectionError;
++        if (visibilityOptIn && snapshot)
++        {
++            try
++            {
++                if (visibilityFirstFrame != UINT32_MAX)
++                    xray::metal::SelectR4WholeLightVisibilitySamples(*snapshot, environment, batches,
++                        visibilityFirstFrame, view.engineFrame, visibilitySamples, visibilityStats,
++                        visibilitySelectionError);
++            }
++            catch (const std::bad_alloc&)
++            {
++                visibilityFailureReason = "selection-allocation-failed";
++                visibilitySamples.clear();
++                visibilityStats = {};
++            }
++            if (!visibilitySelectionError.empty())
++                visibilityFailureReason = "selection-invalid-input";
++        }
+         if (e08PlanTiming)
+             std::fprintf(stderr, "METAL_E08_LOCAL_PLAN frame=%u cpu_ms=%.6f batches=%zu\n", view.engineFrame,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08PlanStart).count(), batches.size());
+@@ -4522,6 +4592,39 @@
+             view.valid,view.engineFrame,snapshot.get(),environment,batches,unshadowed);
+         localLights->BeginFrame();
+         MetalR4LocalLightAdapter::DrawState drawState;
++        if (!visibilitySamples.empty())
++        {
++            try
++            {
++                drawState.visibilitySamples = visibilitySamples;
++            }
++            catch (const std::bad_alloc&)
++            {
++                visibilityFailureReason = "draw-state-allocation-failed";
++                visibilitySamples.clear();
++                drawState.visibilitySamples.clear();
++                visibilityStats = {};
++            }
++        }
++        if (visibilityFailureReason)
++        {
++            static bool loggedDiagnosticFailure = false;
++            if (!loggedDiagnosticFailure)
++            {
++                std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS status=skipped reason=%s\n",
++                    visibilityFailureReason);
++                loggedDiagnosticFailure = true;
++            }
++        }
++        if (visibilityOptIn && visibilityFirstFrame != UINT32_MAX &&
++            view.engineFrame >= visibilityFirstFrame && view.engineFrame - visibilityFirstFrame < 12u)
++            std::fprintf(stderr, "METAL_WHOLE_LIGHT_VIS_FRAME frame=%u status=%s planned_groups=%zu eligible_groups=%zu selected_groups=%zu selected_records=%zu omitted_quota=%zu incomplete_or_collision=%zu hud_exempt_records=%zu volumetric_exempt_records=%zu invalid_exempt_records=%zu\n",
++                view.engineFrame, visibilityStats.eligibleGroups ? "selected" : "inconclusive_no_eligible_groups",
++                visibilityStats.plannedGroups, visibilityStats.eligibleGroups,
++                visibilityStats.selectedGroups, visibilityStats.selectedRecords,
++                visibilityStats.omittedByQuota, visibilityStats.incompleteOrCollision,
++                visibilityStats.hudExemptRecords, visibilityStats.volumetricExemptRecords,
++                visibilityStats.invalidExemptRecords);
+         if (localShadows)
+         {
+             auto& sh=*localShadows;
+@@ -4533,7 +4636,18 @@
+         const auto accumulate=[&](const std::vector<std::size_t>& indices, std::int64_t batchId) {
+             if (indices.empty()) return true;
+             const auto homAccumStart=homDiagnostic.enabled?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+-            if (!backend.BeginRenderPass(localLightPass,error)) return false;
++            const bool enableCounts = visibilityOptIn && batchId >= 0 &&
++                std::any_of(visibilitySamples.begin(), visibilitySamples.end(), [batchId](const auto& sample) {
++                    return sample.batchId == batchId;
++                });
++            drawState.activeVisibilityBatch = enableCounts ? batchId : -1;
++            if (enableCounts)
++            {
++                R4RenderPassDesc pass = localLightPass;
++                pass.enableVisibilityResultCounts = true;
++                if (!backend.BeginRenderPass(pass,error)) return false;
++            }
++            else if (!backend.BeginRenderPass(localLightPass,error)) return false;
+             const bool drawn=localLights->DrawBatchIntoActiveAccumulator(backend,inputs,localView,snapshot,indices,drawState,error);
+             std::string endError;
+             const bool ended=backend.EndRenderPass(endError);
+@@ -4555,7 +4669,8 @@
+             // overwrite it. The accumulator, depth and stencil all load/store.
+             if (!renderLocalShadowBatch(backend,scene,*localShadows,view,snapshot,batches[batchId],
+                 static_cast<std::uint32_t>(batchId),dynamicWorld,defVertex,defObjectsLod,
+-                flora,floraView,detail,detailView,environment,homDiagnostic.enabled?&homDiagnostic:nullptr,error) ||
++                flora,floraView,detail,detailView,environment,visibilitySamples.empty()?nullptr:&visibilitySamples,
++                homDiagnostic.enabled?&homDiagnostic:nullptr,error) ||
+                 !accumulate(batches[batchId],static_cast<std::int64_t>(batchId))) return false;
+             if (volumeFrame)
+             {
+--- a/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.cpp
+@@ -570,13 +570,37 @@
+         draw.indexCount = volumeKind == 0u ? 540u : (volumeKind == 1u ? 96u : DU_SPHERE_PART_NUMFACES * 3u);
+         draw.indexType = R4IndexType::UInt16;
+         const auto bindDraw = [&](const std::shared_ptr<IR4GraphicsPipeline>& pipeline,
+-            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference) {
+-            return backend.BindGraphicsPipeline(pipeline,error) && backend.SetStencilReference(reference,error) && backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) && backend.BindMscResources(vsBindings,error) && backend.BindMscResources(fragmentBindings,error) && backend.DrawIndexed(draw,error);
++            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference,
++            const R4WholeLightVisibilitySample* visibilitySample) {
++            if (!backend.BindGraphicsPipeline(pipeline,error) || !backend.SetStencilReference(reference,error) ||
++                !backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) ||
++                !backend.BindMscResources(vsBindings,error) || !backend.BindMscResources(fragmentBindings,error))
++                return false;
++            if (!visibilitySample) return backend.DrawIndexed(draw,error);
++            bool resultEncoded = false;
++            // The observer is only attached to this final accumulation draw;
++            // query unavailability does not alter the ordinary draw result.
++            return backend.DrawIndexedWithVisibility(draw,*visibilitySample,resultEncoded,error);
+         };
+-        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker) ||
+-            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u) ||
+-            !bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
+-                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker)) return false;
++        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker, nullptr) ||
++            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u, nullptr)) return false;
++        const R4WholeLightVisibilitySample* visibilitySample = nullptr;
++        if (shadowRecord && state.activeVisibilityBatch >= 0)
++        {
++            const auto found = std::find_if(state.visibilitySamples.begin(), state.visibilitySamples.end(),
++                [&](const auto& sample) {
++                    return sample.engineFrame == snapshot->engineFrame &&
++                        sample.batchId == state.activeVisibilityBatch &&
++                        sample.lightId == light.lightId && sample.parentLightId == light.parentLightId &&
++                        sample.face == (light.type == R4EngineLocalLightType::OmniFace ? light.omniFace : 0u) &&
++                        sample.expectedFaceCount == (light.type == R4EngineLocalLightType::OmniFace ? 6u : 1u) &&
++                        sample.groupKind == (light.type == R4EngineLocalLightType::OmniFace ?
++                            R4WholeLightVisibilityGroupKind::OmniParent : R4WholeLightVisibilityGroupKind::SingleRecord);
++                });
++            if (found != state.visibilitySamples.end()) visibilitySample = &*found;
++        }
++        if (!bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
++                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker, visibilitySample)) return false;
+         ++m_telemetry.admitted; ++m_telemetry.submitted;
+         lightMarker.Increment();
+         // Match non-MSAA Windows increment_light_marker/reset_light_marker.
+--- a/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4LocalLightAdapter.h
+@@ -74,7 +74,12 @@
+         std::string& error);
+ 
+     // One cursor and telemetry epoch spans every atlas batch in a GPU frame.
+-    struct DrawState { xray::metal::R4LightMarker marker; };
++    struct DrawState
++    {
++        xray::metal::R4LightMarker marker;
++        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
++        std::int64_t activeVisibilityBatch = -1;
++    };
+     void BeginFrame() { m_telemetry = {}; }
+     bool DrawBatchIntoActiveAccumulator(IR4Backend& backend, const GBufferInputs& inputs,
+         const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4WholeLightVisibilityLedger.h
+@@ -0,0 +1,131 @@
++#pragma once
++
++#include "IR4Backend.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++namespace xray::metal
++{
++constexpr std::size_t R4WholeLightVisibilityMaxSlots = 48u;
++constexpr std::size_t R4WholeLightVisibilityMaxGroups = 8u;
++
++struct R4WholeLightVisibilityRecord
++{
++    R4WholeLightVisibilitySample sample;
++    std::uint32_t slot = 0u;
++    bool encoded = false;
++};
++
++struct R4WholeLightVisibilityGroupResult
++{
++    std::uint32_t engineFrame = 0u;
++    std::int32_t batchId = -1;
++    std::uint64_t lightId = 0u;
++    std::uint64_t groupId = 0u;
++    R4WholeLightVisibilityGroupKind groupKind = R4WholeLightVisibilityGroupKind::SingleRecord;
++    std::uint8_t expectedFaceCount = 0u;
++    bool complete = false;
++    std::uint64_t passedSamples = 0u;
++};
++
++inline bool R4WholeLightVisibilitySampleValid(const R4WholeLightVisibilitySample& s)
++{
++    if (!s.lightId || s.batchId < 0)
++        return false;
++    if (s.groupKind == R4WholeLightVisibilityGroupKind::SingleRecord)
++        return s.face == 0u && s.expectedFaceCount == 1u;
++    return s.groupKind == R4WholeLightVisibilityGroupKind::OmniParent &&
++        s.parentLightId != 0u && s.expectedFaceCount == 6u && s.face < 6u;
++}
++
++inline std::vector<R4WholeLightVisibilityGroupResult> R4ClassifyWholeLightVisibility(
++    const std::vector<R4WholeLightVisibilityRecord>& records,
++    const std::uint64_t* values, const std::size_t valueCount,
++    const bool commandCompleted)
++{
++    std::vector<R4WholeLightVisibilityGroupResult> groups;
++    for (const auto& record : records)
++    {
++        const auto& sample = record.sample;
++        const std::uint64_t groupKey = sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ?
++            sample.parentLightId : sample.lightId;
++        auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
++            return group.groupId == groupKey && group.groupKind == sample.groupKind;
++        });
++        if (found == groups.end())
++        {
++            groups.push_back({sample.engineFrame, sample.batchId, sample.lightId, groupKey,
++                sample.groupKind, sample.expectedFaceCount, false, 0u});
++        }
++    }
++    bool slotsValid = true;
++    std::uint64_t slotMask = 0u;
++    bool lightIdsValid = true;
++    for (std::size_t i = 0; i < records.size(); ++i)
++    {
++        const auto& record = records[i];
++        if (record.slot >= R4WholeLightVisibilityMaxSlots || record.slot >= valueCount ||
++            record.slot >= 64u)
++        {
++            slotsValid = false;
++            continue;
++        }
++        const std::uint64_t bit = 1ull << record.slot;
++        slotsValid = slotsValid && (slotMask & bit) == 0u;
++        slotMask |= bit;
++        lightIdsValid = lightIdsValid && record.sample.lightId != 0u;
++        for (std::size_t prior = 0; prior < i; ++prior)
++            lightIdsValid = lightIdsValid &&
++                records[prior].sample.lightId != record.sample.lightId;
++    }
++    bool globalValid = slotsValid && lightIdsValid &&
++        records.size() <= R4WholeLightVisibilityMaxSlots &&
++        groups.size() <= R4WholeLightVisibilityMaxGroups && values != nullptr &&
++        valueCount <= R4WholeLightVisibilityMaxSlots;
++    for (auto& group : groups)
++    {
++        std::uint32_t faceMask = 0u;
++        std::size_t rowCount = 0u;
++        bool valid = commandCompleted && globalValid && group.expectedFaceCount > 0u &&
++            group.expectedFaceCount <= 6u;
++        std::uint64_t total = 0u;
++        for (const auto& record : records)
++        {
++            const auto& sample = record.sample;
++            const std::uint64_t key = sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ?
++                sample.parentLightId : sample.lightId;
++            if (key != group.groupId || sample.groupKind != group.groupKind)
++                continue;
++            if (rowCount > 0u && sample.batchId != group.batchId)
++                group.batchId = -1;
++            ++rowCount;
++            const bool faceInMaskRange = sample.face < 6u;
++            valid = valid && sample.engineFrame == group.engineFrame &&
++                sample.expectedFaceCount == group.expectedFaceCount && record.encoded &&
++                R4WholeLightVisibilitySampleValid(sample) && faceInMaskRange &&
++                record.slot < valueCount && record.slot < R4WholeLightVisibilityMaxSlots;
++            if (!faceInMaskRange)
++                continue;
++            const std::uint32_t bit = 1u << sample.face;
++            valid = valid && (faceMask & bit) == 0u;
++            faceMask |= bit;
++            if (record.encoded && values && record.slot < valueCount &&
++                record.slot < R4WholeLightVisibilityMaxSlots)
++            {
++                const std::uint64_t value = values[record.slot];
++                total = value > std::numeric_limits<std::uint64_t>::max() - total ?
++                    std::numeric_limits<std::uint64_t>::max() : total + value;
++            }
++        }
++        const std::uint32_t expectedMask = group.expectedFaceCount > 0u && group.expectedFaceCount <= 6u ?
++            ((1u << group.expectedFaceCount) - 1u) : 0u;
++        group.complete = valid && rowCount == group.expectedFaceCount && faceMask == expectedMask;
++        if (group.complete)
++            group.passedSamples = total;
++    }
++    return groups;
++}
++} // namespace xray::metal
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4WholeLightVisibilitySelection.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include "IR4Backend.h"
++#include "R4LocalShadowBatchPlan.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace xray::metal
++{
++struct R4WholeLightVisibilitySelectionStats
++{
++    std::size_t plannedGroups = 0;
++    std::size_t eligibleGroups = 0;
++    std::size_t selectedGroups = 0;
++    std::size_t selectedRecords = 0;
++    std::size_t omittedByQuota = 0;
++    std::size_t incompleteOrCollision = 0;
++    std::size_t hudExemptRecords = 0;
++    std::size_t volumetricExemptRecords = 0;
++    std::size_t invalidExemptRecords = 0;
++};
++
++// Selects complete, already-planned shadow groups for diagnostic sampling.
++// It never changes the input batches and its output is metadata only.
++bool SelectR4WholeLightVisibilitySamples(const R4EngineLocalLightSnapshot& snapshot,
++    const R4EnvironmentSnapshot& environment,
++    const std::vector<std::vector<std::size_t>>& finalBatches,
++    std::uint32_t firstFrame, std::uint32_t engineFrame,
++    std::vector<R4WholeLightVisibilitySample>& samples,
++    R4WholeLightVisibilitySelectionStats& stats, std::string& error);
++
++bool RunR4WholeLightVisibilitySelectionSelfTest(std::string& error);
++} // namespace xray::metal
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4WholeLightVisibilitySelection.cpp
+@@ -0,0 +1,322 @@
++#include "R4WholeLightVisibilitySelection.h"
++#include "R4LocalLightFaceVisibility.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <limits>
++#include <map>
++#include <set>
++#include <tuple>
++#include <utility>
++
++namespace xray::metal
++{
++namespace
++{
++struct GroupKey
++{
++    R4WholeLightVisibilityGroupKind kind = R4WholeLightVisibilityGroupKind::SingleRecord;
++    std::uint64_t parent = 0;
++    bool operator<(const GroupKey& other) const
++    {
++        return std::tie(kind, parent) < std::tie(other.kind, other.parent);
++    }
++};
++
++struct Group
++{
++    GroupKey key{};
++    std::vector<std::size_t> indices;
++};
++
++enum class ExemptReason { None, Hud, Volumetric, Invalid };
++
++ExemptReason exemptReason(const R4EngineLocalLight& light, const R4EnvironmentSnapshot& environment)
++{
++    // This observer only measures the deferred accumulation consumer. HUD and
++    // volumetric routes are separate consumers, so their parents are excluded.
++    for (const float value : environment.ssfxVolumetric)
++        if (!std::isfinite(value)) return ExemptReason::Invalid;
++    for (const float value : light.position) if (!std::isfinite(value)) return ExemptReason::Invalid;
++    for (const float value : light.direction) if (!std::isfinite(value)) return ExemptReason::Invalid;
++    for (const float value : light.right) if (!std::isfinite(value)) return ExemptReason::Invalid;
++    for (const float value : light.color) if (!std::isfinite(value)) return ExemptReason::Invalid;
++    if (!std::isfinite(light.range) || !std::isfinite(light.cone)) return ExemptReason::Invalid;
++    if (!light.active || !light.shadowed) return ExemptReason::Invalid;
++    if (light.hudMode) return ExemptReason::Hud;
++    if (light.type == R4EngineLocalLightType::OmniFace)
++        return R4LocalLightFaceMayBeCulled(light, environment) ? ExemptReason::None :
++            ((environment.localVolumetricEnabled && environment.volumetricMode != 1) ? ExemptReason::Volumetric : ExemptReason::Invalid);
++    // Match BuildMetalR4VolumetricSpotPass: a spotlight has a volume consumer
++    // only when the global pass is enabled and either SSFX or the captured
++    // per-light flag admits it.
++    return environment.localVolumetricEnabled && environment.volumetricMode != 1 &&
++        (environment.ssfxVolumetric[0] > 0.0f || light.volumetricEnabled) ?
++            ExemptReason::Volumetric : ExemptReason::None;
++}
++}
++
++bool SelectR4WholeLightVisibilitySamples(const R4EngineLocalLightSnapshot& snapshot,
++    const R4EnvironmentSnapshot& environment,
++    const std::vector<std::vector<std::size_t>>& finalBatches,
++    std::uint32_t firstFrame, std::uint32_t engineFrame,
++    std::vector<R4WholeLightVisibilitySample>& samples,
++    R4WholeLightVisibilitySelectionStats& stats, std::string& error)
++{
++    samples.clear();
++    stats = {};
++    error.clear();
++    if (engineFrame < firstFrame || engineFrame - firstFrame >= 12u ||
++        snapshot.engineFrame != engineFrame || environment.engineFrame != engineFrame ||
++        !environment.valid)
++        return true;
++
++    std::map<GroupKey, Group> groups;
++    std::map<std::uint64_t, std::size_t> idCounts;
++    for (std::size_t i = 0; i < snapshot.lights.size(); ++i)
++    {
++        const auto& light = snapshot.lights[i];
++        if (light.lightId != 0u) ++idCounts[light.lightId];
++        if (!light.shadowed || !light.active) continue;
++        if (light.type == R4EngineLocalLightType::Spot)
++        {
++            const GroupKey key{R4WholeLightVisibilityGroupKind::SingleRecord, light.lightId};
++            auto [it, inserted] = groups.emplace(key, Group{key, {}});
++            (void)inserted;
++            it->second.indices.push_back(i);
++        }
++        else if (light.type == R4EngineLocalLightType::OmniFace)
++        {
++            const GroupKey key{R4WholeLightVisibilityGroupKind::OmniParent, light.parentLightId};
++            auto [it, inserted] = groups.emplace(key, Group{key, {}});
++            (void)inserted;
++            it->second.indices.push_back(i);
++        }
++    }
++
++    std::map<std::size_t, std::size_t> batchForIndex;
++    for (std::size_t batch = 0; batch < finalBatches.size(); ++batch)
++        for (const std::size_t index : finalBatches[batch])
++        {
++            if (index >= snapshot.lights.size())
++            {
++                error = "visibility selection saw an out-of-range planned light index";
++                return true;
++            }
++            if (!batchForIndex.emplace(index, batch).second)
++            {
++                error = "visibility selection saw a light repeated in planned batches";
++                return true;
++            }
++        }
++
++    struct Eligible
++    {
++        GroupKey key{};
++        std::vector<std::pair<std::size_t, std::size_t>> indexBatch;
++    };
++    std::vector<Eligible> eligible;
++    for (const auto& [key, group] : groups)
++    {
++        const std::size_t plannedMembers = static_cast<std::size_t>(std::count_if(
++            group.indices.begin(), group.indices.end(), [&](std::size_t index) {
++                return batchForIndex.find(index) != batchForIndex.end();
++            }));
++        if (plannedMembers == 0u) continue; // existing frustum planning removed the whole group
++        ++stats.plannedGroups;
++        const std::size_t expected = key.kind == R4WholeLightVisibilityGroupKind::OmniParent ? 6u : 1u;
++        if ((key.kind == R4WholeLightVisibilityGroupKind::OmniParent && key.parent == 0u) ||
++            group.indices.size() != expected || plannedMembers != group.indices.size())
++        { ++stats.incompleteOrCollision; continue; }
++        std::array<bool, 6> faces{};
++        std::set<std::uint64_t> localIds;
++        Eligible candidate; candidate.key = key;
++        bool valid = true;
++        std::vector<ExemptReason> reasons;
++        reasons.reserve(group.indices.size());
++        for (const std::size_t index : group.indices)
++        {
++            const ExemptReason reason = exemptReason(snapshot.lights[index], environment);
++            reasons.push_back(reason);
++            if (reason == ExemptReason::Hud) ++stats.hudExemptRecords;
++            else if (reason == ExemptReason::Volumetric) ++stats.volumetricExemptRecords;
++            else if (reason == ExemptReason::Invalid) ++stats.invalidExemptRecords;
++        }
++        std::size_t reasonIndex = 0u;
++        for (const std::size_t index : group.indices)
++        {
++            const auto& light = snapshot.lights[index];
++            const bool isOmni = key.kind == R4WholeLightVisibilityGroupKind::OmniParent;
++            const ExemptReason reason = reasons[reasonIndex++];
++            if (light.lightId == 0u ||
++                (isOmni && light.parentLightId != key.parent) ||
++                (!isOmni && light.lightId != key.parent) ||
++                idCounts[light.lightId] != 1u || !localIds.insert(light.lightId).second ||
++                light.type != (isOmni ? R4EngineLocalLightType::OmniFace : R4EngineLocalLightType::Spot) ||
++                reason != ExemptReason::None)
++            { valid = false; break; }
++            if (isOmni)
++            {
++                if (light.omniFace >= faces.size() || faces[light.omniFace])
++                { valid = false; break; }
++                faces[light.omniFace] = true;
++            }
++            else if (light.omniFace != 0xffu && light.omniFace != 0u)
++            { valid = false; break; }
++            const auto batch = batchForIndex.find(index);
++            if (batch == batchForIndex.end() ||
++                batch->second > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
++            { valid = false; break; }
++            candidate.indexBatch.emplace_back(index, batch->second);
++        }
++        if (valid && key.kind == R4WholeLightVisibilityGroupKind::OmniParent &&
++            std::find(faces.begin(), faces.end(), false) != faces.end())
++            valid = false;
++        if (valid) eligible.push_back(std::move(candidate));
++        else ++stats.incompleteOrCollision;
++    }
++
++    stats.eligibleGroups = eligible.size();
++    if (eligible.empty()) return true;
++    const std::size_t offset = (static_cast<std::size_t>(engineFrame - firstFrame) * 8u) % eligible.size();
++    const std::size_t selectedCount = std::min<std::size_t>(8u, eligible.size());
++    stats.selectedGroups = selectedCount;
++    stats.omittedByQuota = eligible.size() - selectedCount;
++    for (std::size_t n = 0; n < selectedCount; ++n)
++    {
++        const auto& group = eligible[(offset + n) % eligible.size()];
++        for (const auto [index, batch] : group.indexBatch)
++        {
++            const auto& light = snapshot.lights[index];
++            R4WholeLightVisibilitySample sample;
++            sample.engineFrame = engineFrame;
++            sample.batchId = static_cast<std::int32_t>(batch);
++            sample.lightId = light.lightId;
++            sample.parentLightId = light.parentLightId;
++            sample.face = group.key.kind == R4WholeLightVisibilityGroupKind::OmniParent ? light.omniFace : 0u;
++            sample.groupKind = group.key.kind;
++            sample.expectedFaceCount = group.key.kind == R4WholeLightVisibilityGroupKind::OmniParent ? 6u : 1u;
++            samples.push_back(sample);
++            ++stats.selectedRecords;
++        }
++    }
++    return true;
++}
++
++bool RunR4WholeLightVisibilitySelectionSelfTest(std::string& error)
++{
++    const auto fail = [&error](const char* why) { error = why; return false; };
++    R4EngineLocalLightSnapshot snapshot; snapshot.engineFrame = 300u;
++    R4EnvironmentSnapshot environment; environment.engineFrame = 300u; environment.valid = true;
++    std::vector<std::vector<std::size_t>> batches(2);
++    const auto addOmni = [&](std::uint64_t parent, std::size_t split) {
++        for (std::uint8_t face = 0; face < 6; ++face)
++        {
++            R4EngineLocalLight light; light.lightId = parent * 10u + face + 1u;
++            light.parentLightId = parent; light.type = R4EngineLocalLightType::OmniFace;
++            light.active = true; light.shadowed = true; light.omniFace = face;
++            const std::size_t index = snapshot.lights.size(); snapshot.lights.push_back(light);
++            batches[face < split ? 0u : 1u].push_back(index);
++        }
++    };
++    addOmni(1u, 3u); // one logical group crosses planned batches
++    R4EngineLocalLight spot; spot.lightId = 100u; spot.parentLightId = 0u;
++    spot.type = R4EngineLocalLightType::Spot; spot.active = true; spot.shadowed = true;
++    const std::size_t spotIndex = snapshot.lights.size(); snapshot.lights.push_back(spot);
++    batches[1].push_back(spotIndex);
++
++    std::vector<R4WholeLightVisibilitySample> samples;
++    R4WholeLightVisibilitySelectionStats stats;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 7u)
++        return fail("complete six-face parent and spot were not selected");
++    std::size_t omni = 0u, spotCount = 0u;
++    for (const auto& sample : samples)
++    {
++        if (sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent)
++        { ++omni; if (sample.expectedFaceCount != 6u || sample.face >= 6u) return fail("bad omni tag"); }
++        else
++        { ++spotCount; if (sample.expectedFaceCount != 1u || sample.face != 0u) return fail("bad spot tag"); }
++    }
++    if (omni != 6u || spotCount != 1u) return fail("group metadata mismatch");
++    for (const auto& sample : samples)
++        if (sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent &&
++            sample.batchId != (sample.face < 3u ? 0 : 1))
++            return fail("cross-batch face lost its planned batch ID");
++
++    // Missing/duplicate faces, identity collisions, and excluded consumers must
++    // omit the whole group. These cases are selected at the only frame in range.
++    batches[1].erase(std::remove(batches[1].begin(), batches[1].end(), std::size_t{5}), batches[1].end());
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 1u || samples.front().groupKind != R4WholeLightVisibilityGroupKind::SingleRecord)
++        return fail("missing planned face did not exempt the parent");
++    batches[1].push_back(5u);
++    snapshot.lights[5].omniFace = 4u;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 1u || samples.front().groupKind != R4WholeLightVisibilityGroupKind::SingleRecord)
++        return fail("duplicate omni face did not exempt the parent");
++    snapshot.lights[5].omniFace = 5u;
++    snapshot.lights[2].lightId = snapshot.lights[0].lightId;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 1u)
++        return fail("identity collision did not exempt the parent");
++    snapshot.lights[2].lightId = 13u;
++    snapshot.lights[1].hudMode = true;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 1u)
++        return fail("HUD face did not exempt the parent");
++    snapshot.lights[1].hudMode = false;
++    snapshot.lights[1].volumetricEnabled = true;
++    environment.localVolumetricEnabled = true;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 1u)
++        return fail("volumetric face did not exempt the parent");
++    environment.localVolumetricEnabled = false;
++
++    // At most eight complete groups per frame; rotations cover later groups.
++    snapshot.lights.clear(); batches.assign(1u, {});
++    for (std::uint64_t parent = 1u; parent <= 10u; ++parent)
++    {
++        R4EngineLocalLight l; l.lightId = parent; l.parentLightId = parent;
++        l.type = R4EngineLocalLightType::Spot; l.active = true; l.shadowed = true;
++        batches[0].push_back(snapshot.lights.size()); snapshot.lights.push_back(l);
++    }
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) || samples.size() != 8u)
++        return fail("per-frame group cap was not enforced");
++    snapshot.engineFrame = environment.engineFrame = 301u;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 301u, samples, stats, error) || samples.size() != 8u)
++        return fail("next-frame group cap failed");
++    std::set<std::uint64_t> frameZero, frameOne;
++    for (const auto& sample : samples) frameOne.insert(sample.lightId);
++    snapshot.engineFrame = environment.engineFrame = 300u;
++    SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error);
++    for (const auto& sample : samples) frameZero.insert(sample.lightId);
++    bool discoveredLateGroups = false;
++    for (auto id : frameOne) if (!frameZero.count(id)) discoveredLateGroups = true;
++    if (!discoveredLateGroups) return fail("group rotation did not advance the sample window");
++    for (std::uint64_t id = 1u; id <= 10u; ++id)
++        if (!frameZero.count(id) && !frameOne.count(id)) return fail("two-frame rotation missed a candidate group");
++    snapshot.engineFrame = environment.engineFrame = 312u;
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 312u, samples, stats, error) || !samples.empty())
++        return fail("selection exceeded the twelve-frame window");
++
++    // Parent IDs are irrelevant for a singleton spotlight, while each selected
++    // Omni parent contributes exactly six records and the per-frame cap is 48.
++    snapshot.engineFrame = environment.engineFrame = 300u;
++    snapshot.lights.clear(); batches.assign(1u, {});
++    for (std::uint64_t parent = 1u; parent <= 10u; ++parent)
++        for (std::uint8_t face = 0; face < 6u; ++face)
++        {
++            R4EngineLocalLight light; light.lightId = parent * 10u + face + 1u;
++            light.parentLightId = parent; light.type = R4EngineLocalLightType::OmniFace;
++            light.active = true; light.shadowed = true; light.omniFace = face;
++            batches[0].push_back(snapshot.lights.size()); snapshot.lights.push_back(light);
++        }
++    if (!SelectR4WholeLightVisibilitySamples(snapshot, environment, batches, 300u, 300u, samples, stats, error) ||
++        samples.size() != 48u || stats.selectedGroups != 8u)
++        return fail("eight-parent / 48-face cap was not enforced");
++    error.clear();
++    return true;
++}
++} // namespace xray::metal
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/tests/R4WholeLightVisibilityLedgerProbe.cpp
+@@ -0,0 +1,149 @@
++#include "../R4WholeLightVisibilityLedger.h"
++
++#include <array>
++#include <cstdio>
++#include <vector>
++
++namespace
++{
++using namespace xray::metal;
++
++R4WholeLightVisibilityRecord face(std::uint32_t index, std::int32_t batch, std::uint32_t slot)
++{
++    R4WholeLightVisibilitySample sample;
++    sample.engineFrame = 7u;
++    sample.batchId = batch;
++    sample.lightId = 900u + index;
++    sample.parentLightId = 42u;
++    sample.face = index;
++    sample.groupKind = R4WholeLightVisibilityGroupKind::OmniParent;
++    sample.expectedFaceCount = 6u;
++    return {sample, slot, true};
++}
++
++bool omniAcrossBatches()
++{
++    std::vector<R4WholeLightVisibilityRecord> records;
++    for (std::uint32_t i = 0; i < 6u; ++i)
++        records.push_back(face(i, i < 3u ? 11 : 12, i));
++    const std::array<std::uint64_t, 6> values{{1, 0, 4, 0, 2, 3}};
++    const auto groups = R4ClassifyWholeLightVisibility(records, values.data(), values.size(), true);
++    return groups.size() == 1u && groups[0].complete && groups[0].passedSamples == 10u &&
++        groups[0].batchId == -1;
++}
++
++bool invalidCases()
++{
++    std::vector<R4WholeLightVisibilityRecord> first, second;
++    for (std::uint32_t i = 0; i < 3u; ++i)
++    {
++        first.push_back(face(i, 1, i));
++        second.push_back(face(i + 3u, 2, i));
++    }
++    const std::array<std::uint64_t, 6> values{{1, 1, 1, 1, 1, 1}};
++    const auto firstHalf = R4ClassifyWholeLightVisibility(first, values.data(), values.size(), true);
++    const auto secondHalf = R4ClassifyWholeLightVisibility(second, values.data(), values.size(), true);
++    if (firstHalf.size() != 1u || firstHalf[0].complete ||
++        secondHalf.size() != 1u || secondHalf[0].complete)
++        return false;
++
++    std::vector<R4WholeLightVisibilityRecord> duplicate;
++    for (std::uint32_t i = 0; i < 5u; ++i)
++        duplicate.push_back(face(i == 4u ? 3u : i, static_cast<int>(i & 1u), i));
++    auto result = R4ClassifyWholeLightVisibility(duplicate, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    result = R4ClassifyWholeLightVisibility(duplicate, values.data(), values.size(), false);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    duplicate.pop_back();
++    duplicate.pop_back();
++    result = R4ClassifyWholeLightVisibility(duplicate, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    std::vector<R4WholeLightVisibilityRecord> aliasedSlots;
++    for (std::uint32_t i = 0; i < 6u; ++i)
++        aliasedSlots.push_back(face(i, static_cast<int>(i), i == 5u ? 4u : i));
++    result = R4ClassifyWholeLightVisibility(aliasedSlots, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    std::vector<R4WholeLightVisibilityRecord> collidingIds;
++    const std::array<std::uint64_t, 12> collisionValues{};
++    for (std::uint32_t group = 0u; group < 2u; ++group)
++        for (std::uint32_t i = 0u; i < 6u; ++i)
++        {
++            auto record = face(i, static_cast<int>(group), group * 6u + i);
++            record.sample.parentLightId = 42u + group;
++            record.sample.lightId = 100u + group * 10u + i;
++            if (group == 1u && i == 5u)
++                record.sample.lightId = 100u; // duplicate ID across two otherwise complete parents
++            collidingIds.push_back(record);
++        }
++    const auto colliding = R4ClassifyWholeLightVisibility(collidingIds,
++        collisionValues.data(), collisionValues.size(), true);
++    if (colliding.size() != 2u || colliding[0].complete || colliding[1].complete)
++        return false;
++
++    auto invalid = std::vector<R4WholeLightVisibilityRecord>{face(255u, 1, 0u)};
++    result = R4ClassifyWholeLightVisibility(invalid, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    auto negativeBatch = face(0u, -1, 0u);
++    invalid = {negativeBatch};
++    result = R4ClassifyWholeLightVisibility(invalid, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    auto tooManyFaces = face(0u, 1, 0u);
++    tooManyFaces.sample.expectedFaceCount = 255u;
++    invalid = {tooManyFaces};
++    result = R4ClassifyWholeLightVisibility(invalid, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    auto outOfRange = face(0u, 1, 48u);
++    invalid = {outOfRange};
++    result = R4ClassifyWholeLightVisibility(invalid, values.data(), values.size(), true);
++    if (result.size() != 1u || result[0].complete)
++        return false;
++    result = R4ClassifyWholeLightVisibility(invalid, nullptr, 0u, true);
++    return result.size() == 1u && !result[0].complete;
++}
++
++bool singleSpot()
++{
++    R4WholeLightVisibilitySample sample;
++    sample.engineFrame = 9;
++    sample.batchId = 21;
++    sample.lightId = 88;
++    sample.face = 0;
++    sample.expectedFaceCount = 1;
++    std::vector<R4WholeLightVisibilityRecord> records{{sample, 0u, true}};
++    const std::array<std::uint64_t, 1> values{{0u}};
++    const auto groups = R4ClassifyWholeLightVisibility(records, values.data(), values.size(), true);
++    if (groups.size() != 1u || !groups[0].complete || groups[0].passedSamples != 0u)
++        return false;
++
++    std::array<std::uint64_t, 9> manyValues{};
++    std::vector<R4WholeLightVisibilityRecord> tooManyGroups;
++    for (std::uint32_t i = 0u; i < 9u; ++i)
++    {
++        auto many = sample;
++        many.lightId += i;
++        tooManyGroups.push_back({many, i, true});
++    }
++    const auto rejected = R4ClassifyWholeLightVisibility(tooManyGroups,
++        manyValues.data(), manyValues.size(), true);
++    return rejected.size() == 9u && std::none_of(rejected.begin(), rejected.end(),
++        [](const auto& group) { return group.complete; });
++}
++}
++
++int main()
++{
++    if (!omniAcrossBatches() || !invalidCases() || !singleSpot())
++    {
++        std::fprintf(stderr, "WHOLE_LIGHT_VISIBILITY_LEDGER status=FAIL\n");
++        return 1;
++    }
++    std::fprintf(stderr, "WHOLE_LIGHT_VISIBILITY_LEDGER status=PASS\n");
++    return 0;
++}
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/tests/R4WholeLightVisibilitySelectionProbe.cpp
+@@ -0,0 +1,16 @@
++#include "../R4WholeLightVisibilitySelection.h"
++
++#include <cstdio>
++#include <string>
++
++int main()
++{
++    std::string error;
++    if (!xray::metal::RunR4WholeLightVisibilitySelectionSelfTest(error))
++    {
++        std::fprintf(stderr, "WHOLE_LIGHT_SELECTION FAIL %s\n", error.c_str());
++        return 1;
++    }
++    std::fprintf(stderr, "WHOLE_LIGHT_SELECTION PASS complete-groups batch-coverage exclusion-rotation frame-cap\n");
++    return 0;
++}
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/tests/R4WholeLightVisibilityBackendGpuProbe.cpp
+@@ -0,0 +1,22 @@
++#include "../IR4Backend.h"
++
++#include <cstdio>
++#include <string>
++
++int main(int argc, char** argv)
++{
++    if (argc != 2 || std::string(argv[1]) != "--self-test")
++    {
++        std::fprintf(stderr, "usage: R4WholeLightVisibilityBackendGpuProbe --self-test\n");
++        return 2;
++    }
++    std::string error;
++    if (!RunMetalR4WholeLightVisibilityGpuProbe(error))
++    {
++        std::fprintf(stderr, "WHOLE_LIGHT_VISIBILITY_BACKEND_GPU status=FAIL error=%s\n",
++            error.c_str());
++        return 1;
++    }
++    std::fprintf(stderr, "WHOLE_LIGHT_VISIBILITY_BACKEND_GPU status=PASS\n");
++    return 0;
++}

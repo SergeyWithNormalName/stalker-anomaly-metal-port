@@ -1,0 +1,159 @@
+--- src/Layers/xrRenderMetal/MetalR4DynamicWorldAdapter.cpp	2026-09-29 10:22:09
++++ scratch/gameplay-rescue-20260929/dynamic-epoch-draft/src/Layers/xrRenderMetal/MetalR4DynamicWorldAdapter.cpp	2026-09-29 10:55:23
+@@ -1,5 +1,6 @@
+ #include "MetalR4DynamicWorldAdapter.h"
+ #include "R4StaticShadowIndex.h"
++#include "R4DynamicWorldPreparedState.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -118,27 +119,8 @@
+ 
+ struct Float3 { float x = 0, y = 0, z = 0; };
+ 
+-enum class DynamicWorldPrewarmDisposition
+-{
+-    Skip,
+-    ShadowGeometryOnly,
+-    ShadowSkinnedCaster,
+-    MainViewAndShadow,
+-};
+-
+-DynamicWorldPrewarmDisposition dynamicWorldPrewarmDisposition(const bool mainViewVisible,
+-    const bool castsShadow, const bool skinned)
+-{
+-    // CPU-skinned objects keep their frame-local vertices: the shadow route
+-    // consumes that exact buffer. Static geometry can be cached without
+-    // allocating per-frame main-view state when only a light volume sees it.
+-    if (mainViewVisible)
+-        return DynamicWorldPrewarmDisposition::MainViewAndShadow;
+-    if (!castsShadow)
+-        return DynamicWorldPrewarmDisposition::Skip;
+-    return skinned ? DynamicWorldPrewarmDisposition::ShadowSkinnedCaster :
+-        DynamicWorldPrewarmDisposition::ShadowGeometryOnly;
+-}
++using xray::metal::DynamicWorldPrewarmDisposition;
++using xray::metal::dynamicWorldPrewarmDisposition;
+ 
+ bool hasPositiveHotness(const std::array<float, 4>& hotness)
+ {
+@@ -1614,6 +1596,7 @@
+         std::uint64_t lastUsedGeneration = 0;
+         std::uint64_t skinPoseHash = 0;
+         bool hasSkinPose = false;
++        xray::metal::R4DynamicWorldPreparedState prepared;
+     };
+     std::shared_ptr<IR4GraphicsPipeline> staticPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> skinnedPipeline;
+@@ -1665,6 +1648,7 @@
+     bool legacySelflightMismatchLogged = false;
+     std::uint32_t instanceFrame = UINT32_MAX;
+     std::uint64_t instanceGeneration = 0;
++    xray::metal::R4DynamicWorldPrewarmState prewarm;
+     std::size_t instanceSlot = 0;
+     std::size_t instanceSlotCount = kInstanceFrameSlots;
+ 
+@@ -2082,6 +2066,10 @@
+ {
+     if (m_impl)
+     {
++        // Readiness belongs to this invocation, not an engine-frame number.
++        // Repeated simulation frames and drawable retries must invalidate it.
++        if (m_impl->prewarm.Begin())
++            for (auto& instance : m_impl->instances) instance.second.prepared = {};
+         // No stale prepared snapshot may survive an early or failed Prewarm.
+         m_impl->shadowFrameIndex.Invalidate();
+         m_impl->initializeE07Profile();
+@@ -2545,6 +2533,10 @@
+                 }
+                 else
+                     ++m_telemetry.skinnedVerticesReused;
++                // Both freshly repacked and current-pose cache-hit buffers
++                // are valid shadow inputs for this unique Prewarm invocation.
++                if (existing != m_impl->instances.end() && existing->second.skinnedVertices)
++                    existing->second.prepared.PublishSkin(m_impl->prewarm.epoch);
+             }
+             if (existing != m_impl->instances.end() && existing->second.vertexGlobals &&
+                 existing->second.transforms && existing->second.fragmentGlobals)
+@@ -2561,9 +2553,13 @@
+                         key.c_str(), renderableIndex, localError.empty() ?
+                         "dynamic OGF instance uniform update failed" : localError.c_str());
+                     m_impl->instances.erase(existing);
++                    existing = m_impl->instances.end();
+                 }
+                 else
++                {
+                     existing->second.lastUsedGeneration = m_impl->instanceGeneration;
++                    existing->second.prepared.PublishMain(m_impl->prewarm.epoch);
++                }
+                 if (collectCpuVertexDiagnostic && existing != m_impl->instances.end())
+                 {
+                     existing->second.cpuVertexDiagnostic = cpuVertexDiagnostic;
+@@ -2594,6 +2590,7 @@
+                 continue;
+             }
+             instance.lastUsedGeneration = m_impl->instanceGeneration;
++            instance.prepared.PublishMain(m_impl->prewarm.epoch);
+             if (collectCpuVertexDiagnostic)
+             {
+                 instance.cpuVertexDiagnostic = cpuVertexDiagnostic;
+@@ -2609,6 +2606,7 @@
+     m_telemetry.cachedGeometry = m_impl->geometry.size();
+     m_telemetry.rejectedGeometry = m_impl->rejected.size();
+     m_impl->pendingMotionFrame = true;
++    m_impl->prewarm.Complete();
+     return true;
+ }
+ 
+@@ -2689,7 +2687,8 @@
+                 ":slot:" + std::to_string(m_impl->instanceSlot);
+             const auto geometry = m_impl->geometry.find(key);
+             const auto instance = m_impl->instances.find(instanceKey);
+-            if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end())
++            if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
++                !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), geometry->second.skinned))
+                 continue;
+             if (geometry->second.lightplane)
+                 continue;
+@@ -2887,7 +2886,8 @@
+             const auto instance = m_impl->instances.find(instanceKey);
+             if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
+                 !geometry->second.indices || !geometry->second.baseTexture ||
+-                geometry->second.skinned != source.skinned)
++                geometry->second.skinned != source.skinned ||
++                !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), geometry->second.skinned))
+             {
+                 if (accumulator) ++m_telemetry.emissiveAccumulatorRejected;
+                 else ++m_telemetry.emissiveRejected;
+@@ -2986,8 +2986,10 @@
+             const std::string key = geometryKey(*renderable.asset, index);
+             const std::string instanceKey = instanceIdentityKey(key, renderable, renderableIndex) +
+                 ":slot:" + std::to_string(m_impl->instanceSlot);
++            const auto instance = m_impl->instances.find(instanceKey);
+             if (m_impl->geometry.find(key) != m_impl->geometry.end() &&
+-                m_impl->instances.find(instanceKey) != m_impl->instances.end())
++                instance != m_impl->instances.end() &&
++                instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), true))
+                 sorted.push_back({renderableIndex, index, distanceSquared});
+         }
+     }
+@@ -3004,7 +3006,8 @@
+         const auto instance = m_impl->instances.find(instanceKey);
+         if (geometry == m_impl->geometry.end() || instance == m_impl->instances.end() ||
+             !geometry->second.lightplane || !geometry->second.baseTexture ||
+-            !geometry->second.indices || !instance->second.skinnedVertices)
++            !geometry->second.indices || !instance->second.skinnedVertices ||
++            !instance->second.prepared.MainReady(m_impl->prewarm.ReadyEpoch(), true))
+         {
+             error = "prepared models\\lightplanes draw lost its geometry or frame resource";
+             return false;
+@@ -3137,7 +3140,8 @@
+                 const std::string instanceKey = instanceIdentityKey(key, renderable, renderableIndex) +
+                     ":slot:" + std::to_string(m_impl->instanceSlot);
+                 const auto inst = m_impl->instances.find(instanceKey);
+-                if (inst == m_impl->instances.end() || !inst->second.skinnedVertices)
++                if (inst == m_impl->instances.end() || !inst->second.skinnedVertices ||
++                    !inst->second.prepared.SkinReady(m_impl->prewarm.ReadyEpoch()))
+                 {
+                     ++rejected;
+                     continue;

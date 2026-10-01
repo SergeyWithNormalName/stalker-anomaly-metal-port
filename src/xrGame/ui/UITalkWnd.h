@@ -22,6 +22,7 @@ class CUITalkDialogWnd;
 
 class CUITalkWnd : public CUIDialogWnd
 {
+	friend class CGamepadInput;
 private:
 	typedef CUIDialogWnd inherited;
 	ref_sound m_sound;

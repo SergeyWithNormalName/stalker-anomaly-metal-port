@@ -1,0 +1,38 @@
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -300,6 +300,10 @@
+         std::shared_ptr<IR4Buffer> indices;
+     };
+     bool mergeStatic = std::getenv("XRAY_METAL_E08_MERGE_STATIC_SHADOWS_OFF") == nullptr;
++    bool staticPsoReuse = [] {
++        const char* flag = std::getenv("XRAY_METAL_LOCAL_STATIC_PSO_REUSE");
++        return flag && std::strcmp(flag, "1") == 0;
++    }();
+     std::vector<std::vector<std::uint16_t>> mergeSourceIndices;
+     std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<StaticMergeEntry>>> mergeCache;
+     std::size_t mergeCacheBytes = 0;
+@@ -3348,6 +3352,8 @@
+         }
+     const bool separateTiles = std::getenv("XRAY_METAL_E08_SHADOW_SEPARATE_TILES") != nullptr;
+     const auto drawStaticTile = [&](std::size_t tile, bool useMerged, bool account) {
++        // Other caster families may replace state between tiles or oracle calls.
++        std::shared_ptr<IR4GraphicsPipeline> lastPipeline;
+         std::size_t lastVertexBuffer = std::numeric_limits<std::size_t>::max();
+         const auto& merge = useMerged ? mergePlans[tile] : nullptr;
+         const std::size_t drawCount = merge ? merge->plan.runs.size() : materialEntries[tile].size();
+@@ -3371,8 +3377,13 @@
+             vertexBindings.tlabSize = 24u;
+             vertexBindings.resources = {{R4MscResourceType::ConstantBuffer, 0u,
+                 batchTransforms.buffer, batchTransforms.offset + offset, 256u, nullptr, nullptr}};
+-            if (!backend.BindGraphicsPipeline(pipeline, error) ||
+-                !backend.BindMscResources(vertexBindings, error))
++            if (!shadows.staticPsoReuse || pipeline != lastPipeline)
++            {
++                if (!backend.BindGraphicsPipeline(pipeline, error))
++                    return false;
++                if (shadows.staticPsoReuse) lastPipeline = pipeline;
++            }
++            if (!backend.BindMscResources(vertexBindings, error))
+                 return false;
+             if (alphaTested)
+             {

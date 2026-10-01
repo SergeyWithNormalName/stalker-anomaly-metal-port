@@ -1,0 +1,16 @@
+--- scratch/gameplay-rescue-20260929/whole-light-visibility-stage/prestate/scene/MetalR4LocalLightAdapter.h	2026-09-29 13:31:27
++++ scratch/gameplay-rescue-20260929/whole-light-visibility-stage/draft/adapter/MetalR4LocalLightAdapter.h	2026-09-29 13:47:43
+@@ -74,7 +74,12 @@
+         std::string& error);
+ 
+     // One cursor and telemetry epoch spans every atlas batch in a GPU frame.
+-    struct DrawState { xray::metal::R4LightMarker marker; };
++    struct DrawState
++    {
++        xray::metal::R4LightMarker marker;
++        std::vector<R4WholeLightVisibilitySample> visibilitySamples;
++        std::int64_t activeVisibilityBatch = -1;
++    };
+     void BeginFrame() { m_telemetry = {}; }
+     bool DrawBatchIntoActiveAccumulator(IR4Backend& backend, const GBufferInputs& inputs,
+         const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,

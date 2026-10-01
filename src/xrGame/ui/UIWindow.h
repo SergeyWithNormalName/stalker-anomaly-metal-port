@@ -258,6 +258,12 @@ public:
 	void ResetAll();
 
 	virtual bool NeedCursor() const { return true; }
+	void SetGamepadFocusable(bool value) { m_bGamepadFocusable = value; }
+	bool GetGamepadFocusable() const { return m_bGamepadFocusable; }
+	void SetGamepadFocused(bool value) { m_bGamepadFocused = value; }
+	bool GetGamepadFocused() const { return m_bGamepadFocused; }
+	void SetGamepadRole(int value) { m_iGamepadRole = value; }
+	int GetGamepadRole() const { return m_iGamepadRole; }
 
 
 	DEF_UILIST(WINDOW_LIST, CUIWindow*);
@@ -370,6 +376,10 @@ protected:
 	// Если курсор над окном
 	bool m_bCursorOverWindow;
 	bool m_bCustomDraw;
+	// Optional controller-navigation metadata for script-built controls.
+	bool m_bGamepadFocusable;
+	bool m_bGamepadFocused;
+	int m_iGamepadRole;
 
 	xr_vector<Fvector2> m_hit_clip_poly;
 

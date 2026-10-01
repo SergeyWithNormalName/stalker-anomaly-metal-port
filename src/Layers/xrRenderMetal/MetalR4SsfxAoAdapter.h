@@ -7,9 +7,7 @@
 #include <memory>
 #include <string>
 
-// Owns the production SSFX AO branch that R4 executes before combine_1.  IL
-// remains a separate milestone: it has a different light-accumulator and
-// temporal contract and must not be silently approximated by AO output.
+// Owns the independent production SSFX AO and IL branches before combine_1.
 class MetalR4SsfxAoAdapter final
 {
 public:
@@ -25,7 +23,12 @@ public:
         std::shared_ptr<IR4Buffer> staticGlobals;
         std::array<float, 16> view{};
         std::array<float, 16> projection{};
+        std::array<float, 16> previousView{};
+        std::array<float, 16> previousProjection{};
         R4EnvironmentSnapshot environment{};
+        bool cameraCut = false;
+        bool previousValid = false;
+        std::uint32_t previousFrame = 0;
     };
     struct Telemetry
     {
@@ -35,6 +38,8 @@ public:
         std::uint32_t passes = 0;
         std::uint32_t indirectLightPasses = 0;
         bool temporalHistory = false;
+        bool aoEnabled = false, ilEnabled = false;
+        bool aoHistory = false, ilHistory = false;
     };
 
     MetalR4SsfxAoAdapter();
@@ -46,6 +51,9 @@ public:
     bool PrepareRenderTargets(IR4Backend& backend, std::uint32_t width, std::uint32_t height,
         std::string& error);
     bool Draw(IR4Backend& backend, const FrameInputs& inputs, std::string& error);
+    void DiscardUnsubmittedFrame();
+    void CommitSubmittedFrame();
+    void InvalidateHistory();
 
     const std::shared_ptr<IR4Texture>& Output() const;
     const std::shared_ptr<IR4Texture>& IndirectLightOutput() const;

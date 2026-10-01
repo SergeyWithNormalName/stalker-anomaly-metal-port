@@ -10,6 +10,10 @@
 
 extern LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
+#if defined(XR_PLATFORM_APPLE)
+extern "C" SDL_Window* g_mainSdlWindow = nullptr;
+#endif
+
 #ifdef INGAME_EDITOR
 void CRenderDevice::initialize_editor()
 {
@@ -99,10 +103,14 @@ PROTECT_API void CRenderDevice::Initialize()
 #else
 		windowFlags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_VULKAN;
 #endif
+
 		SDL_Window* sdlWnd = SDL_CreateWindow("S.T.A.L.K.E.R.: Anomaly",
 		                                      SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 		                                      640, 480, windowFlags);
 		m_hWnd = (HWND)sdlWnd;
+#if defined(XR_PLATFORM_APPLE)
+		g_mainSdlWindow = sdlWnd;
+#endif
 	}
 	m_dwWindowStyle = 0;
 	GetWindowRect(m_hWnd, &m_rcWindowBounds);

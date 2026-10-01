@@ -1,0 +1,24 @@
+# PROPOSAL ONLY: do not apply to run_matched_pair.sh until root review.
+# Default remains stock-pinned; guarded-custom preserves a stock copy and is one-arm only.
+diff --git a/scratch/native-silo-parity-20260929/luna-harness/run_matched_pair.sh b/scratch/native-silo-parity-20260929/luna-harness/run_matched_pair.sh
+--- a/scratch/native-silo-parity-20260929/luna-harness/run_matched_pair.sh
++++ b/scratch/native-silo-parity-20260929/luna-harness/run_matched_pair.sh
+@@
+ WINREL=bin/AnomalyDX11.exe
++SILO_STOCK_SHA=c0bf73944e700425734d95b71f5c8fd201b669bac67d295357a141442103bdd3
++SILO_GUARD_SHA=1a3ff9acbab231da7348ad61969d6e910d229233ae982b48a8e4e5a23b271c20
++SILO_EXE_MODE="${PARITY_SILO_EXE_MODE:-stock}"
++SILO_EXE_SHA="${PARITY_SILO_EXE_SHA256:-$SILO_STOCK_SHA}"
++case "$SILO_EXE_MODE:$SILO_EXE_SHA" in "stock:$SILO_STOCK_SHA"|"guarded-custom:$SILO_GUARD_SHA") ;; *) echo 'Invalid Silo reference mode/hash' >&2; exit 2 ;; esac
+@@
+ case "$MODE" in --prepare-only|--run-prepared) ;; --run-one) [[ "${2:-}" == native || "${2:-}" == silo ]] || exit 2 ;; *) echo 'usage: run_matched_pair.sh --prepare-only | --run-one native|silo | --run-prepared' >&2; exit 2 ;; esac
++if [[ "$SILO_EXE_MODE" == guarded-custom && "$MODE" != --prepare-only && ( "$MODE" != --run-one || "${2:-}" != silo ) ]]; then echo 'guarded-custom is one-arm compatibility-only' >&2; exit 2; fi
+@@
+   /bin/cp -cR "$WINBASE/bin" "$RUN/silo/runtime/"
++  if [[ "$SILO_EXE_MODE" == guarded-custom ]]; then pin "${PARITY_SILO_GUARD_EXE:?set pinned guard-copy path}" "$SILO_GUARD_SHA"; cp "$RUN/silo/runtime/$WINREL" "$RUN/silo/output/AnomalyDX11.stock.exe"; pin "$RUN/silo/output/AnomalyDX11.stock.exe" "$SILO_STOCK_SHA"; cp "$PARITY_SILO_GUARD_EXE" "$RUN/silo/runtime/$WINREL"; pin "$RUN/silo/runtime/$WINREL" "$SILO_GUARD_SHA"; fi
+@@
+ Silo MetalFX disabled; require false,false flags and equal target dimensions
++silo_reference=$SILO_EXE_MODE; executable_sha256=$SILO_EXE_SHA; guarded-custom is compatibility-only
+@@
+     env | LC_ALL=C awk -F= '$1 ~ /^(XRAY_|MTL_|METAL_PERFORMANCE_|PERF_GAP_|D3DM_|WINE|WINEDLL|DYLD_)/ {print}' | sort > "$out/environment.txt"
++    printf 'SILO_EXE_MODE=%s\nSILO_EXE_SHA256=%s\n' "$SILO_EXE_MODE" "$SILO_EXE_SHA" >> "$out/environment.txt"; pin "$rt/$WINREL" "$SILO_EXE_SHA"

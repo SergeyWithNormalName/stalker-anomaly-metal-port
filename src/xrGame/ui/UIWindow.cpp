@@ -118,7 +118,10 @@ CUIWindow::CUIWindow()
 	  //dwHintDelay(1000),
 	  //bShowHint(false),
 	  //m_sHint(""),
-	  m_bCustomDraw(false)
+	  m_bCustomDraw(false),
+	  m_bGamepadFocusable(false),
+	  m_bGamepadFocused(false),
+	  m_iGamepadRole(0)
 {
 	Show(true);
 	Enable(true);

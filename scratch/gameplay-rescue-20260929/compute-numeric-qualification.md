@@ -1,0 +1,19 @@
+# Compute skin exact arithmetic qualification — 2026-09-29
+
+Production backend and adapter were unchanged during this experiment. Existing CPU constructor and exported `RepackR4DynamicWorldSkinnedVertices` semantics were frozen; all static reference libraries were copied and SHA-verified before an isolated one-file clang/link, with separate object, binary and LTO cache. No CMake/Ninja invocation, gameplay run or timing run occurred. `qualification/compute-numeric-scratch/receipt.json` records exact compile/link argv, source snapshots and library hashes.
+
+## Causal result
+
+ARM64 disassembly shows transform component `y*m`, then `fma(x,m,+)`, then `fma(z,m,+)`; point translation adds separately. Normal length is `y*y`, `fma(x,x,+)`, `fma(z,z,+)`, followed by sqrt/divide/multiply. Weighted accumulation uses separate multiply and add. This is the compiled existing CPU reference operation order, not a new reference implementation or tolerance rule.
+
+Safe MSL math still implicitly contracted weighted multiply/add. Under identity bones, stress 2W vertex 64 has raw normal `(-0.490196049,0.871612191,0)` and weights `(-0.0962250233,1.09622502)`: CPU instruction model pre-normal X `-0.490196079`, GPU `-0.490196049`, both length² 1; actual CPU/GPU BGR normal ends 64/65. Thus the first failure appears before normalization and floor packing. The diagnostic labels the local CPU instruction model separately from the actual exported CPU packed reference.
+
+Dot-only explicit FMA fails. Explicit transform/dot FMA with implicit contraction still enabled also fails identically: normal mismatch components 53 (2W identity), 53 (2W translated), 174 (3W identity), 317 (4W identity), maximum byte delta 1; T/B/UV/alpha remain zero. Negative controls: `dot-fma-diagnostic.log` and `explicit-fma-contract-on.log`, with per-failure raw normal, weights, bone matrices, pre-normal and normalized values.
+
+Explicit reference FMA plus `#pragma clang fp contract(off)` makes every synthetic/strict stress case **bitwise equal**, including positions. Positive `explicit-fma-no-contract-diagnostic.log` and trace-disabled `explicit-fma-no-contract-default.log`; guard bytes also pass. No gate changed: packed bytes/UV/alpha exact, position relative limit still 1e-6, observed position error now zero. All 31 installed OGF leaves rerun: 30 GPU-eligible leaves have bitwise-exact output under the generated finite palette; one 17,139-vertex 1W weapon-HUD leaf with nonfinite T/B stays on the existing CPU normalized fallback and its CPU reference succeeds (no tangent rebuild for 1W). `installed-explicit-fma-results.json` records fixture hashes, commands and individual receipts. The installed sample covers current XRFS-winning NPC, Nosorog, boar and weapon-HUD geometry; it is representative admission evidence, not a claim that every installed mesh has been tested.
+
+## Adoption and next gate
+
+Canonical `R4ComputeSkin.metal` now uses this operation order. Optional diagnostic trace compiles out by default. `compute-numeric-adoption-prestate/manifest.json` preserves source before adoption, and `compute-numeric-adoption.patch` is narrow. The previous kernel timing receipt is historical only; it must not be used as a performance claim for this arithmetic revision. New timings require a quiet central hardware slot after the full app build.
+
+Before production integration, the V2 application must be copied and scene_cpu's `mainPreparedEpoch`/`skinPreparedEpoch` fix must land. The GPU pending-pose journal reuses that unique Prewarm epoch. Every non-Ready GPU admission routes to the original CPU path, including 1W nonfinite basis fallback. Production CMake must derive embedded MSL from the same canonical file with an explicit dependency; oracle and production use safe/precise flags and the same contraction pragma.

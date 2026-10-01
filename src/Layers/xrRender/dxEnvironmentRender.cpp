@@ -1,4 +1,11 @@
 #include "stdafx.h"
+extern ENGINE_API BOOL r2_advanced_pp;
+extern float dm_current_fade;
+extern Fvector3 ps_ssfx_shadow_bias;
+extern Fvector4 ps_ssfx_florafixes_1;
+extern Fvector4 ps_ssfx_florafixes_2;
+extern Fvector4 ps_ssfx_lightsetup_1;
+extern Fvector4 ps_ssfx_fog;
 #include "dxEnvironmentRender.h"
 
 #include "dxRenderDeviceRender.h"
@@ -15,6 +22,17 @@
 #include <filesystem>
 #include <fstream>
 #endif
+
+extern Fvector4 ps_ssfx_bloom_1;
+extern int ps_ssfx_is_underground;
+extern int ps_ssfx_gloss_method;
+extern float ps_ssfx_gloss_factor;
+extern Fvector3 ps_ssfx_gloss_minmax;
+extern float OLES_SUN_LIMIT_27_01_07;
+extern float ps_r2_gloss_min;
+extern float ps_r2_gloss_factor;
+extern int ps_ssfx_gloss_method;
+extern Fvector3 ps_ssfx_gloss_minmax;
 
 static Fmatrix mSky_prev = Fidentity;
 
@@ -347,10 +365,35 @@ void dxEnvironmentRender::OnFrame(CEnvironment& env)
 			ps_r2_img_exposure, ps_r2_img_gamma, ps_r2_img_saturation, 1.0f,
 		};
 		snapshot.colorGrading = {ps_r2_img_cg.x, ps_r2_img_cg.y, ps_r2_img_cg.z, 1.0f};
-		snapshot.frameDeltaSeconds = Device.fTimeDelta;
+			snapshot.frameDeltaSeconds = Device.fTimeDelta;
 		if (env.CurrentEnv)
 		{
 			const CEnvDescriptorMixer& current = *env.CurrentEnv;
+			snapshot.ssfxVolumetric = {ps_ssfx_volumetric.x, ps_ssfx_volumetric.y,
+				ps_ssfx_volumetric.z, ps_ssfx_volumetric.w};
+			snapshot.localVolumetricEnabled = r2_advanced_pp &&
+				ps_r2_ls_flags.test(R2FLAG_VOLUMETRIC_LIGHTS);
+			snapshot.sunShaftsEnabled = r2_advanced_pp;
+			snapshot.sunShaftsMode = ps_sunshafts_mode;
+			snapshot.sunShaftsIntensity = current.m_fSunShaftsIntensity;
+			snapshot.sunShaftsFarRange = OLES_SUN_LIMIT_27_01_07;
+			snapshot.sunShaftsQuality = ps_r_sun_shafts;
+			snapshot.volumetricMode = ps_pfx_volumetric_mode;
+			snapshot.volumetricGlossMethod = ps_ssfx_gloss_method;
+			snapshot.volumetricGlossMinimum = ps_r2_gloss_min;
+			snapshot.volumetricGlossFactor = ps_ssfx_gloss_method == 0 ? ps_r2_gloss_factor : ps_ssfx_gloss_factor;
+			snapshot.volumetricGlossMinMax = {ps_ssfx_gloss_minmax.x,
+				ps_ssfx_gloss_minmax.y, ps_ssfx_gloss_minmax.z};
+			snapshot.volumetricResolutionDivisor = 8u;
+			if (Core.ParamsData.test(ECoreParams::volumetric1))
+				snapshot.volumetricResolutionDivisor = 1u;
+			if (Core.ParamsData.test(ECoreParams::volumetric2))
+				snapshot.volumetricResolutionDivisor = 2u;
+			if (Core.ParamsData.test(ECoreParams::volumetric4))
+				snapshot.volumetricResolutionDivisor = 4u;
+			string_path volumetricSourcePath;
+			snapshot.ssfxVolumetricAvailable = FS.exist(volumetricSourcePath,
+				"$game_shaders$", "r3\\ssfx_volumetric_blur", ".ps") != nullptr;
 			snapshot.skyColor = {current.sky_color.x, current.sky_color.y, current.sky_color.z};
 			snapshot.skyBlend = current.weight;
 			snapshot.skyRotation = current.sky_rotation;
@@ -363,6 +406,12 @@ void dxEnvironmentRender::OnFrame(CEnvironment& env)
 			snapshot.fogDensity = current.fog_density;
 			snapshot.fogNear = current.fog_near;
 			snapshot.fogFar = current.fog_far;
+			string_path fogScatteringSourcePath;
+			snapshot.ssfxFogScatteringAvailable = FS.exist(fogScatteringSourcePath,
+				"$game_shaders$", "r3\\ssfx_fog_scattering", ".ps") != nullptr;
+			snapshot.ssfxFog = {ps_ssfx_fog.x, ps_ssfx_fog.y,
+				ps_ssfx_fog.z, ps_ssfx_fog.w};
+			snapshot.ssfxFogScattering = ps_ssfx_fog_scattering;
 			const float ambientScale = ps_r2_sun_lumscale_amb +
 				g_pGamePersistent->nv_shader_data.lum_factor;
 			snapshot.combineAmbient = {
@@ -389,12 +438,50 @@ void dxEnvironmentRender::OnFrame(CEnvironment& env)
 				ps_ssfx_water_setup2.z, ps_ssfx_water_setup2.w};
 			snapshot.ssfxWaterQuality = {ps_ssfx_water_quality.x, ps_ssfx_water_quality.y,
 				ps_ssfx_water_quality.z};
+			// Match R4's shader-presence option and standard global bindings for
+			// the general (pre-water) SSR phase.
+			string_path ssrSourcePath;
+			snapshot.ssfxSsrAvailable = FS.exist(ssrSourcePath, "$game_shaders$", "r3\\ssfx_ssr", ".ps") != nullptr;
+			snapshot.ssfxSsrQuality = static_cast<std::uint32_t>(
+				std::max(0, std::min(ps_ssfx_ssr_quality, 5)));
+			snapshot.ssfxSsr = {ps_ssfx_ssr.x, ps_ssfx_ssr.y, ps_ssfx_ssr.z, ps_ssfx_ssr.w};
+			snapshot.ssfxSsr2 = {ps_ssfx_ssr_2.x, ps_ssfx_ssr_2.y,
+				ps_ssfx_ssr_2.z, ps_ssfx_ssr_2.w};
+			snapshot.ssfxIsUnderground = {static_cast<float>(ps_ssfx_is_underground), 0.0f, 0.0f, 0.0f};
+			// Match the Windows shader-presence options without borrowing its backend state.
+			string_path aoIlSourcePath;
+			snapshot.ssfxAoAvailable = FS.exist(aoIlSourcePath, "$game_shaders$", "r3\\ssfx_ao", ".ps") != nullptr;
+			snapshot.ssfxIlAvailable = FS.exist(aoIlSourcePath, "$game_shaders$", "r3\\ssfx_il", ".ps") != nullptr;
 			snapshot.ssfxAo = {ps_ssfx_ao.x, ps_ssfx_ao.y, ps_ssfx_ao.z, ps_ssfx_ao.w};
 			snapshot.ssfxAoSetup1 = {ps_ssfx_ao_setup1.x, ps_ssfx_ao_setup1.y,
 				ps_ssfx_ao_setup1.z, ps_ssfx_ao_setup1.w};
 			snapshot.ssfxIl = {ps_ssfx_il.x, ps_ssfx_il.y, ps_ssfx_il.z, ps_ssfx_il.w};
 			snapshot.ssfxIlSetup1 = {ps_ssfx_il_setup1.x, ps_ssfx_il_setup1.y,
 				ps_ssfx_il_setup1.z, ps_ssfx_il_setup1.w};
+			// Match Blender_Recorder_StandartBinding::ssfx_bloom_1, including z=0.
+			snapshot.ssfxBloom1 = ps_ssfx_bloom_use_presets ?
+				std::array<float, 4>{current.bloom_threshold, current.bloom_exposure, 0.0f, current.bloom_sky_intensity} :
+				std::array<float, 4>{ps_ssfx_bloom_1.x, ps_ssfx_bloom_1.y, 0.0f, ps_ssfx_bloom_1.w};
+			snapshot.ssfxBloom2 = {ps_ssfx_bloom_2.x, ps_ssfx_bloom_2.y, ps_ssfx_bloom_2.z, ps_ssfx_bloom_2.w};
+			snapshot.maskControl = {ps_r2_mask_control.x, ps_r2_mask_control.y, ps_r2_mask_control.z, ps_r2_mask_control.w};
+            snapshot.ssfxFloraFixes1={ps_ssfx_florafixes_1.x,ps_ssfx_florafixes_1.y,ps_ssfx_florafixes_1.z,ps_ssfx_florafixes_1.w};
+            snapshot.ssfxFloraFixes2={ps_ssfx_florafixes_2.x,ps_ssfx_florafixes_2.y,ps_ssfx_florafixes_2.z,ps_ssfx_florafixes_2.w};
+            snapshot.ssfxLightSetup1={ps_ssfx_lightsetup_1.x,ps_ssfx_lightsetup_1.y,ps_ssfx_lightsetup_1.z,ps_ssfx_lightsetup_1.w};
+            snapshot.ssfxShadowBias = {ps_ssfx_shadow_bias.x,ps_ssfx_shadow_bias.y,0.0f,0.0f};
+            snapshot.ssfxShadowCascades = {ps_ssfx_shadow_cascades.x,
+                ps_ssfx_shadow_cascades.y, ps_ssfx_shadow_cascades.z};
+            snapshot.ssfxGrassShadows = {ps_ssfx_grass_shadows.x, ps_ssfx_grass_shadows.y,
+                ps_ssfx_grass_shadows.z, ps_ssfx_grass_shadows.w};
+            snapshot.grassShadows = psDeviceFlags2.test(rsGrassShadow);
+            snapshot.detailFadeDistance = dm_current_fade;
+            snapshot.sunDepthScale = {ps_r2_sun_depth_near_scale, ps_r2_sun_depth_far_scale};
+            snapshot.sunDepthBias = {-ps_r2_sun_depth_near_bias, ps_r2_sun_depth_far_bias};
+            snapshot.sunTsmBias = ps_r2_sun_tsm_bias;
+            snapshot.sunZCulling = ps_r2_ls_flags_ext.is(R2FLAGEXT_SUN_ZCULLING);
+            // Metal skips hardware initialization of o.advancedpp; preserve
+            // the authored Windows console/environment gate for ray reset.
+            snapshot.sunResetLastCascade = r2_advanced_pp && ps_sunshafts_mode &&
+                current.m_fSunShaftsIntensity >= 0.0001f;
 			snapshot.windAnimation = env.wind_anim.w;
 			snapshot.windVelocity = current.wind_velocity;
 			snapshot.rainDensity = current.rain_density;
@@ -406,12 +493,18 @@ void dxEnvironmentRender::OnFrame(CEnvironment& env)
 					adaptedSun->color.b};
 				snapshot.adaptedSunDirection = {adaptedSun->direction.x, adaptedSun->direction.y,
 					adaptedSun->direction.z};
+                snapshot.adaptedSunPosition = {adaptedSun->position.x, adaptedSun->position.y, adaptedSun->position.z};
 			}
 			else
 			{
 				snapshot.adaptedSunColor = snapshot.sunColor;
 				snapshot.adaptedSunDirection = snapshot.sunDirection;
+                snapshot.adaptedSunPosition = {Device.vCameraPosition.x - 500.0f * snapshot.sunDirection[0],
+                    Device.vCameraPosition.y - 500.0f * snapshot.sunDirection[1],
+                    Device.vCameraPosition.z - 500.0f * snapshot.sunDirection[2]};
 			}
+            snapshot.adaptedSunSpecular=u_diffuse2s(snapshot.adaptedSunColor[0],
+                snapshot.adaptedSunColor[1],snapshot.adaptedSunColor[2]);
 			if (env.Current[0] && env.Current[1] && env.Current[0]->sky_texture_name.size() &&
 				env.Current[1]->sky_texture_name.size())
 			{

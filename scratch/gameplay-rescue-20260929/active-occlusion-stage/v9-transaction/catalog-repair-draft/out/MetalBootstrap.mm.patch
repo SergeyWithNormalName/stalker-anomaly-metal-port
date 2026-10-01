@@ -1,0 +1,44 @@
+--- prestate/MetalBootstrap.mm	2026-09-29 19:36:48
++++ draft/MetalBootstrap.mm	2026-09-29 19:47:01
+@@ -648,6 +648,7 @@
+     std::uint32_t activeOcclusionScopesBegun = 0u;
+     bool activeOcclusionScopeCapLogged = false;
+     std::size_t activeOcclusionSourceVisuals = 0;
++    std::size_t activeOcclusionMateHintsCleared = 0;
+     std::size_t activeOcclusionCandidateVisuals = 0;
+     std::size_t activeOcclusionCandidateTriangles = 0;
+     std::size_t activeOcclusionOmittedVisuals = 0;
+@@ -980,6 +981,7 @@
+     scene.activeOcclusionEnabled = false;
+     scene.activeOcclusionSourceCatalog.Reset();
+     scene.activeOcclusionSourceVisuals = 0u;
++    scene.activeOcclusionMateHintsCleared = 0u;
+     scene.activeOcclusionObservation.admittedDraws.clear();
+     for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+     {
+@@ -1243,6 +1245,8 @@
+                         use.count = 3u;
+                     }
+             }
++            scene.activeOcclusionMateHintsCleared += NormalizeReciprocalMateHints(
++                visualTriangles.data(), visualTriangles.size());
+             const std::size_t firstTriangle = sourceTriangles.size();
+             if (firstTriangle > std::numeric_limits<std::uint32_t>::max() ||
+                 triangleCount > std::numeric_limits<std::uint32_t>::max() - firstTriangle)
+@@ -2081,7 +2085,7 @@
+         std::fprintf(stderr,
+             "METAL_ACTIVE_OCCLUSION_PREP status=%s reason=%s catalog_visuals=%zu "
+             "catalog_triangles=%zu catalog_bytes=%zu candidate_visuals=%zu candidate_triangles=%zu "
+-            "omitted_visuals=%zu omitted_triangles=%zu "
++            "omitted_visuals=%zu omitted_triangles=%zu mate_hints_cleared=%zu "
+             "excluded_materials=%zu excluded_trees=%zu invalid_visuals=%zu cap_visuals=%zu max_triangles=%zu\n",
+             scene.activeOcclusionEnabled ? "enabled" : "disabled",
+             scene.activeOcclusionEnabled ? "qualified-source-snapshot" :
+@@ -2093,6 +2097,7 @@
+             scene.activeOcclusionCandidateVisuals,
+             scene.activeOcclusionCandidateTriangles,
+             scene.activeOcclusionOmittedVisuals, scene.activeOcclusionOmittedTriangles,
++            scene.activeOcclusionMateHintsCleared,
+             scene.activeOcclusionExcludedMaterials, scene.activeOcclusionExcludedTrees,
+             scene.activeOcclusionInvalidVisuals, scene.activeOcclusionCapVisuals,
+             LevelScene::ActiveOcclusionMaxTriangles);

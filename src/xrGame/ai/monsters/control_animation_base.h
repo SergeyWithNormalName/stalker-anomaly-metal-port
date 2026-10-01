@@ -76,6 +76,14 @@ protected:
 	void init_anim_storage();
 	void free_anim_storage();
 
+	// eAnimUndefined is u32(-1) and must never reach m_anim_storage: indexing
+	// with it reads far past the vector (8 * 0xFFFFFFFF bytes).
+	bool has_animation(EMotionAnim anim) const
+	{
+		return anim != eAnimUndefined && anim < m_anim_storage.size() &&
+			m_anim_storage[anim] != nullptr;
+	}
+
 public:
 
 	EAction m_tAction;

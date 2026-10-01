@@ -1,0 +1,23 @@
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -1018,6 +1018,10 @@
+ 		static const Fvector omniDir[6] = {
+ 			{1.f, 0.f, 0.f}, {-1.f, 0.f, 0.f}, {0.f, 1.f, 0.f},
+ 			{0.f, -1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, -1.f}};
++        static const bool r1StaticPolicy = [] {
++            const char* flag = std::getenv("XRAY_METAL_R1_STATIC_POLICY");
++            return flag && std::strcmp(flag, "1") == 0;
++        }();
+ 		for (light* source : RImplementation.v_all_lights)
+ 		{
+ 			if (!source || !source->flags.bActive)
+@@ -1029,6 +1033,9 @@
+ 			if (sourceType == IRender_Light::DIRECT || sourceType == IRender_Light::REFLECTED ||
+ 				sourceType == IRender_Light::OMNIPART)
+ 				continue;
++            // Same package gate as CLight_DB::add_light; no camera/HOM/LOD policy change.
++            if (r1StaticPolicy && source->flags.bStatic && !ps_r2_ls_flags.test(R2FLAG_R1LIGHTS))
++                continue;
+ 			const u64 parentIdentity = static_cast<u64>(reinterpret_cast<uintptr_t>(source));
+ 			lightByParentIdentity.emplace(parentIdentity, source);
+ 			const auto append = [&](CDSGraphManager::MetalLocalLight::Type type,

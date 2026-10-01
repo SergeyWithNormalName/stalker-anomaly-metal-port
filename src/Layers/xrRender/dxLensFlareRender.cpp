@@ -45,10 +45,10 @@ void dxLensFlareRender::Render(CLensFlare& owner, BOOL bSun, BOOL bFlares, BOOL 
 		xray::metal::lensflare::Frame captured;
 		if (!owner.m_Current) { xray::metal::lensflare::Submit(std::move(captured)); return; }
 		const float distance = FAR_DIST * .75f;
-		auto append = [&captured](const Fvector& center, const Fvector& x, const Fvector& y,
+		auto append = [&captured, bSun](const Fvector& center, const Fvector& x, const Fvector& y,
 			float radius, u32 color, LPCSTR texture) {
 			if (!texture || !*texture) return;
-			xray::metal::lensflare::Draw draw; draw.texture = texture;
+			xray::metal::lensflare::Draw draw; draw.texture = texture; draw.afterPostprocess = !bSun;
 			Fvector p; const Fvector sx = Fvector().mul(x, radius), sy = Fvector().mul(y, radius);
 			const Fvector positions[4] = {Fvector().sub(Fvector().add(center, sx), sy), Fvector().add(Fvector().add(center, sx), sy), Fvector().sub(Fvector().sub(center, sx), sy), Fvector().add(Fvector().sub(center, sx), sy)};
 			const float uv[4][2]={{0,0},{0,1},{1,0},{1,1}};
@@ -64,7 +64,7 @@ void dxLensFlareRender::Render(CLensFlare& owner, BOOL bSun, BOOL bFlares, BOOL 
 			Fvector dx, dy; dx.normalize(owner.vecAxis); dy.crossproduct(dx, owner.vecDir);
 			for (auto& flare : owner.m_Current->m_Flares) { Fvector center; center.mad(owner.vecCenter, owner.vecAxis, flare.fPosition); color=light; color.mul_rgba(flare.fOpacity*owner.fBlend*owner.m_StateBlend); append(center,dx,dy,flare.fRadius*distance,color.get(),flare.texture.c_str()); }
 		}
-		if (bGradient && owner.fGradientValue >= EPS_L && owner.m_Current->m_Flags.is(CLensFlareDescriptor::flGradient)) { color=light; color.mul_rgba(owner.fGradientValue*owner.m_StateBlend); append(owner.vecLight,owner.vecX,owner.vecY,owner.m_Current->m_Gradient.fRadius*owner.fGradientValue*distance,color.get(),owner.m_Current->m_Gradient.texture.c_str()); }
+		if (bGradient && owner.fBlend >= EPS_L && owner.fGradientValue >= EPS_L && owner.m_Current->m_Flags.is(CLensFlareDescriptor::flGradient)) { color=light; color.mul_rgba(owner.fGradientValue*owner.m_StateBlend); append(owner.vecLight,owner.vecX,owner.vecY,owner.m_Current->m_Gradient.fRadius*owner.fGradientValue*distance,color.get(),owner.m_Current->m_Gradient.texture.c_str()); }
 		xray::metal::lensflare::Submit(std::move(captured));
 		return;
 	}

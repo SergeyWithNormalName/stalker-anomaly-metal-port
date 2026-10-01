@@ -1,0 +1,72 @@
+--- src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -479,6 +479,11 @@
+     std::unordered_map<std::string, CachedGeometry> geometry;
+     std::unordered_map<std::string, std::shared_ptr<IR4Texture>> textures;
+     std::vector<Draw> draws;
++    std::vector<std::size_t> mainDrawOrder;
++    bool mainMaterialOrder = [] {
++        const char* flag = std::getenv("XRAY_METAL_FLORA_MAIN_MATERIAL_ORDER");
++        return flag && std::strcmp(flag, "1") == 0;
++    }();
+     FloraShadowIndex shadowIndex;
+     bool shadowLinear = std::getenv("XRAY_METAL_E08_FLORA_LINEAR") != nullptr;
+     bool shadowOracle = std::getenv("XRAY_METAL_E08_FLORA_ORACLE") != nullptr;
+@@ -838,6 +843,15 @@
+         m_impl->draws.emplace_back(std::move(draw));
+         ++m_telemetry.admittedVisuals;
+     }
++    m_impl->mainDrawOrder.resize(m_impl->draws.size());
++    std::iota(m_impl->mainDrawOrder.begin(), m_impl->mainDrawOrder.end(), 0u);
++    if (m_impl->mainMaterialOrder)
++        std::stable_partition(m_impl->mainDrawOrder.begin(), m_impl->mainDrawOrder.end(),
++            [this](const std::size_t index) {
++                return m_impl->draws[index].material == Impl::Material::TrunkFlat;
++            });
++    std::fprintf(stderr, "METAL_FLORA_MAIN_MATERIAL_ORDER enabled=%d draws=%zu shadows_unchanged=1\n",
++        int(m_impl->mainMaterialOrder), m_impl->mainDrawOrder.size());
+     for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
+     {
+         const auto& d = m_impl->draws[i];
+@@ -905,8 +919,11 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
+-    for (Impl::Draw& draw : m_impl->draws)
+-    {
++    std::shared_ptr<IR4GraphicsPipeline> lastMainPipeline;
++    std::size_t mainPipelineBinds = 0;
++    for (const std::size_t index : m_impl->mainDrawOrder)
++    {
++        Impl::Draw& draw = m_impl->draws[index];
+         const Matrix4 wvp = multiply(vp, draw.model);
+         const Matrix4 wv = multiply(viewMatrix, draw.model);
+         if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
+@@ -1038,14 +1055,25 @@
+         indexed.indexBuffer = draw.indices;
+         indexed.indexCount = draw.indexCount;
+         indexed.indexType = R4IndexType::UInt16;
+-        if (!backend.BindGraphicsPipeline(leaf ? m_impl->leafPipeline : m_impl->trunkPipeline, error) ||
+-            !backend.BindVertexBuffer(6u, draw.vertices, 0, error) ||
++        const auto& pipeline = leaf ? m_impl->leafPipeline : m_impl->trunkPipeline;
++        if (!m_impl->mainMaterialOrder || pipeline != lastMainPipeline)
++        {
++            if (!backend.BindGraphicsPipeline(pipeline, error))
++                return false;
++            lastMainPipeline = pipeline;
++            ++mainPipelineBinds;
++        }
++        if (!backend.BindVertexBuffer(6u, draw.vertices, 0, error) ||
+             !backend.BindMscResources(vs, error) || !backend.BindMscResources(ps, error) ||
+             !backend.DrawIndexed(indexed, error))
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
+     }
++    static std::size_t mainFrames = 0;
++    if (++mainFrames % 300u == 0u)
++        std::fprintf(stderr, "METAL_FLORA_MAIN_MATERIAL_FRAME enabled=%d draws=%zu pipeline_binds=%zu\n",
++            int(m_impl->mainMaterialOrder), m_telemetry.draws, mainPipelineBinds);
+     return true;
+ }
+ 

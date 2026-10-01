@@ -1,0 +1,406 @@
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.h
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.h
+@@ -85,7 +85,34 @@
+ 	std::uint32_t visualId = 0;
+ 	std::uint8_t visualType = 0;
+ 	std::uint16_t shaderId = 0;
++	std::array<float, 6> box{};
++	std::array<float, 4> sphere{};
++	bool boundsValid = false;
+ 	std::vector<std::uint32_t> linkedChildren;
++};
++
++struct R4LevelSectorTopology
++{
++	std::uint32_t sectorId = 0;
++	std::uint32_t rootVisualId = 0;
++	std::vector<std::uint16_t> portalIds;
++};
++
++struct R4LevelPortalTopology
++{
++	std::uint32_t portalId = 0;
++	std::uint16_t frontSector = 0;
++	std::uint16_t backSector = 0;
++	std::vector<std::array<float, 3>> vertices;
++};
++
++struct R4LevelPortalMetadata
++{
++	bool available = false;
++	std::string unavailableReason = "sector topology was not parsed";
++	std::vector<R4LevelSectorTopology> sectors;
++	std::vector<R4LevelPortalTopology> portals;
++	std::vector<std::vector<std::uint32_t>> visualOwnerSectors;
+ };
+ 
+ struct R4LevelGeometry
+@@ -95,6 +122,7 @@
+ 	std::vector<R4LevelShader> shaders;
+ 	std::vector<R4VisualNode> visualNodes;
+ 	std::vector<R4StaticVisual> visuals;
++	R4LevelPortalMetadata portalMetadata;
+ };
+ 
+ bool CollectR4StaticVisualDescendants(
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
+@@ -6,6 +6,7 @@
+ #include <fstream>
+ #include <limits>
+ #include <sstream>
++#include <utility>
+ 
+ namespace xray::metal
+ {
+@@ -16,9 +17,13 @@
+ constexpr std::uint32_t kLevelShadersChunk = 2u;
+ constexpr std::uint32_t kLevelVertexBuffersChunk = 9u;
+ constexpr std::uint32_t kLevelIndexBuffersChunk = 10u;
++constexpr std::uint32_t kLevelPortalsChunk = 4u;
++constexpr std::uint32_t kLevelSectorsChunk = 8u;
+ constexpr std::uint32_t kOgfGeometryContainerChunk = 21u;
+ constexpr std::uint32_t kOgfHeaderChunk = 1u;
+ constexpr std::uint32_t kOgfLinkedChildrenChunk = 10u;
++constexpr std::uint32_t kSectorPortalsChunk = 1u;
++constexpr std::uint32_t kSectorRootChunk = 2u;
+ constexpr std::uint32_t kOgfTreeDefinitionChunk = 12u;
+ constexpr std::uint8_t kOgfFormatVersion = 4u;
+ constexpr std::uint16_t kD3dDeclEndStream = 0xffu;
+@@ -92,6 +97,18 @@
+ 	static_assert(sizeof(bits) == sizeof(value), "float must be 32-bit");
+ 	std::memcpy(&value, &bits, sizeof(value));
+ 	return true;
++}
++
++const Chunk* findOptionalUniqueChunk(const std::vector<Chunk>& chunks, const std::uint32_t id, bool& duplicate)
++{
++	const Chunk* found = nullptr;
++	for (const Chunk& chunk : chunks)
++		if (chunk.id == id)
++		{
++			if (found) { duplicate = true; return nullptr; }
++			found = &chunk;
++		}
++	return found;
+ }
+ 
+ bool readStringZ(
+@@ -460,6 +477,133 @@
+ 	appendU32(destination, static_cast<std::uint32_t>(payload.size()));
+ 	destination.insert(destination.end(), payload.begin(), payload.end());
+ }
++
++void parsePortalMetadata(const std::vector<std::uint8_t>& bytes, const std::vector<Chunk>& levelChunks,
++	R4LevelGeometry& geometry)
++{
++	auto& metadata = geometry.portalMetadata;
++	auto unavailable = [&metadata](const std::string& reason) {
++		metadata.available = false;
++		metadata.unavailableReason = reason;
++		metadata.sectors.clear(); metadata.portals.clear(); metadata.visualOwnerSectors.clear();
++	};
++	std::string error;
++	bool duplicate = false;
++	const Chunk* sectorChunk = findOptionalUniqueChunk(levelChunks, kLevelSectorsChunk, duplicate);
++	if (duplicate || !sectorChunk) { unavailable("missing or duplicate fsL_SECTORS"); return; }
++	std::vector<Chunk> sectorChunks;
++	if (!scanChunks(bytes, sectorChunk->dataBegin, sectorChunk->dataEnd, sectorChunks, error))
++		{ unavailable("malformed fsL_SECTORS: " + error); return; }
++	if (sectorChunks.empty()) { unavailable("empty fsL_SECTORS"); return; }
++	if (sectorChunks.size() > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1u)
++		{ unavailable("sector count exceeds portal endpoint ID range"); return; }
++	metadata.sectors.reserve(sectorChunks.size());
++	for (std::size_t index = 0; index < sectorChunks.size(); ++index)
++	{
++		const Chunk& sectorChunkData = sectorChunks[index];
++		if (sectorChunkData.id != index) { unavailable("sector chunk IDs are not dense"); return; }
++		std::vector<Chunk> chunks;
++		if (!scanChunks(bytes, sectorChunkData.dataBegin, sectorChunkData.dataEnd, chunks, error))
++			{ unavailable("malformed sector chunk: " + error); return; }
++		duplicate = false;
++		const Chunk* portalIds = findOptionalUniqueChunk(chunks, kSectorPortalsChunk, duplicate);
++		const Chunk* root = findOptionalUniqueChunk(chunks, kSectorRootChunk, duplicate);
++		if (duplicate || !portalIds || !root || (portalIds->dataEnd - portalIds->dataBegin) % 2u != 0u ||
++			root->dataEnd - root->dataBegin != 4u)
++			{ unavailable("sector portal/root chunks are missing, duplicate, or malformed"); return; }
++		R4LevelSectorTopology sector;
++		sector.sectorId = static_cast<std::uint32_t>(index);
++		if (!readU32(bytes, root->dataBegin, sector.rootVisualId) || sector.rootVisualId >= geometry.visualNodes.size())
++			{ unavailable("sector root visual ID is out of range"); return; }
++		const R4VisualNode& rootNode = geometry.visualNodes[sector.rootVisualId];
++		if (!rootNode.boundsValid) { unavailable("sector root OGF bounds are invalid"); return; }
++		for (std::size_t cursor = portalIds->dataBegin; cursor < portalIds->dataEnd; cursor += 2u)
++		{
++			std::uint16_t portalId = 0;
++			if (!readU16(bytes, cursor, portalId)) { unavailable("unreadable sector portal ID"); return; }
++			if (std::find(sector.portalIds.begin(), sector.portalIds.end(), portalId) != sector.portalIds.end())
++				{ unavailable("duplicate sector portal ID"); return; }
++			sector.portalIds.push_back(portalId);
++		}
++		metadata.sectors.push_back(std::move(sector));
++	}
++
++	duplicate = false;
++	const Chunk* portalChunk = findOptionalUniqueChunk(levelChunks, kLevelPortalsChunk, duplicate);
++	if (duplicate) { unavailable("duplicate fsL_PORTALS"); return; }
++	if (portalChunk)
++	{
++		constexpr std::size_t PortalRecordBytes = 80u; // u16 front/back, 6*Fvector, svector count
++		const std::size_t bytesAvailable = portalChunk->dataEnd - portalChunk->dataBegin;
++		if (bytesAvailable % PortalRecordBytes != 0u) { unavailable("fsL_PORTALS record size mismatch"); return; }
++		const std::size_t count = bytesAvailable / PortalRecordBytes;
++		if (count > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1u)
++			{ unavailable("portal count exceeds sector portal ID range"); return; }
++		metadata.portals.reserve(count);
++		for (std::size_t index = 0; index < count; ++index)
++		{
++			const std::size_t offset = portalChunk->dataBegin + index * PortalRecordBytes;
++			R4LevelPortalTopology portal;
++			portal.portalId = static_cast<std::uint32_t>(index);
++			std::uint32_t vertexCount = 0;
++			if (!readU16(bytes, offset, portal.frontSector) || !readU16(bytes, offset + 2u, portal.backSector) ||
++				!readU32(bytes, offset + 76u, vertexCount) || vertexCount < 3u || vertexCount > 6u ||
++				portal.frontSector == portal.backSector || portal.frontSector >= metadata.sectors.size() ||
++				portal.backSector >= metadata.sectors.size())
++				{ unavailable("portal endpoint or vertex count is invalid"); return; }
++			portal.vertices.reserve(vertexCount);
++			for (std::uint32_t vertex = 0; vertex < vertexCount; ++vertex)
++			{
++				std::array<float, 3> point{};
++				for (std::size_t axis = 0; axis < 3u; ++axis)
++					if (!readFloat(bytes, offset + 4u + (vertex * 3u + axis) * sizeof(float), point[axis]) ||
++						!std::isfinite(point[axis]))
++						{ unavailable("portal vertex is unreadable or nonfinite"); return; }
++				portal.vertices.push_back(point);
++			}
++			metadata.portals.push_back(std::move(portal));
++		}
++	}
++	for (const R4LevelSectorTopology& sector : metadata.sectors)
++		for (const std::uint16_t portalId : sector.portalIds)
++			if (portalId >= metadata.portals.size())
++				{ unavailable("sector references a missing portal ID"); return; }
++			else if (sector.sectorId != metadata.portals[portalId].frontSector &&
++				sector.sectorId != metadata.portals[portalId].backSector)
++				{ unavailable("sector lists a portal that is not incident to it"); return; }
++	for (const R4LevelPortalTopology& portal : metadata.portals)
++	{
++		const auto incident = [&portal](const R4LevelSectorTopology& sector) {
++			return std::find(sector.portalIds.begin(), sector.portalIds.end(), portal.portalId) != sector.portalIds.end();
++		};
++		if (!incident(metadata.sectors[portal.frontSector]) || !incident(metadata.sectors[portal.backSector]))
++			{ unavailable("portal endpoints do not list the portal as incident"); return; }
++	}
++
++	metadata.visualOwnerSectors.resize(geometry.visualNodes.size());
++	for (const R4LevelSectorTopology& sector : metadata.sectors)
++	{
++		std::vector<std::uint8_t> state(geometry.visualNodes.size(), 0u);
++		std::vector<std::pair<std::uint32_t, bool>> stack{{sector.rootVisualId, false}};
++		while (!stack.empty())
++		{
++			const auto [visualId, leaving] = stack.back(); stack.pop_back();
++			if (visualId >= geometry.visualNodes.size()) { unavailable("visual descendant ID is out of range"); return; }
++			if (leaving) { state[visualId] = 2u; continue; }
++			if (state[visualId] == 1u) { unavailable("cycle in sector root visual hierarchy"); return; }
++			if (state[visualId] == 2u) continue;
++			state[visualId] = 1u;
++			auto& owners = metadata.visualOwnerSectors[visualId];
++			if (std::find(owners.begin(), owners.end(), sector.sectorId) == owners.end()) owners.push_back(sector.sectorId);
++			stack.emplace_back(visualId, true);
++			const auto& children = geometry.visualNodes[visualId].linkedChildren;
++			for (auto child = children.rbegin(); child != children.rend(); ++child)
++				stack.emplace_back(*child, false);
++		}
++	}
++	metadata.available = true;
++	metadata.unavailableReason.clear();
++}
+ } // namespace
+ 
+ bool ParseR4LevelGeometry(
+@@ -605,6 +749,19 @@
+ 			error = "unreadable OGF_HEADER shader id";
+ 			return false;
+ 		}
++		node.boundsValid = true;
++		for (std::size_t index = 0; index < node.box.size(); ++index)
++		{
++			if (!readFloat(levelBytes, header->dataBegin + 4u + index * sizeof(float), node.box[index]) ||
++				!std::isfinite(node.box[index])) node.boundsValid = false;
++		}
++		for (std::size_t index = 0; index < node.sphere.size(); ++index)
++		{
++			if (!readFloat(levelBytes, header->dataBegin + 28u + index * sizeof(float), node.sphere[index]) ||
++				!std::isfinite(node.sphere[index])) node.boundsValid = false;
++		}
++		node.boundsValid = node.boundsValid && node.box[0] <= node.box[3] && node.box[1] <= node.box[4] &&
++			node.box[2] <= node.box[5] && node.sphere[3] >= 0.0f;
+ 		if (linkedChildren)
+ 		{
+ 			std::size_t childCursor = linkedChildren->dataBegin;
+@@ -751,6 +908,7 @@
+ 			}
+ 		}
+ 	}
++	parsePortalMetadata(levelBytes, levelChunks, result);
+ 
+ 	return true;
+ }
+@@ -903,6 +1061,8 @@
+ 	header[0] = kOgfFormatVersion;
+ 	header[1] = 7u;
+ 	header[2] = 1u;
++	const std::array<float, 10> headerBounds{-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 2.0f};
++	std::memcpy(header.data() + 4u, headerBounds.data(), headerBounds.size() * sizeof(float));
+ 	appendChunk(visual, kOgfHeaderChunk, header);
+ 	std::vector<std::uint8_t> treeDefinition;
+ 	for (std::size_t element = 0; element < 16u; ++element)
+@@ -913,7 +1073,7 @@
+ 		if (element == 14u) value = 4.0f;
+ 		appendFloat(treeDefinition, value);
+ 	}
+-	treeDefinition.resize(96u, 0u);
++	treeDefinition.resize(104u, 0u);
+ 	appendChunk(visual, kOgfTreeDefinitionChunk, treeDefinition);
+ 	appendChunk(visual, kOgfGeometryContainerChunk, geometryContainer);
+ 	std::vector<std::uint8_t> visuals;
+@@ -922,6 +1082,8 @@
+ 	std::vector<std::uint8_t> hierarchyHeader(44u, 0u);
+ 	hierarchyHeader[0] = kOgfFormatVersion;
+ 	hierarchyHeader[1] = 1u;
++	const std::array<float, 10> hierarchyBounds{-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 2.0f};
++	std::memcpy(hierarchyHeader.data() + 4u, hierarchyBounds.data(), hierarchyBounds.size() * sizeof(float));
+ 	appendChunk(hierarchy, kOgfHeaderChunk, hierarchyHeader);
+ 	std::vector<std::uint8_t> children;
+ 	appendU32(children, 1u);
+@@ -980,6 +1142,128 @@
+ 		return false;
+ 	}
+ 	error.clear();
++	if (parsed.portalMetadata.available || parsed.portalMetadata.unavailableReason.empty() ||
++		!parsed.visuals.front().valid)
++	{
++		error = "missing optional sector metadata changed normal geometry admission";
++		return false;
++	}
++
++	std::vector<std::uint8_t> topologyLevelBytes = levelBytes;
++	std::vector<std::uint8_t> portalPayload;
++	appendU16(portalPayload, 0u); appendU16(portalPayload, 1u);
++	for (float value : {2.0f, -1.0f, -1.0f, 2.0f, 1.0f, -1.0f, 2.0f, 1.0f, 1.0f,
++		2.0f, -1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}) appendFloat(portalPayload, value);
++	appendU32(portalPayload, 4u);
++	appendChunk(topologyLevelBytes, kLevelPortalsChunk, portalPayload);
++	std::vector<std::uint8_t> sectorsPayload;
++	for (std::uint32_t sectorId = 0u; sectorId < 2u; ++sectorId)
++	{
++		std::vector<std::uint8_t> sectorPayload, portalIds, rootPayload;
++		appendU16(portalIds, 0u); appendChunk(sectorPayload, kSectorPortalsChunk, portalIds);
++		appendU32(rootPayload, sectorId == 0u ? 1u : 0u);
++		appendChunk(sectorPayload, kSectorRootChunk, rootPayload);
++		appendChunk(sectorsPayload, sectorId, sectorPayload);
++	}
++	appendChunk(topologyLevelBytes, kLevelSectorsChunk, sectorsPayload);
++	if (!ParseR4LevelGeometry(geometryBytes, topologyLevelBytes, parsed, error) ||
++		!parsed.portalMetadata.available || parsed.portalMetadata.sectors.size() != 2u ||
++		parsed.portalMetadata.portals.size() != 1u || parsed.portalMetadata.visualOwnerSectors.size() != 2u ||
++		parsed.portalMetadata.visualOwnerSectors[0] != std::vector<std::uint32_t>{0u, 1u} ||
++		parsed.portalMetadata.visualOwnerSectors[1] != std::vector<std::uint32_t>{0u} ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "valid multi-root portal metadata fixture failed or changed geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> foreignPortalTopology = topologyLevelBytes;
++	std::vector<Chunk> topChunks;
++	bool duplicateChunk = false;
++	topChunks.clear();
++	if (!scanChunks(foreignPortalTopology, 0u, foreignPortalTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* foreignSectors = findOptionalUniqueChunk(topChunks, kLevelSectorsChunk, duplicateChunk);
++	if (!foreignSectors || duplicateChunk || foreignSectors->dataEnd != foreignPortalTopology.size())
++		{ error = "foreign-sector fixture chunk missing or not final"; return false; }
++	std::vector<std::uint8_t> foreignSectorPayload, foreignPortalIds, foreignRoot;
++	appendU16(foreignPortalIds, 0u); appendChunk(foreignSectorPayload, kSectorPortalsChunk, foreignPortalIds);
++	appendU32(foreignRoot, 0u); appendChunk(foreignSectorPayload, kSectorRootChunk, foreignRoot);
++	std::vector<std::uint8_t> foreignSectorChunk;
++	appendChunk(foreignSectorChunk, 2u, foreignSectorPayload);
++	const std::size_t foreignSectorListSize = foreignSectors->dataEnd - foreignSectors->dataBegin + foreignSectorChunk.size();
++	for (std::size_t byte = 0u; byte < 4u; ++byte)
++		foreignPortalTopology[foreignSectors->dataBegin - 4u + byte] =
++			static_cast<std::uint8_t>((foreignSectorListSize >> (byte * 8u)) & 0xffu);
++	foreignPortalTopology.insert(foreignPortalTopology.end(), foreignSectorChunk.begin(), foreignSectorChunk.end());
++	if (!ParseR4LevelGeometry(geometryBytes, foreignPortalTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid ||
++		parsed.portalMetadata.unavailableReason.find("not incident") == std::string::npos)
++	{
++		if (error.empty()) error = "foreign-sector portal reference did not fail open while preserving geometry";
++		return false;
++	}
++	std::vector<std::uint8_t> malformedTopology = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(malformedTopology, 0u, malformedTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* malformedPortals = findOptionalUniqueChunk(topChunks, kLevelPortalsChunk, duplicateChunk);
++	if (!malformedPortals || duplicateChunk) { error = "portal fixture chunk missing"; return false; }
++	malformedTopology[malformedPortals->dataBegin + 2u] = 9u;
++	if (!ParseR4LevelGeometry(geometryBytes, malformedTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "malformed optional portal metadata affected geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> unorderedRootBounds = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(unorderedRootBounds, 0u, unorderedRootBounds.size(), topChunks, error)) return false;
++	const Chunk* boundsVisualList = findOptionalUniqueChunk(topChunks, kLevelVisualsChunk, duplicateChunk);
++	if (!boundsVisualList || duplicateChunk) { error = "visual fixture chunk missing"; return false; }
++	std::vector<Chunk> boundsVisualItems;
++	if (!scanChunks(unorderedRootBounds, boundsVisualList->dataBegin, boundsVisualList->dataEnd, boundsVisualItems, error)) return false;
++	const Chunk* rootItem = nullptr;
++	for (const Chunk& item : boundsVisualItems) if (item.id == 1u) rootItem = &item;
++	if (!rootItem) { error = "root visual fixture missing"; return false; }
++	std::vector<Chunk> rootOgfChunks;
++	if (!scanChunks(unorderedRootBounds, rootItem->dataBegin, rootItem->dataEnd, rootOgfChunks, error)) return false;
++	const Chunk* rootHeader = nullptr;
++	for (const Chunk& item : rootOgfChunks) if (item.id == kOgfHeaderChunk) rootHeader = &item;
++	if (!rootHeader) { error = "root OGF header fixture missing"; return false; }
++	const float invertedMaxX = -2.0f;
++	std::memcpy(unorderedRootBounds.data() + rootHeader->dataBegin + 4u + 3u * sizeof(float),
++		&invertedMaxX, sizeof(invertedMaxX));
++	if (!ParseR4LevelGeometry(geometryBytes, unorderedRootBounds, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid || parsed.visualNodes[1].boundsValid)
++	{
++		if (error.empty()) error = "invalid optional root bounds affected geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> cyclicTopology = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(cyclicTopology, 0u, cyclicTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* visualList = findOptionalUniqueChunk(topChunks, kLevelVisualsChunk, duplicateChunk);
++	if (!visualList || duplicateChunk) { error = "visual fixture chunk missing"; return false; }
++	std::vector<Chunk> visualItems;
++	if (!scanChunks(cyclicTopology, visualList->dataBegin, visualList->dataEnd, visualItems, error)) return false;
++	const Chunk* hierarchyChunk = nullptr;
++	for (const Chunk& item : visualItems) if (item.id == 1u) hierarchyChunk = &item;
++	if (!hierarchyChunk) { error = "hierarchy fixture missing"; return false; }
++	std::vector<Chunk> hierarchyChunks;
++	if (!scanChunks(cyclicTopology, hierarchyChunk->dataBegin, hierarchyChunk->dataEnd, hierarchyChunks, error)) return false;
++	const Chunk* hierarchyLinks = nullptr;
++	for (const Chunk& item : hierarchyChunks) if (item.id == kOgfLinkedChildrenChunk) hierarchyLinks = &item;
++	if (!hierarchyLinks || hierarchyLinks->dataEnd - hierarchyLinks->dataBegin != 8u)
++		{ error = "hierarchy link fixture malformed"; return false; }
++	cyclicTopology[hierarchyLinks->dataBegin + 4u] = 1u;
++	if (!ParseR4LevelGeometry(geometryBytes, cyclicTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "optional topology cycle affected geometry admission";
++		return false;
++	}
++	error.clear();
+ 
+ 	geometryBytes.back() = 3u;
+ 	if (!ParseR4LevelGeometry(geometryBytes, levelBytes, parsed, error))

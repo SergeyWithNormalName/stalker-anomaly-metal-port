@@ -76,6 +76,13 @@ int MONSTER_COMMUNITY::relation(MONSTER_COMMUNITY_INDEX from, MONSTER_COMMUNITY_
 	VERIFY(from >= 0 && from <(int)m_relation_table.table().size());
 	VERIFY(to >= 0 && to <(int)m_relation_table.table().size());
 
+	// VERIFY is compiled out in this build configuration, so an unresolved
+	// species (NO_MONSTER_COMMUNITY_INDEX) used to index the table out of
+	// bounds and returned arbitrary friend/enemy results.  CHARACTER_COMMUNITY
+	// keeps the same guard; mirror it here.
+	if (from == NO_MONSTER_COMMUNITY_INDEX || to == NO_MONSTER_COMMUNITY_INDEX)
+		return 0;
+
 	return m_relation_table.table()[from][to];
 }
 

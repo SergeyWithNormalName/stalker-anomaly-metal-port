@@ -28,6 +28,8 @@
 #include "UIMessageBoxEx.h"
 #include "UIPropertiesBox.h"
 #include "UIMainIngameWnd.h"
+#include <dinput.h>
+#include "../xrEngine/xr_gamepad_nav.h"
 
  //Alundaio
 
@@ -418,6 +420,99 @@ bool CUIActorMenu::OnMouseAction(float x, float y, EUIMessages mouse_action)
 bool CUIActorMenu::OnKeyboardAction(int dik, EUIMessages keyboard_action)
 {
 	InfoCurItem(NULL);
+
+	// 1. If context menu (PropertiesBox) is open, forward navigation and selection to it
+	if (m_UIPropertiesBox && m_UIPropertiesBox->IsShown())
+	{
+		if (m_UIPropertiesBox->OnKeyboardAction(dik, keyboard_action))
+			return true;
+	}
+
+	// Enter activates the item under controller selection. The properties box
+	// above keeps priority while it is open.
+	if (keyboard_action == WINDOW_KEY_PRESSED &&
+	    (dik == DIK_RETURN || dik == DIK_NUMPADENTER) && CurrentItem())
+	{
+		OnItemDbClick(CurrentItem());
+		return true;
+	}
+
+	// 2. Spatial grid navigation in inventory lists
+	if (keyboard_action == WINDOW_KEY_PRESSED &&
+	    (dik == DIK_UP || dik == DIK_DOWN || dik == DIK_LEFT || dik == DIK_RIGHT))
+	{
+		ENavDirection dir;
+		if (dik == DIK_UP) dir = NAV_UP;
+		else if (dik == DIK_DOWN) dir = NAV_DOWN;
+		else if (dik == DIK_LEFT) dir = NAV_LEFT;
+		else dir = NAV_RIGHT;
+
+		// Select active list
+		CUIDragDropListEx* activeList = m_pInventoryBagList;
+		if (m_currMenuMode == mmDeadBodySearch && m_pDeadBodyBagList && m_pDeadBodyBagList->IsShown())
+		{
+			if (CurrentItem() && m_pDeadBodyBagList->IsOwner(CurrentItem()))
+				activeList = m_pDeadBodyBagList;
+		}
+		else if (m_currMenuMode == mmTrade && m_pTradePartnerBagList && m_pTradePartnerBagList->IsShown())
+		{
+			if (CurrentItem() && m_pTradePartnerBagList->IsOwner(CurrentItem()))
+				activeList = m_pTradePartnerBagList;
+			else if (m_pTradeActorBagList && m_pTradeActorBagList->IsShown())
+				activeList = m_pTradeActorBagList;
+		}
+
+		if (activeList && activeList->ItemsCount() > 0)
+		{
+			std::vector<SNavCandidate> targets;
+			const u32 count = activeList->ItemsCount();
+			targets.reserve(count);
+			for (u32 i = 0; i < count; ++i)
+			{
+				CUICellItem* itm = activeList->GetItemIdx(i);
+				if (itm && itm->IsShown())
+				{
+					Frect r;
+					itm->GetAbsoluteRect(r);
+					targets.push_back(SNavCandidate((int)i, SNavRect(r.x1, r.y1, r.x2, r.y2), true, true));
+				}
+			}
+
+			const bool hasCurrentItem = CurrentItem() && activeList->IsOwner(CurrentItem());
+			SNavRect curNavRect;
+			if (hasCurrentItem)
+			{
+				Frect curRect;
+				CurrentItem()->GetAbsoluteRect(curRect);
+				curNavRect = SNavRect(curRect.x1, curRect.y1, curRect.x2, curRect.y2);
+			}
+			else
+			{
+				const Fvector2 curPos = GetUICursor().GetCursorPosition();
+				curNavRect = SNavRect(curPos.x, curPos.y, curPos.x + 1.0f, curPos.y + 1.0f);
+			}
+
+			// With no selection, seed navigation from the first visible item. A
+			// directional half-plane search from the cursor can otherwise find no
+			// target at all when the cursor is already beyond the list in that direction.
+			int bestIdx = hasCurrentItem
+				? FindBestSpatialNeighbor(curNavRect, targets, dir)
+				: (targets.empty() ? -1 : targets.front().id);
+			if (bestIdx >= 0 && u32(bestIdx) < count)
+			{
+				CUICellItem* targetItem = activeList->GetItemIdx(bestIdx);
+				if (targetItem)
+				{
+					Frect r;
+					targetItem->GetAbsoluteRect(r);
+					GetUICursor().SetUICursorPosition(Fvector2().set(r.x1 + r.width() * 0.5f, r.y1 + r.height() * 0.5f));
+					SetCurrentItem(targetItem);
+					return true;
+				}
+			}
+		}
+	}
+
 	if (is_binded(kDROP, dik))
 	{
 		if (WINDOW_KEY_PRESSED == keyboard_action && CurrentIItem() && !CurrentIItem()->IsQuestItem()

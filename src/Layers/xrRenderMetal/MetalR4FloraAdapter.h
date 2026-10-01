@@ -2,6 +2,7 @@
 
 #include "IR4Backend.h"
 #include "R4DdsTexture.h"
+#include "R4FloraBlenderMaterial.h"
 #include "R4LevelGeometry.h"
 
 #include <array>
@@ -24,10 +25,26 @@ struct R4FloraViewState
     // shaders consume ambient/hemi/sun/fog here; synthesizing a zero-filled
     // copy turns otherwise valid foliage into black silhouettes.
     std::shared_ptr<IR4Buffer> staticGlobals;
+    std::array<std::array<float, 4>, 32> previousBenders{};
+    std::array<std::array<float, 4>, 32> currentBenders{};
+    std::array<float, 4> bendersSetup{};
+    std::array<float, 4> windParams{};
+    std::array<float, 4> windSetupGrass{};
+    std::array<float, 4> windSetupTrees{};
+    std::array<float, 4> windAnimation{};
+    std::array<float, 4> windAnimationPrevious{};
     float treeScaleBiasCorrection = 1.0f;
     float timeSeconds = 0.0f;
     bool valid = false;
     bool previousValid = false;
+    bool windValid = false;
+    // Validation-only switch: draw alpha-tested leaf geometry through the
+    // same branch-wind vertex path but use the opaque depth-only fragment
+    // shader to measure the coverage hidden by alpha discard.
+    bool shadowIgnoreAlpha = false;
+    // Validation-only selector: shadow draws are restricted to tree visuals
+    // outside the production camera frustum when true.
+    bool shadowOnlyOffCamera = false;
 };
 
 // MSC's tree input is P4/N4/T3/B3/I4.  Level geometry is P3/C4/C4/C4/S4;
@@ -67,6 +84,15 @@ public:
         std::filesystem::path leafFragmentMetallibPath;
         std::filesystem::path trunkVertexMetallibPath;
         std::filesystem::path trunkFragmentMetallibPath;
+        // Optional, isolated shadow caster shader bundle. When empty, the
+        // visible Flora path stays available and shadow draws are a no-op.
+        std::filesystem::path shadowShaderDirectory;
+        std::filesystem::path instancedShadowShaderDirectory;
+        std::filesystem::path wavesTexturePath;
+        // Archive-winning CBlender_Tree settings from shaders.xr, keyed by
+        // the exact shader name in R4LevelGeometry. Missing records are
+        // rejected instead of inferring alpha or Object LOD state.
+        std::vector<R4FloraBlenderMaterial> shaderMaterials;
         xray::metal::R4DdsBytesProvider ddsBytesProvider;
     };
 
@@ -79,6 +105,9 @@ public:
         std::size_t submittedVisuals = 0;
         std::size_t culledVisuals = 0;
         std::size_t draws = 0;
+        std::size_t shadowSubmittedVisuals = 0;
+        std::size_t shadowCulledVisuals = 0;
+        std::size_t shadowDraws = 0;
     };
 
     MetalR4FloraAdapter();
@@ -99,6 +128,21 @@ public:
     // Requires an already-open, scene-owned G-buffer encoder.
     bool DrawIntoActiveGBuffer(IR4Backend& backend,
         const R4FloraViewState& view, std::string& error);
+
+    // Requires the active sun/local shadow pass. lightViewProjection must be
+    // the exact matrix used by the corresponding Windows shadow phase.
+    bool DrawShadowCasters(IR4Backend& backend,
+        const std::array<float, 16>& lightViewProjection,
+        const R4FloraViewState& view, std::string& error);
+
+    // Diagnostic-only draw into an isolated scene-owned pass. Selects one
+    // implementation for this call and restores configured mode/telemetry.
+    bool DrawShadowCastersForValidation(IR4Backend& backend,
+        const std::array<float, 16>& lightViewProjection,
+        const R4FloraViewState& view, bool instanced,
+        Telemetry& sampledTelemetry, std::string& error);
+
+    bool HasShadowCasters() const;
 
     bool IsReady() const { return m_ready; }
     const std::string& Status() const { return m_status; }

@@ -1,0 +1,17 @@
+# V7 hybrid observer preparation
+
+This is a scratch-only adaptation of the frozen V6 observer workflow. It has not been used to build or launch the game. The copied Lua marker harness keeps the single frame 300–311 window, fixed canonical Cordon save/camera, direct-executable path, and start/end/drain markers. The runner clones the canonical runtime once, preserves the original/V4/V5/V6 app hashes, refuses without an explicit root token and reviewed V7 executable hash, validates the V7 source manifest against the live checkout, and keeps the 180-second owned-PID watchdog. It enables only the requested active-occlusion and whole-light observer switches in addition to the existing V6 candidate settings. It does not capture screenshots or emit FPS/performance acceptance claims.
+
+The parser joins CPU face rows to submitted GPU face receipts on the full `(cpu_observation_scope, engine_frame, batch_id, light_id, parent_light_id, face)` identity, then also requires matching `group_kind` and `expected_faces`. A GPU group counts only when its completed group row, every expected valid face receipt, per-face count sum, matching CPU rows and ready GRID summary, and selected tile receipts are all complete. A CPU `behind` face matched to a valid submitted GPU face with a positive receiver-sample count is reported independently as a hard false-hidden finding, even when other faces make the group mixed. Missing, duplicate, mixed-scope, scope-zero, unknown, skipped, invalid, and malformed evidence remains inconclusive. A complete zero GPU group whose CPU faces are not all behind is reported as a missed zero group. `build_ms` and `query_ms` are reported as separate grid costs; no saved-time or FPS inference is made.
+
+The GRID summary must be unique per nonzero scope/frame, follow all scoped CPU FACE rows, match their face and explicit group counts, and reconcile aggregate query-cell tests with the face rows. A ready grid with triangle/cell cap bits set can still qualify the helper's conservatively retained covered subset; the bits remain visible in the report. Unknown/skipped grids and `unknown` face predictions cannot qualify a correlated group.
+
+## Offline validation
+
+- `bash -n run_observer_v7.sh`: passed; exit code is recorded in `out/bash-n-final.exit`.
+- `python3 test_summarize_observation_v7.py`: passed; output is recorded in `out/parser-fixtures-final.log` and exit code in `out/parser-fixtures-final.exit`.
+- Fixtures cover correlated zero/nonzero groups, missed zero groups, a mixed omni parent containing a hard false-hidden face, split-batch omni identity, mixed scope, missing and duplicate CPU/GPU/GRID rows, scope zero, skipped GRID, invalid group, malformed stats, safe capped subset, and orphan CPU/GPU/grid evidence.
+- Initial wrapper and fixture failures are retained under `out/attempt-01-wrapper-error.log`, `out/parser-fixtures-attempt-01.log`, and `out/parser-fixtures-attempt-02-failed.log`; fixes corrected a zsh-reserved shell variable collision and synthetic omni fixture identity/count assumptions.
+- The frozen V6 runner/parser remain unchanged at SHA-256 `923c0fd7c09834d7887b7dbfa8cc0ec8182dca3349f8f75a1e3ca2da821d16c8` and `7309c70181161ddce8d7cce7329c45c4c3c33214f25936bb363e84aba8d1b385`.
+
+Current V7 scratch-source hashes are in `out/source-sha256.txt`. This preparation receipt is not permission to build or run V7; review and the separate shared build/game authorization remain required.

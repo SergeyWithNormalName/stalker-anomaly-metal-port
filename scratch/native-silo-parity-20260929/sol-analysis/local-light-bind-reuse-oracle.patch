@@ -1,0 +1,431 @@
+--- a/src/Layers/xrRenderMetal/MetalR4Backend.mm
++++ b/src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -1132,6 +1132,8 @@
+     static bool ProbePrivateUploadRecovery(std::string& error);
+     static bool ProbeComputeSkinBackendGpu(std::string& error);
+     static bool ProbeWholeLightVisibilityGpu(std::string& error);
++    friend bool ::RunMetalR4LocalLightRolloverGpuProbe(const std::string&,
++        const std::string&, std::size_t, std::string&, bool);
+ 
+     bool Initialize(SDL_Window* window, const std::uint32_t preferredWidth,
+         const std::uint32_t preferredHeight, std::string& error) override
+@@ -6593,7 +6595,8 @@
+ }
+ 
+ bool RunMetalR4LocalLightRolloverGpuProbe(const std::string& shaderDirectory,
+-    const std::string& artifactDirectory, const std::size_t lightCount, std::string& error)
++    const std::string& artifactDirectory, const std::size_t lightCount, std::string& error,
++    const bool compareBindReuse)
+ {
+     @autoreleasepool
+     {
+@@ -6602,6 +6605,27 @@
+         constexpr std::uint32_t Height = 8;
+         constexpr std::size_t PixelCount = Width * Height;
+         constexpr std::array<float, 4> Seed = {0.0625f, 0.125f, 0.1875f, 0.25f};
++        struct SavedEnv
++        {
++            const char* name;
++            bool present;
++            std::string value;
++            explicit SavedEnv(const char* key) : name(key), present(std::getenv(key) != nullptr),
++                value(present ? std::getenv(key) : "") {}
++            ~SavedEnv() { if (present) ::setenv(name, value.c_str(), 1); else ::unsetenv(name); }
++        } bindEnv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE"),
++            lifecycleEnv("XRAY_METAL_TEMPORAL_LIFECYCLE_PROBE"),
++            retryEnv("XRAY_METAL_TEMPORAL_FORCE_ACQUIRE_RETRY");
++        const char* familyText = compareBindReuse ?
++            std::getenv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE_PROBE_TYPE") : nullptr;
++        const std::string family = familyText ? familyText : "mixed";
++        const char* shadowText = compareBindReuse ?
++            std::getenv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE_PROBE_SHADOWED") : nullptr;
++        const bool shadowFixture = shadowText && std::strcmp(shadowText, "1") == 0;
++        if ((family != "mixed" && family != "point" && family != "spot" && family != "omni") ||
++            (shadowFixture && family == "point"))
++        { error = "invalid bind-reuse probe family or unsupported shadowed point"; return false; }
++        if (compareBindReuse) ::setenv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE", "0", 1);
+         if (shaderDirectory.empty() || artifactDirectory.empty() || lightCount == 0u || lightCount > 400u)
+         {
+             error = "shader directory, artifact directory, and a light count from 1 through 400 are required";
+@@ -6708,6 +6732,7 @@
+             { fail("local-light shared fixture resources unavailable: " + error); break; }
+ 
+             MetalR4LocalLightAdapter adapter;
++            MetalR4LocalLightAdapter reusedAdapter;
+             MetalR4LocalLightAdapter::Options adapterOptions;
+             adapterOptions.shaderDirectory = fs::path(shaderDirectory);
+             adapterOptions.defaultSpotCookie = cookie;
+@@ -6715,6 +6740,12 @@
+             if (!adapter.Prepare(*backend, adapterOptions, adapterStatus) || !adapter.IsReady())
+             { fail("production local-light MSC adapter did not prepare: " + adapterStatus); break; }
+ 
++            if (compareBindReuse)
++            {
++                ::setenv("XRAY_METAL_LOCAL_LIGHT_BIND_REUSE", "1", 1);
++                if (!reusedAdapter.Prepare(*backend, adapterOptions, adapterStatus) || !reusedAdapter.IsReady())
++                { fail("reuse adapter production MSC admission failed: " + adapterStatus); break; }
++            }
+             const std::array<std::uint16_t, 6> quadIndices = {0u, 1u, 2u, 0u, 2u, 3u};
+             auto indexBuffer = makeBuffer(quadIndices.data(), sizeof(quadIndices), R4BufferUsage::Index,
+                 "E05 fullscreen fixture indices", error);
+@@ -6778,11 +6809,20 @@
+                 light.active = true;
+                 light.type = i % 3u == 0u ? R4EngineLocalLightType::Point :
+                     (i % 3u == 1u ? R4EngineLocalLightType::Spot : R4EngineLocalLightType::OmniFace);
+-                light.position = {0.0f, 0.0f, 0.1f};
++                if (family == "point") light.type = R4EngineLocalLightType::Point;
++                else if (family == "spot") light.type = R4EngineLocalLightType::Spot;
++                else if (family == "omni") light.type = R4EngineLocalLightType::OmniFace;
++                if (shadowFixture && light.type == R4EngineLocalLightType::Point)
++                    light.type = R4EngineLocalLightType::Spot;
++                light.shadowed = shadowFixture;
++                light.omniFace = light.type == R4EngineLocalLightType::OmniFace ? i % 6u : 0u;
++                light.position = {compareBindReuse ? (float(int(i % 5u) - 2) * 0.008f) : 0.0f,
++                    0.0f, 0.1f};
+                 light.direction = {0.0f, 0.0f, 1.0f}; light.right = {1.0f, 0.0f, 0.0f};
+                 // Keep the entire far cap inside the fixture's orthographic
+                 // 0..1 depth range so depth-fail stencil can close the volume.
+-                light.range = 0.6f; light.cone = 1.2f; light.virtualSize = 1.0f;
++                light.range = compareBindReuse ? 0.6f - float(i % 5u) * 0.002f : 0.6f;
++                light.cone = 1.2f; light.virtualSize = 1.0f;
+                 light.color = i + 1u == lightCount ? std::array<float, 4>{0.5f,0.3f,0.2f,1.0f} :
+                     std::array<float, 4>{0.2f, 0.15f, 0.1f, 1.0f};
+                 light.specular = 0.01f;
+@@ -6790,6 +6830,44 @@
+                 if (i < lightCount) lightSnapshot.lights.push_back(light);
+             }
+ 
++            std::shared_ptr<IR4Texture> shadowAtlas;
++            std::shared_ptr<IR4Texture> blockedShadowAtlas;
++            std::shared_ptr<IR4Sampler> shadowSampler;
++            std::vector<xray::metal::R4LocalShadowAtlasRecord> shadowRecords;
++            if (shadowFixture)
++            {
++                R4Texture2DDesc desc; desc.width = desc.height = Width;
++                desc.format = R4PixelFormat::R32Float; desc.storage = R4ResourceStorage::Shared;
++                desc.usage = R4TextureUsage::ShaderRead; desc.label = "bind reuse positive shadow atlas";
++                shadowAtlas = resources.CreateTexture2D(desc, error);
++                R4SamplerDesc samplerDesc = linearDesc;
++                samplerDesc.compareFunction = R4SamplerCompareFunction::LessEqual;
++                samplerDesc.addressU = samplerDesc.addressV = samplerDesc.addressW =
++                    R4SamplerAddressMode::ClampToBorder;
++                samplerDesc.borderColor = R4SamplerBorderColor::OpaqueWhite;
++                samplerDesc.label = "bind reuse production shadow comparison sampler";
++                shadowSampler = resources.CreateSampler(samplerDesc, error);
++                std::array<float, Width * Width> depth{}; depth.fill(0.95f);
++                if (!shadowAtlas || !shadowSampler || !resources.UploadTexture2D(shadowAtlas, 0u, 0u, depth.data(),
++                        sizeof(depth), Width * sizeof(float), sizeof(depth), error))
++                { fail("bind reuse shadow fixture allocation/upload failed: " + error); break; }
++                desc.label = "bind reuse blocked shadow atlas";
++                blockedShadowAtlas = resources.CreateTexture2D(desc, error);
++                depth.fill(0.0f);
++                if (!blockedShadowAtlas || !resources.UploadTexture2D(blockedShadowAtlas, 0u, 0u,
++                        depth.data(), sizeof(depth), Width * sizeof(float), sizeof(depth), error))
++                { fail("bind reuse blocked shadow fixture allocation/upload failed: " + error); break; }
++                const std::array<float, 16> identity{{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
++                for (const auto& light : lightSnapshot.lights)
++                {
++                    xray::metal::R4LocalShadowAtlasRecord record;
++                    record.lightIdentity = light.lightId; record.engineFrame = lightSnapshot.engineFrame;
++                    record.atlasExtent = record.atlasSize = Width; record.face = light.omniFace;
++                    record.renderedDepth = true; record.lightView = record.lightProjection = identity;
++                    record.deviceInverseView = record.shadowMatrix = record.lightMapMatrix = identity;
++                    shadowRecords.push_back(record);
++                }
++            }
+             struct Captured
+             {
+                 std::shared_ptr<IR4Texture> color;
+@@ -6797,10 +6875,15 @@
+                 std::shared_ptr<IR4Texture> diagnostics;
+                 std::vector<float> rgba;
+                 std::vector<__fp16> verify;
++                std::vector<std::uint16_t> colorBits;
++                std::vector<std::uint32_t> depthBits;
++                std::vector<std::uint8_t> stencilBits;
++                id<MTLBuffer> aspectReadback = nil;
++                MetalR4LocalLightAdapter::Telemetry telemetry;
+                 std::size_t resets = 0;
+                 std::size_t submitted = 0;
+             };
+-            std::array<Captured, 8> captures;
++            std::vector<Captured> captures(compareBindReuse ? (shadowFixture ? 17u : 16u) : 8u);
+             for (Captured& capture : captures)
+             {
+                 capture.color = makeTexture(R4PixelFormat::RGBA16Float, R4TextureUsage::RenderTarget,
+@@ -6824,7 +6907,9 @@
+                 return backend->BindGraphicsPipeline(pipeline, error) &&
+                     backend->SetStencilReference(reference, error) && backend->DrawIndexed(draw, error);
+             };
+-            const auto renderOne = [&](Captured& capture, const std::size_t pose, const std::size_t mode) {
++            const auto renderOne = [&](Captured& capture, const std::size_t pose,
++                const std::size_t mode, MetalR4LocalLightAdapter& activeAdapter,
++                const bool blockedShadow = false) {
+                 const bool reference = mode == 1u;
+                 R4RenderPassDesc pass;
+                 pass.label = reference ? "E05 rollover chunked reference" : "E05 rollover bulk";
+@@ -6843,6 +6928,12 @@
+                 MetalR4LocalLightAdapter::GBufferInputs inputs;
+                 inputs.position = position; inputs.diffuse = diffuse; inputs.staticGlobals = staticGlobals;
+                 inputs.noFilterSampler = nearest; inputs.linearSampler = linear;
++                if (shadowFixture)
++                {
++                    inputs.shadowAtlas = blockedShadow ? blockedShadowAtlas : shadowAtlas;
++                    inputs.shadowSampler = shadowSampler;
++                    inputs.shadowRecords = &shadowRecords;
++                }
+                 MetalR4LocalLightAdapter::ViewState view;
+                 view.view = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                 view.projection = view.view; view.valid = true;
+@@ -6864,9 +6955,10 @@
+                 }
+                 if (!reference)
+                 {
+-                    if (!adapter.DrawIntoActiveAccumulator(*backend, inputs, view, snapshot, error)) return false;
+-                    capture.resets = adapter.LastTelemetry().markerResets;
+-                    capture.submitted = adapter.LastTelemetry().submitted;
++                    if (!activeAdapter.DrawIntoActiveAccumulator(*backend, inputs, view, snapshot, error)) return false;
++                    capture.resets = activeAdapter.LastTelemetry().markerResets;
++                    capture.submitted = activeAdapter.LastTelemetry().submitted;
++                    capture.telemetry = activeAdapter.LastTelemetry();
+                 }
+                 else
+                 {
+@@ -6882,8 +6974,13 @@
+                         auto chunk = std::make_shared<R4EngineLocalLightSnapshot>(*snapshot);
+                         const std::size_t end = std::min(snapshot->lights.size(), begin + ChunkSize);
+                         chunk->lights.assign(snapshot->lights.begin() + begin, snapshot->lights.begin() + end);
+-                        if (!adapter.DrawIntoActiveAccumulator(*backend, inputs, view, chunk, error)) return false;
+-                        capture.submitted += adapter.LastTelemetry().submitted;
++                        if (!activeAdapter.DrawIntoActiveAccumulator(*backend, inputs, view, chunk, error)) return false;
++                        capture.submitted += activeAdapter.LastTelemetry().submitted;
++                        const auto& t = activeAdapter.LastTelemetry();
++                        capture.telemetry.mscVertexBinds += t.mscVertexBinds;
++                        capture.telemetry.mscFragmentBinds += t.mscFragmentBinds;
++                        capture.telemetry.mscVertexReuses += t.mscVertexReuses;
++                        capture.telemetry.mscFragmentReuses += t.mscFragmentReuses;
+                     }
+                     capture.resets = resetCount;
+                 }
+@@ -6905,18 +7002,81 @@
+                     !drawIndexed(geometryDepthVerify, 1u, 3u, "geometry depth witness") ||
+                     !drawIndexed(skyDepthVerify, 0u, 3u, "sky depth witness") ||
+                     !backend->EndRenderPass(error)) return false;
++                if (compareBindReuse)
++                {
++                    constexpr std::size_t RowBytes = 256u;
++                    constexpr std::size_t StencilOffset = RowBytes * Height;
++                    auto& nativeBackend = static_cast<MetalR4Backend&>(*backend);
++                    auto& frame = nativeBackend.m_frames[nativeBackend.m_activeFrameIndex];
++                    capture.aspectReadback = [nativeBackend.m_device
++                        newBufferWithLength:StencilOffset * 2u options:MTLResourceStorageModeShared];
++                    id<MTLBlitCommandEncoder> blit = [frame.commandBuffer blitCommandEncoder];
++                    const auto depth = std::dynamic_pointer_cast<MetalTexture>(capture.depthStencil);
++                    if (!capture.aspectReadback || !blit || !depth)
++                    { error = "bind reuse exact depth/stencil readback allocation failed"; return false; }
++                    const MTLSize size = MTLSizeMake(Width, Height, 1);
++                    [blit copyFromTexture:depth->Native() sourceSlice:0 sourceLevel:0
++                        sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toBuffer:capture.aspectReadback
++                        destinationOffset:0 destinationBytesPerRow:RowBytes destinationBytesPerImage:0
++                        options:MTLBlitOptionDepthFromDepthStencil];
++                    [blit copyFromTexture:depth->Native() sourceSlice:0 sourceLevel:0
++                        sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toBuffer:capture.aspectReadback
++                        destinationOffset:StencilOffset destinationBytesPerRow:RowBytes destinationBytesPerImage:0
++                        options:MTLBlitOptionStencilFromDepthStencil];
++                    [blit endEncoding];
++                }
+                 return true;
+             };
+-            for (std::size_t pose = 0; pose < 2u; ++pose)
+-            {
+-                const std::size_t base = pose * 4u;
+-                for (std::size_t mode = 0; mode < 4u; ++mode)
+-                    if (!renderOne(captures[base + mode], pose, mode))
+-                    { fail("bulk/reference/tail adapter rendering failed: " + error); break; }
++            if (compareBindReuse)
++            {
++                // Encode a real triplet and abandon it, then exercise the
++                // production no-drawable retry before any compared submission.
++                if (!renderOne(captures.back(), 0u, 0u, reusedAdapter)) break;
++                backend->DiscardFrame();
++                ::setenv("XRAY_METAL_TEMPORAL_LIFECYCLE_PROBE", "1", 1);
++                ::setenv("XRAY_METAL_TEMPORAL_FORCE_ACQUIRE_RETRY", "1", 1);
++                if (backend->BeginFrame(error) != R4FrameAcquireResult::Retry)
++                { fail("bind reuse oracle did not exercise actual acquire Retry"); break; }
++                ::unsetenv("XRAY_METAL_TEMPORAL_LIFECYCLE_PROBE");
++                if (backend->BeginFrame(error) != R4FrameAcquireResult::Ready)
++                { fail("bind reuse oracle failed after discard/acquire retry"); break; }
++                captures.back().resets = captures.back().submitted = 0u;
++                captures.back().telemetry = {};
++            }
++            const std::size_t armCount = compareBindReuse ? 2u : 1u;
++            for (std::size_t arm = 0; arm < armCount; ++arm)
++            {
++                auto& activeAdapter = arm == 0u ? adapter : reusedAdapter;
++                for (std::size_t pose = 0; pose < 2u; ++pose)
++                {
++                    const std::size_t base = arm * 8u + pose * 4u;
++                    for (std::size_t mode = 0; mode < 4u; ++mode)
++                    {
++                        if (!renderOne(captures[base + mode], pose, mode, activeAdapter))
++                        { fail("bulk/reference/tail adapter rendering failed: " + error); break; }
++                        if (compareBindReuse)
++                        {
++                            if (!backend->SubmitFrame(error)) break;
++                            if (base + mode + 1u < 16u &&
++                                backend->BeginFrame(error) != R4FrameAcquireResult::Ready)
++                            { fail("bind reuse oracle acquire failed during submitted slot wrap"); break; }
++                        }
++                    }
++                    if (!error.empty()) break;
++                }
+                 if (!error.empty()) break;
+             }
+             if (!error.empty()) break;
+-            if (!backend->SubmitFrame(error))
++            if (compareBindReuse && shadowFixture)
++            {
++                // Same adapter, PSO, light transforms and receivers as the
++                // lit on-arm. Only the atlas depths change from .95 to 0.
++                if (backend->BeginFrame(error) != R4FrameAcquireResult::Ready ||
++                    !renderOne(captures[16u], 0u, 0u, reusedAdapter, true) ||
++                    !backend->SubmitFrame(error))
++                { fail("bind reuse blocked-shadow render failed: " + error); break; }
++            }
++            if (!compareBindReuse && !backend->SubmitFrame(error))
+             { fail("rollover probe frame submit failed: " + error); break; }
+             backend->Shutdown(); // drains the GPU before the shared texture readback.
+ 
+@@ -6933,10 +7093,77 @@
+                     fromRegion:MTLRegionMake2D(0, 0, Width, Height) mipmapLevel:0];
+                 capture.rgba.resize(PixelCount * 4u);
+                 capture.verify = std::move(proof);
++                if (compareBindReuse)
++                {
++                    capture.colorBits.resize(PixelCount * 4u);
++                    std::memcpy(capture.colorBits.data(), half.data(), half.size() * sizeof(__fp16));
++                    capture.depthBits.resize(PixelCount); capture.stencilBits.resize(PixelCount);
++                    const auto* bytes = static_cast<const std::uint8_t*>(capture.aspectReadback.contents);
++                    if (!bytes) { fail("bind reuse exact aspect readback is missing"); break; }
++                    for (std::size_t row = 0; row < Height; ++row)
++                    {
++                        std::memcpy(capture.depthBits.data() + row * Width,
++                            bytes + row * 256u, Width * sizeof(float));
++                        std::memcpy(capture.stencilBits.data() + row * Width,
++                            bytes + 256u * Height + row * 256u, Width);
++                    }
++                }
+                 for (std::size_t i = 0; i < capture.rgba.size(); ++i)
+                     capture.rgba[i] = static_cast<float>(half[i]);
+             }
+             if (!error.empty()) break;
++            float maxShadowSignalDelta = 0.0f;
++            std::size_t shadowSignalPixels = 0u;
++            bool shadowDepthStencilPreserved = false;
++            if (compareBindReuse)
++            {
++                for (std::size_t index = 0; index < 8u; ++index)
++                {
++                    const auto& off = captures[index]; const auto& on = captures[index + 8u];
++                    if (off.colorBits != on.colorBits || off.depthBits != on.depthBits ||
++                        off.stencilBits != on.stencilBits || off.verify != on.verify ||
++                        off.resets != on.resets || off.submitted != on.submitted ||
++                        off.telemetry.mscVertexBinds != off.submitted * 3u ||
++                        off.telemetry.mscFragmentBinds != off.submitted * 3u ||
++                        off.telemetry.mscVertexReuses != 0u || off.telemetry.mscFragmentReuses != 0u ||
++                        on.telemetry.mscVertexBinds != on.submitted ||
++                        on.telemetry.mscFragmentBinds != on.submitted * 2u ||
++                        on.telemetry.mscVertexReuses != on.submitted * 2u ||
++                        on.telemetry.mscFragmentReuses != on.submitted)
++                    { fail("bind reuse off/on color/depth/stencil or exact work-count oracle failed"); break; }
++                }
++                if (!error.empty()) break;
++            }
++            if (compareBindReuse && shadowFixture)
++            {
++                const auto& lit = captures[8u]; const auto& blocked = captures[16u];
++                shadowDepthStencilPreserved = lit.depthBits == blocked.depthBits &&
++                    lit.stencilBits == blocked.stencilBits && lit.verify == blocked.verify;
++                if (!shadowDepthStencilPreserved || lit.submitted != blocked.submitted ||
++                    lit.resets != blocked.resets)
++                { fail("changing shadow atlas depths changed volume coverage/depth/stencil"); break; }
++                for (std::size_t pixel = 0; pixel < PixelCount; ++pixel)
++                {
++                    bool changed = false;
++                    for (std::size_t channel = 0; channel < 4u; ++channel)
++                    {
++                        const std::size_t at = pixel * 4u + channel;
++                        if (!std::isfinite(lit.rgba[at]) || !std::isfinite(blocked.rgba[at]))
++                        { fail("lit/blocked shadow comparison produced non-finite pixels"); break; }
++                        if (channel < 3u && pixel % Width < Width / 2u)
++                        {
++                            const float delta = lit.rgba[at] - blocked.rgba[at];
++                            maxShadowSignalDelta = std::max(maxShadowSignalDelta, delta);
++                            changed = changed || delta > 0.001f;
++                        }
++                    }
++                    if (!error.empty()) break;
++                    if (changed) ++shadowSignalPixels;
++                }
++                if (!error.empty()) break;
++                if (maxShadowSignalDelta <= 0.001f || shadowSignalPixels == 0u)
++                { fail("real shadowed MSC PSO ignored lit versus blocked atlas depths"); break; }
++            }
+             float maxDifference = 0.0f;
+             float maxGeometrySignal = 0.0f;
+             float maxSkyDifferenceFromSeed = 0.0f;
+@@ -7050,7 +7277,20 @@
+             report << std::fixed << std::setprecision(6)
+                 << "{\n  \"status\": \"PASS\",\n  \"shader_bundle\": \"" << shaderDirectory
+                 << "\",\n  \"lights\": " << lightCount << ",\n  \"types\": [\"point\", \"spot\", \"omni_face\"],\n"
+-                << "  \"camera_poses\": 2,\n  \"bulk_marker_resets\": " << captures[0].resets
++                << "  \"bind_reuse_compared\": " << (compareBindReuse ? "true" : "false")
++                << ",\n  \"bind_reuse_family\": \"" << family << "\""
++                << ",\n  \"bind_reuse_shadowed\": " << (shadowFixture ? "true" : "false")
++                << ",\n  \"shadow_lit_depth\": 0.95,\n  \"shadow_blocked_depth\": 0.0"
++                << ",\n  \"shadow_signal_pixels\": " << shadowSignalPixels
++                << ",\n  \"max_shadow_lit_minus_blocked_delta\": " << maxShadowSignalDelta
++                << ",\n  \"shadow_depth_stencil_preserved\": " << (shadowDepthStencilPreserved ? "true" : "false")
++                << ",\n  \"exact_color_depth_stencil_pairs\": " << (compareBindReuse ? 8u : 0u)
++                << ",\n  \"discard_retry_and_submitted_slot_wrap\": " << (compareBindReuse ? "true" : "false")
++                << ",\n  \"off_vertex_binds\": " << captures[0].telemetry.mscVertexBinds
++                << ",\n  \"off_fragment_binds\": " << captures[0].telemetry.mscFragmentBinds
++                << ",\n  \"on_vertex_binds\": " << (compareBindReuse ? captures[8].telemetry.mscVertexBinds : 0u)
++                << ",\n  \"on_fragment_binds\": " << (compareBindReuse ? captures[8].telemetry.mscFragmentBinds : 0u)
++                << ",\n  \"camera_poses\": 2,\n  \"bulk_marker_resets\": " << captures[0].resets
+                 << ",\n  \"chunk_reference_marker_resets\": " << captures[1].resets
+                 << ",\n  \"max_bulk_reference_abs_error\": " << maxDifference
+                 << ",\n  \"max_bulk_minus_prefix_tail_contribution\": " << maxTailContribution
+--- a/src/Layers/xrRenderMetal/IR4Backend.h
++++ b/src/Layers/xrRenderMetal/IR4Backend.h
+@@ -745,7 +745,8 @@
+     const std::string& shaderDirectory,
+     const std::string& artifactDirectory,
+     std::size_t lightCount,
+-    std::string& error);
++    std::string& error,
++    bool compareBindReuse = false);
+ 
+ // E04 CPU/GPU screen-space reprojection and motion vector accuracy probe (gate <= 0.5px).
+ bool RunMetalR4ReprojectionProbe(std::string& error);
+--- a/src/Layers/xrRenderMetal/tests/R4LocalLightRolloverGpuProbe.cpp
++++ b/src/Layers/xrRenderMetal/tests/R4LocalLightRolloverGpuProbe.cpp
+@@ -9,7 +9,7 @@
+ 
+ int main(int argc, char** argv)
+ {
+-    if (argc != 5 || std::string(argv[1]) != "--gpu")
++    if (argc != 5 || (std::string(argv[1]) != "--gpu" && std::string(argv[1]) != "--bind-reuse-gpu"))
+     {
+         std::fprintf(stderr,
+             "usage: R4LocalLightRolloverGpuProbe --gpu <local-light-msc-dir> <light-count> <artifact-dir>\n");
+@@ -19,7 +19,8 @@
+     InitializeR4RolloverProbeRuntime();
+     std::string error;
+     const std::size_t lightCount = static_cast<std::size_t>(std::strtoul(argv[3], nullptr, 10));
+-    const bool passed = RunMetalR4LocalLightRolloverGpuProbe(argv[2], argv[4], lightCount, error);
++    const bool passed = RunMetalR4LocalLightRolloverGpuProbe(argv[2], argv[4], lightCount, error,
++        std::string(argv[1]) == "--bind-reuse-gpu");
+     std::fprintf(stderr, "E05_LOCAL_LIGHT_ROLLOVER_GPU status=%s detail=\"%s\"\n",
+         passed ? "PASS" : "FAIL", error.c_str());
+     ShutdownR4RolloverProbeRuntime();

@@ -21,6 +21,7 @@ public:
 	virtual void Draw();
 	virtual void Update();
 	virtual bool OnMouseAction(float x, float y, EUIMessages mouse_action);
+	virtual bool OnKeyboardAction(int dik, EUIMessages keyboard_action);
 	virtual void OnMessage(LPCSTR message);
 	// CUIWindow
 	void InitTrackBar(Fvector2 pos, Fvector2 size);

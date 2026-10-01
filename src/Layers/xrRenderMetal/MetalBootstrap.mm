@@ -8,6 +8,8 @@
 #include "IR4Resources.h"
 #include "R4DdsTexture.h"
 #include "R4LevelGeometry.h"
+#include "R4ActiveOcclusionCatalogSelection.h"
+#include "R4StaticConstantGroups.h"
 
 #include <algorithm>
 #include <array>
@@ -15,10 +17,12 @@
 #include <cmath>
 #include <cstring>
 #include <errno.h>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <limits.h>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -514,6 +518,35 @@ struct LevelMaterialInput
 
 struct LevelScene
 {
+    using ActiveOcclusionSourceTriangle =
+        xray::metal::active_occlusion_catalog::SourceTriangle;
+    using ActiveOcclusionDrawReceipt =
+        xray::metal::active_occlusion_catalog::DrawReceipt;
+
+    static constexpr std::size_t ActiveOcclusionMaxTriangles =
+        xray::metal::active_occlusion_catalog::kMaximumTriangleBudget;
+    static constexpr std::uint32_t ActiveOcclusionMaxScopes = 12u;
+    static constexpr std::uint32_t ActiveOcclusionFirstFrame = 300u;
+    static constexpr std::uint32_t ActiveOcclusionLastFrame = 311u;
+
+    struct ActiveOcclusionObservation
+    {
+        std::uint64_t scopeId = 0;
+        std::uint32_t engineFrame = UINT32_MAX;
+        std::uint32_t viewportWidth = 0;
+        std::uint32_t viewportHeight = 0;
+        bool complete = false;
+        bool failed = false;
+        std::vector<xray::metal::active_occlusion_catalog::DrawReceipt> admittedDraws;
+    };
+
+    struct StaticConstantBufferGroup
+    {
+        std::shared_ptr<IR4Buffer> mscVertexGlobals;
+        std::shared_ptr<IR4Buffer> mscVertexTransforms;
+        std::shared_ptr<IR4Buffer> mscFragmentTransforms;
+    };
+
     struct TextureAsset
     {
         xray::metal::R4DdsTexture ddsTexture;
@@ -536,6 +569,7 @@ struct LevelScene
         std::size_t textureAssetIndex = 0;
         std::size_t hemiTextureAssetIndex = std::numeric_limits<std::size_t>::max();
         std::uint32_t visualId = 0;
+        std::uint8_t visualType = 0;
         std::uint16_t shaderId = 0;
         std::uint32_t vertexBufferId = 0;
         std::uint32_t vertexBase = 0;
@@ -543,6 +577,13 @@ struct LevelScene
         std::uint32_t indexBufferId = 0;
         std::uint32_t indexBase = 0;
         std::uint32_t indexCount = 0;
+        std::size_t activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
+        std::uint32_t activeOcclusionTriangleCount = 0;
+        std::array<float, 16> activeOcclusionUploadedWvp{};
+        std::array<float, 2> activeOcclusionUploadedJitter{};
+        std::uint64_t activeOcclusionConstantsScopeId = 0;
+        std::uint32_t activeOcclusionConstantsFrame = UINT32_MAX;
+        bool activeOcclusionConstantsValid = false;
         std::uint32_t uvOffset = 0;
         std::uint32_t hemiUvOffset = 0;
         std::uint32_t normalOffset = 0;
@@ -563,6 +604,7 @@ struct LevelScene
     std::vector<std::shared_ptr<IR4GraphicsPipeline>> arefPipelines;
     std::shared_ptr<IR4Buffer> uniforms;
     std::shared_ptr<IR4Texture> depthTarget;
+    Matrix4 previousViewProjection{};
     std::shared_ptr<IR4Texture> scopeDepthSnapshot;
     std::vector<std::shared_ptr<IR4Texture>> gBufferTargets;
     std::shared_ptr<IR4Texture> lightingAccumulator;
@@ -570,6 +612,10 @@ struct LevelScene
     std::shared_ptr<IR4Texture> scopeSceneColorSnapshot;
     std::shared_ptr<IR4Texture> lightingTonemap;
     std::shared_ptr<IR4Texture> lightingTonemapScratch;
+    std::shared_ptr<IR4Texture> luminanceBloom256;
+    std::shared_ptr<IR4GraphicsPipeline> luminanceBloomPipeline;
+    std::shared_ptr<IR4Sampler> luminanceLinearSampler;
+    float luminanceBloomThreshold = 0.0f;
     std::shared_ptr<IR4Texture> luminance64;
     std::shared_ptr<IR4Texture> luminance8;
     std::shared_ptr<IR4Texture> lightingWhite;
@@ -588,6 +634,29 @@ struct LevelScene
     std::vector<TextureAsset> textureAssets;
     std::vector<TextureMaterial> textureMaterials;
     std::unordered_map<std::uint32_t, std::size_t> textureMaterialByVisual;
+    xray::metal::R4StaticConstantGroupPlan staticConstantGroupPlan;
+    std::vector<StaticConstantBufferGroup> staticConstantBufferGroups;
+    bool staticConstantGroupsEnabled = false;
+    bool activeOcclusionRequested = false;
+    bool activeOcclusionEnabled = false;
+    bool activeOcclusionLocalVolumeShaderQualified = false;
+    const char* activeOcclusionLocalVolumeShaderReason = "not-checked";
+    const char* activeOcclusionDisableReason = nullptr;
+    xray::metal::active_occlusion_catalog::Catalog activeOcclusionSourceCatalog;
+    ActiveOcclusionObservation activeOcclusionObservation;
+    std::uint64_t activeOcclusionNextScopeId = 1;
+    std::uint32_t activeOcclusionScopesBegun = 0u;
+    bool activeOcclusionScopeCapLogged = false;
+    std::size_t activeOcclusionSourceVisuals = 0;
+    std::size_t activeOcclusionMateHintsCleared = 0;
+    std::size_t activeOcclusionCandidateVisuals = 0;
+    std::size_t activeOcclusionCandidateTriangles = 0;
+    std::size_t activeOcclusionOmittedVisuals = 0;
+    std::size_t activeOcclusionOmittedTriangles = 0;
+    std::size_t activeOcclusionExcludedMaterials = 0;
+    std::size_t activeOcclusionExcludedTrees = 0;
+    std::size_t activeOcclusionInvalidVisuals = 0;
+    std::size_t activeOcclusionCapVisuals = 0;
     std::shared_ptr<IR4Sampler> baseSampler;
     std::shared_ptr<IR4Sampler> hemiSampler;
     std::shared_ptr<IR4GraphicsPipeline> gBufferDisplayPipeline;
@@ -618,8 +687,23 @@ struct LevelScene
     std::shared_ptr<IR4GraphicsPipeline> sunMaskPipeline;
     std::shared_ptr<IR4GraphicsPipeline> sunNearPipeline;
     std::shared_ptr<IR4GraphicsPipeline> sunFarPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> sunMiddlePipeline;
+    std::shared_ptr<IR4GraphicsPipeline> sunFarZPipeline;
+    struct SunCascadeGpu
+    {
+        std::shared_ptr<IR4Texture> shadow;
+        std::shared_ptr<IR4Buffer> globals, volume;
+        Matrix4 lightViewProjection{};
+        Matrix4 shadowLookup{};
+    };
+    std::array<SunCascadeGpu,3> sunCascades;
+    R4SunCascadeSet sunCascadeContract;
+    std::array<float,4> positionDecompressionParams{};
+    bool sunZCulling = false;
+    bool sunCascadesValid = false;
     std::shared_ptr<IR4GraphicsPipeline> sunShadowPipeline;
     std::shared_ptr<IR4GraphicsPipeline> sunShadowArefPipeline;
+    std::shared_ptr<IR4GraphicsPipeline> sunShadowArefNoAlphaPipeline;
     std::shared_ptr<IR4Buffer> sunMaskVertices;
     std::shared_ptr<IR4Buffer> sunMaskIndices;
     std::shared_ptr<IR4Buffer> sunVolumeVertices;
@@ -662,9 +746,12 @@ struct LevelScene
     std::uint64_t automaticLmhFrustumSubmitted = 0;
     std::uint64_t automaticLmhFrustumCulled = 0;
     bool lightingInputsUploaded = false;
+    bool pendingLightingInputsUploaded = false;
+    bool pendingLutAtlasUploaded = false;
     float luminanceAdaptation = 0.5f;
     std::uint32_t luminanceLastTelemetryFrame = UINT32_MAX;
     bool uploaded = false;
+    bool pendingUploaded = false;
 };
 
 bool readTextFile(const std::filesystem::path& path, std::string& text)
@@ -674,6 +761,25 @@ bool readTextFile(const std::filesystem::path& path, std::string& text)
         return false;
     text.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
     return stream.good() || stream.eof();
+}
+
+bool readActiveOcclusionTextFileBounded(const std::filesystem::path& path,
+    const std::size_t maximumBytes, std::string& text)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        return false;
+    stream.seekg(0, std::ios::end);
+    const std::streamoff length = stream.tellg();
+    if (length < 0 || static_cast<std::uint64_t>(length) > maximumBytes)
+        return false;
+    stream.seekg(0, std::ios::beg);
+    if (!stream)
+        return false;
+    text.resize(static_cast<std::size_t>(length));
+    if (length != 0)
+        stream.read(text.data(), length);
+    return stream.gcount() == length;
 }
 
 bool fileSha256(const std::filesystem::path& path, std::string& digest)
@@ -725,6 +831,577 @@ bool receiptAdmitsArtifact(
         lineStart = receipt.find(prefix, lineEnd + 1);
     }
     return false;
+}
+
+bool receiptHasLineToken(const std::string& receipt, const char* token)
+{
+    return receipt.find(token) != std::string::npos;
+}
+
+bool activeOcclusionShaderPairQualified(
+    const std::filesystem::path& vertexMetallibPath,
+    const std::filesystem::path& fragmentMetallibPath,
+    const char*& reason)
+{
+    // This observer admits one previously qualified shader/source/define set.
+    // Generic receipt self-consistency is not enough to admit a mod-updated shader.
+    if (vertexMetallibPath.filename() != "deffer_base_lmh_flat.vs.metallib" ||
+        fragmentMetallibPath.filename() != "deffer_base_lmh_flat.ps.metallib" ||
+        vertexMetallibPath.parent_path() != fragmentMetallibPath.parent_path())
+    {
+        reason = "shader-pair-name-or-path-mismatch";
+        return false;
+    }
+
+    std::filesystem::path vertexReflection = vertexMetallibPath;
+    std::filesystem::path fragmentReflection = fragmentMetallibPath;
+    vertexReflection.replace_extension(".json");
+    fragmentReflection.replace_extension(".json");
+    std::string vertexMetallibHash, fragmentMetallibHash;
+    std::string vertexReflectionHash, fragmentReflectionHash;
+    std::string vertexJson, fragmentJson, receipt;
+    const std::filesystem::path receiptPath =
+        vertexMetallibPath.parent_path() / "lmh-msc-receipt.txt";
+    if (!fileSha256(vertexMetallibPath, vertexMetallibHash) ||
+        !fileSha256(fragmentMetallibPath, fragmentMetallibHash) ||
+        !fileSha256(vertexReflection, vertexReflectionHash) ||
+        !fileSha256(fragmentReflection, fragmentReflectionHash) ||
+        !readActiveOcclusionTextFileBounded(vertexReflection, 64u * 1024u, vertexJson) ||
+        !readActiveOcclusionTextFileBounded(fragmentReflection, 64u * 1024u, fragmentJson) ||
+        !readActiveOcclusionTextFileBounded(receiptPath, 64u * 1024u, receipt))
+    {
+        reason = "qualified-shader-evidence-unavailable";
+        return false;
+    }
+
+    static constexpr const char* VertexMetallibHash =
+        "06415f649e216a95acf82a2940c7c9523332559705e644f5649b4a8bbde3d605";
+    static constexpr const char* FragmentMetallibHash =
+        "7c8078287baf8842389301b350681c9bd445067449bce314515a26aef296ebab";
+    static constexpr const char* VertexReflectionHash =
+        "54784344ece2100723a89b585edef118f0551688518b906eb07d95a1982e1001";
+    static constexpr const char* FragmentReflectionHash =
+        "e7383445db4e7a8672147b323a986a51c83db19746eeeedc319869904bb24ce0";
+    static constexpr const char* CommonDefines =
+        "common_define_args=-D SMAP_size=2048 -D FP16_FILTER=1 -D FP16_BLEND=1 "
+        "-D USE_HWSMAP=1 -D USE_HWSMAP_PCF=1 -D USE_BRANCHING=1 -D USE_VTF=1 "
+        "-D SM_5=1 -D SSFX_INT_GRASS=8 -D SSFX_SSR_QUALITY=0 -D SSFX_WATER_QUALITY=1 "
+        "-D SSFX_WATER_PARALLAX=2 -D SSFX_IL_QUALITY=16 -D SSFX_AO_QUALITY=2 "
+        "-D SSFX_POM_REFINE=0 -D SSFX_TERRA_POM_REFINE=0 -D SSFX_SSS_DIR_QUALITY=6 "
+        "-D SSFX_SSS_OMNI_QUALITY=2 -D SSFX_MODEXE=1 -D SKIN_NONE=1";
+    if (vertexMetallibHash != VertexMetallibHash ||
+        fragmentMetallibHash != FragmentMetallibHash ||
+        vertexReflectionHash != VertexReflectionHash ||
+        fragmentReflectionHash != FragmentReflectionHash ||
+        !receiptAdmitsArtifact(receipt, "vs", vertexMetallibHash, vertexReflectionHash) ||
+        !receiptAdmitsArtifact(receipt, "ps", fragmentMetallibHash, fragmentReflectionHash) ||
+        !receiptHasLineToken(receipt, "evidence_scope=exact_deffer_base_lmh_flat_dxc_msc_artifacts") ||
+        !receiptHasLineToken(receipt, "source_tree_sha256=bc502abe6276487148978a7423c102079d7120a12ed8359c87eff7f1047b8494") ||
+        !receiptHasLineToken(receipt, "entry_point=main") ||
+        !receiptHasLineToken(receipt, "permutation=non_msaa_skin_none_use_lm_hemi") ||
+        !receiptHasLineToken(receipt, CommonDefines) ||
+        !receiptHasLineToken(receipt, "stage=vs\tsource_sha256=dc054e39ed652cea6f8a4e7ace6b65e7aaef9d2927209f99a7f5954286a888a3") ||
+        !receiptHasLineToken(receipt, "stage=ps\tsource_sha256=2e52ee96c4f587671f8a4a3fcfaee3745f6e688f3a29cefb97e38f7cf97fb4db") ||
+        vertexJson.find("\"EntryPoint\":\"main\"") == std::string::npos ||
+        fragmentJson.find("\"EntryPoint\":\"main\"") == std::string::npos ||
+        fragmentJson.find("\"discards\":false") == std::string::npos)
+    {
+        reason = "shader-identity-not-in-qualified-allowlist";
+        return false;
+    }
+    return true;
+}
+
+bool activeOcclusionOptedIn()
+{
+    const char* value = std::getenv("XRAY_METAL_ACTIVE_OCCLUSION");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+bool staticConstantGroupsOptedIn()
+{
+    const char* value = std::getenv("XRAY_METAL_STATIC_CONSTANT_GROUPS");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+bool activeOcclusionFrameInWindow(const std::uint32_t engineFrame)
+{
+    return engineFrame >= LevelScene::ActiveOcclusionFirstFrame &&
+        engineFrame <= LevelScene::ActiveOcclusionLastFrame;
+}
+
+bool activeOcclusionCheckedAdd(const std::size_t left, const std::size_t right,
+    std::size_t& result)
+{
+    if (right > std::numeric_limits<std::size_t>::max() - left)
+        return false;
+    result = left + right;
+    return true;
+}
+
+bool activeOcclusionCheckedMultiply(const std::size_t left, const std::size_t right,
+    std::size_t& result)
+{
+    if (left != 0u && right > std::numeric_limits<std::size_t>::max() / left)
+        return false;
+    result = left * right;
+    return true;
+}
+
+bool activeOcclusionReadFloat3(const std::vector<std::uint8_t>& bytes,
+    const std::size_t offset, std::array<float, 3>& output)
+{
+    std::size_t end = 0;
+    if (!activeOcclusionCheckedAdd(offset, sizeof(float) * output.size(), end) ||
+        end > bytes.size())
+        return false;
+    for (std::size_t axis = 0; axis != output.size(); ++axis)
+    {
+        const std::size_t componentOffset = offset + axis * sizeof(float);
+        const std::uint32_t bits =
+            std::uint32_t(bytes[componentOffset + 0u]) |
+            (std::uint32_t(bytes[componentOffset + 1u]) << 8u) |
+            (std::uint32_t(bytes[componentOffset + 2u]) << 16u) |
+            (std::uint32_t(bytes[componentOffset + 3u]) << 24u);
+        std::memcpy(&output[axis], &bits, sizeof(bits));
+        if (!std::isfinite(output[axis]))
+            return false;
+    }
+    return true;
+}
+
+bool appendActiveOcclusionSource(LevelScene& scene,
+    const std::filesystem::path& vertexMetallibPath,
+    const std::filesystem::path& fragmentMetallibPath,
+    const char*& reason)
+{
+    if (!scene.activeOcclusionRequested)
+        return true;
+
+    scene.activeOcclusionEnabled = false;
+    scene.activeOcclusionSourceCatalog.Reset();
+    scene.activeOcclusionSourceVisuals = 0u;
+    scene.activeOcclusionMateHintsCleared = 0u;
+    scene.activeOcclusionObservation.admittedDraws.clear();
+    for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+    {
+        material.activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
+        material.activeOcclusionTriangleCount = 0u;
+        material.activeOcclusionConstantsValid = false;
+        material.activeOcclusionConstantsScopeId = 0u;
+        material.activeOcclusionConstantsFrame = UINT32_MAX;
+    }
+    try
+    {
+        if (!scene.productionMsc || !scene.hemiDiagnostic)
+        {
+            reason = "production-lmh-path-not-active";
+            return false;
+        }
+        if (!activeOcclusionShaderPairQualified(vertexMetallibPath,
+                fragmentMetallibPath, reason))
+            return false;
+        using namespace xray::metal::active_occlusion_catalog;
+        std::vector<LevelScene::TextureMaterial*> sourceMaterials;
+        sourceMaterials.reserve(scene.textureMaterials.size());
+        std::size_t candidateTriangleCount = 0u;
+        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+        {
+            if (material.shaderName != "default")
+            {
+                ++scene.activeOcclusionExcludedMaterials;
+                continue;
+            }
+            if (material.visualType == 7u || material.visualType == 11u)
+            {
+                ++scene.activeOcclusionExcludedTrees;
+                continue;
+            }
+            if (material.indexCount == 0u || material.indexCount % 3u != 0u)
+            {
+                ++scene.activeOcclusionInvalidVisuals;
+                scene.activeOcclusionOmittedTriangles += material.indexCount / 3u;
+                continue;
+            }
+            std::size_t nextTriangleCount = 0u;
+            const std::size_t triangleCount = material.indexCount / 3u;
+            if (!activeOcclusionCheckedAdd(candidateTriangleCount, triangleCount,
+                    nextTriangleCount))
+            {
+                reason = "catalog-triangle-count-overflow";
+                return false;
+            }
+            candidateTriangleCount = nextTriangleCount;
+            sourceMaterials.push_back(&material);
+        }
+        std::sort(sourceMaterials.begin(), sourceMaterials.end(),
+            [](const auto* a, const auto* b) { return a->visualId < b->visualId; });
+        scene.activeOcclusionCandidateVisuals = sourceMaterials.size();
+        scene.activeOcclusionCandidateTriangles = candidateTriangleCount;
+        for (std::size_t index = 1u; index < sourceMaterials.size(); ++index)
+            if (sourceMaterials[index - 1u]->visualId == sourceMaterials[index]->visualId)
+            {
+                reason = "catalog-duplicate-visual-id";
+                return false;
+            }
+
+        if (sourceMaterials.size() > kMaximumVisualRanges ||
+            candidateTriangleCount > std::numeric_limits<std::uint32_t>::max())
+        {
+            scene.activeOcclusionCapVisuals = sourceMaterials.size();
+            scene.activeOcclusionOmittedVisuals += sourceMaterials.size();
+            scene.activeOcclusionOmittedTriangles += candidateTriangleCount;
+            reason = "catalog-range-or-triangle-limit-exceeded";
+            return false;
+        }
+        std::size_t triangleBytes = 0u;
+        std::size_t rangeBytes = 0u;
+        if (!activeOcclusionCheckedMultiply(candidateTriangleCount, sizeof(SourceTriangle),
+                triangleBytes) ||
+            !activeOcclusionCheckedMultiply(sourceMaterials.size(), sizeof(VisualRange),
+                rangeBytes) || triangleBytes > kCatalogBudgetBytes ||
+            rangeBytes > kCatalogBudgetBytes - triangleBytes)
+        {
+            scene.activeOcclusionCapVisuals = sourceMaterials.size();
+            scene.activeOcclusionOmittedVisuals += sourceMaterials.size();
+            scene.activeOcclusionOmittedTriangles += candidateTriangleCount;
+            reason = "catalog-over-64-mib";
+            return false;
+        }
+        std::vector<VisualRange> sourceRanges;
+        std::vector<SourceTriangle> sourceTriangles;
+        sourceRanges.reserve(sourceMaterials.size());
+        sourceTriangles.reserve(candidateTriangleCount);
+        std::size_t reservedRangeBytes = 0u;
+        std::size_t reservedTriangleBytes = 0u;
+        if (!activeOcclusionCheckedMultiply(sourceRanges.capacity(), sizeof(VisualRange),
+                reservedRangeBytes) ||
+            !activeOcclusionCheckedMultiply(sourceTriangles.capacity(), sizeof(SourceTriangle),
+                reservedTriangleBytes) || reservedTriangleBytes > kCatalogBudgetBytes ||
+            reservedRangeBytes > kCatalogBudgetBytes - reservedTriangleBytes)
+        {
+            scene.activeOcclusionCapVisuals = sourceMaterials.size();
+            scene.activeOcclusionOmittedVisuals += sourceMaterials.size();
+            scene.activeOcclusionOmittedTriangles += candidateTriangleCount;
+            reason = "catalog-capacity-over-64-mib";
+            return false;
+        }
+        std::size_t candidateVisualCount = 0;
+        for (LevelScene::TextureMaterial* materialPointer : sourceMaterials)
+        {
+            LevelScene::TextureMaterial& material = *materialPointer;
+            if (material.vertexBufferId >= scene.geometry.vertexBuffers.size() ||
+                material.indexBufferId >= scene.geometry.indexBuffers.size() ||
+                material.indexCount == 0u || material.indexCount % 3u != 0u)
+            {
+                ++scene.activeOcclusionInvalidVisuals;
+                scene.activeOcclusionOmittedTriangles += material.indexCount / 3u;
+                continue;
+            }
+
+            const xray::metal::R4VertexBufferSummary& vertexBuffer =
+                scene.geometry.vertexBuffers[material.vertexBufferId];
+            const xray::metal::R4IndexBufferSummary& indexBuffer =
+                scene.geometry.indexBuffers[material.indexBufferId];
+            std::size_t vertexBufferEnd = 0;
+            std::size_t indexBufferEnd = 0;
+            if (!vertexBuffer.hasPositionFloat3 || vertexBuffer.stride == 0u ||
+                material.vertexBase > vertexBuffer.vertexCount ||
+                material.vertexCount > vertexBuffer.vertexCount - material.vertexBase ||
+                material.indexBase > indexBuffer.indexCount ||
+                material.indexCount > indexBuffer.indexCount - material.indexBase ||
+                !activeOcclusionCheckedAdd(vertexBuffer.dataOffset, vertexBuffer.dataSize,
+                    vertexBufferEnd) || vertexBufferEnd > scene.geometryBytes.size() ||
+                !activeOcclusionCheckedAdd(indexBuffer.dataOffset, indexBuffer.dataSize,
+                    indexBufferEnd) || indexBufferEnd > scene.geometryBytes.size())
+            {
+                ++scene.activeOcclusionInvalidVisuals;
+                scene.activeOcclusionOmittedTriangles += material.indexCount / 3u;
+                continue;
+            }
+
+            const std::size_t triangleCount = material.indexCount / 3u;
+            bool visualValid = true;
+            std::vector<LevelScene::ActiveOcclusionSourceTriangle> visualTriangles;
+            visualTriangles.reserve(triangleCount);
+            for (std::uint32_t index = 0; index < material.indexCount; index += 3u)
+            {
+                LevelScene::ActiveOcclusionSourceTriangle triangle;
+                triangle.visualId = material.visualId;
+                triangle.triangleId = index / 3u;
+                for (std::uint32_t corner = 0; corner != 3u; ++corner)
+                {
+                    std::size_t indexNumber = 0;
+                    std::size_t indexRelativeOffset = 0;
+                    std::size_t indexOffset = 0;
+                    std::size_t indexEnd = 0;
+                    if (!activeOcclusionCheckedAdd(material.indexBase, index, indexNumber) ||
+                        !activeOcclusionCheckedAdd(indexNumber, corner, indexNumber) ||
+                        !activeOcclusionCheckedMultiply(indexNumber, sizeof(std::uint16_t),
+                            indexRelativeOffset) ||
+                        !activeOcclusionCheckedAdd(indexBuffer.dataOffset, indexRelativeOffset,
+                            indexOffset) ||
+                        !activeOcclusionCheckedAdd(indexOffset, sizeof(std::uint16_t), indexEnd) ||
+                        indexEnd > scene.geometryBytes.size() ||
+                        indexEnd > indexBufferEnd)
+                    {
+                        visualValid = false;
+                        break;
+                    }
+                    const std::uint16_t localIndex =
+                        std::uint16_t(scene.geometryBytes[indexOffset]) |
+                        (std::uint16_t(scene.geometryBytes[indexOffset + 1u]) << 8u);
+                    if (localIndex >= material.vertexCount)
+                    {
+                        visualValid = false;
+                        break;
+                    }
+                    std::size_t sourceVertex = 0;
+                    std::size_t vertexRelativeOffset = 0;
+                    std::size_t positionOffset = 0;
+                    std::size_t positionEnd = 0;
+                    if (!activeOcclusionCheckedAdd(material.vertexBase, localIndex, sourceVertex) ||
+                        !activeOcclusionCheckedMultiply(sourceVertex, vertexBuffer.stride,
+                            vertexRelativeOffset) ||
+                        !activeOcclusionCheckedAdd(vertexBuffer.dataOffset, vertexRelativeOffset,
+                            positionOffset) ||
+                        !activeOcclusionCheckedAdd(positionOffset, vertexBuffer.positionOffset,
+                            positionOffset) ||
+                        !activeOcclusionCheckedAdd(positionOffset, sizeof(float) * 3u,
+                            positionEnd) || positionEnd > vertexBufferEnd ||
+                        !activeOcclusionReadFloat3(scene.geometryBytes, positionOffset,
+                            triangle.positions[corner]))
+                    {
+                        visualValid = false;
+                        break;
+                    }
+                    triangle.sourceVertexIds[corner] = localIndex;
+                }
+                if (!visualValid)
+                    break;
+                visualTriangles.emplace_back(std::move(triangle));
+            }
+            if (!visualValid || visualTriangles.size() != triangleCount)
+            {
+                ++scene.activeOcclusionInvalidVisuals;
+                ++scene.activeOcclusionOmittedVisuals;
+                scene.activeOcclusionOmittedTriangles += triangleCount;
+                continue;
+            }
+
+            struct EdgeUse
+            {
+                std::uint32_t firstTriangle = 0;
+                std::uint32_t secondTriangle = 0;
+                std::uint32_t firstStart = 0;
+                std::uint32_t firstEnd = 0;
+                std::uint8_t count = 0;
+                bool reciprocal = false;
+            };
+            std::unordered_map<std::uint32_t, EdgeUse> edgeUses;
+            edgeUses.reserve(triangleCount * 3u);
+            for (std::uint32_t tri = 0; tri < visualTriangles.size(); ++tri)
+                for (std::uint32_t edge = 0; edge != 3u; ++edge)
+                {
+                    const std::uint32_t start = visualTriangles[tri].sourceVertexIds[edge];
+                    const std::uint32_t end = visualTriangles[tri].sourceVertexIds[(edge + 1u) % 3u];
+                    if (start == end)
+                        continue;
+                    const std::uint32_t lo = std::min(start, end);
+                    const std::uint32_t hi = std::max(start, end);
+                    const std::uint32_t key = (lo << 16u) | hi;
+                    auto inserted = edgeUses.emplace(key, EdgeUse{});
+                    EdgeUse& use = inserted.first->second;
+                    if (inserted.second)
+                    {
+                        use.firstTriangle = tri;
+                        use.firstStart = start;
+                        use.firstEnd = end;
+                        use.count = 1u;
+                        continue;
+                    }
+                    if (use.count == 1u)
+                    {
+                        use.count = 2u;
+                        use.secondTriangle = tri;
+                        use.reciprocal = use.firstTriangle != tri &&
+                            use.firstStart == end && use.firstEnd == start;
+                        if (use.reciprocal)
+                        {
+                            visualTriangles[use.firstTriangle].mateTriangleId = tri;
+                            visualTriangles[tri].mateTriangleId = use.firstTriangle;
+                        }
+                    }
+                    else
+                    {
+                        if (use.reciprocal)
+                        {
+                            visualTriangles[use.firstTriangle].mateTriangleId =
+                                std::numeric_limits<std::uint32_t>::max();
+                            visualTriangles[use.secondTriangle].mateTriangleId =
+                                std::numeric_limits<std::uint32_t>::max();
+                        }
+                        use.reciprocal = false;
+                        use.count = 3u;
+                    }
+            }
+            scene.activeOcclusionMateHintsCleared += NormalizeReciprocalMateHints(
+                visualTriangles.data(), visualTriangles.size());
+            const std::size_t firstTriangle = sourceTriangles.size();
+            if (firstTriangle > std::numeric_limits<std::uint32_t>::max() ||
+                triangleCount > std::numeric_limits<std::uint32_t>::max() - firstTriangle)
+            {
+                reason = "catalog-range-index-overflow";
+                return false;
+            }
+            sourceRanges.push_back({material.visualId,
+                static_cast<std::uint32_t>(firstTriangle),
+                static_cast<std::uint32_t>(triangleCount)});
+            sourceTriangles.insert(sourceTriangles.end(),
+                visualTriangles.begin(), visualTriangles.end());
+            material.activeOcclusionFirstTriangle = firstTriangle;
+            material.activeOcclusionTriangleCount = static_cast<std::uint32_t>(triangleCount);
+            ++candidateVisualCount;
+        }
+        const Catalog::BuildResult buildResult = scene.activeOcclusionSourceCatalog.Build(
+            std::move(sourceRanges), std::move(sourceTriangles), kCatalogBudgetBytes);
+        if (buildResult != Catalog::BuildResult::Ready)
+        {
+            if (buildResult == Catalog::BuildResult::BudgetExceeded)
+            {
+                scene.activeOcclusionCapVisuals = sourceMaterials.size();
+                scene.activeOcclusionOmittedVisuals += sourceMaterials.size();
+                scene.activeOcclusionOmittedTriangles += candidateTriangleCount;
+            }
+            reason = buildResult == Catalog::BuildResult::BudgetExceeded ?
+                "catalog-capacity-over-64-mib" : "catalog-validation-failed";
+            for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+            {
+                material.activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
+                material.activeOcclusionTriangleCount = 0u;
+            }
+            return false;
+        }
+        scene.activeOcclusionSourceVisuals = candidateVisualCount;
+        scene.activeOcclusionObservation.admittedDraws.reserve(candidateVisualCount);
+        scene.activeOcclusionEnabled = true;
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        scene.activeOcclusionSourceCatalog.Reset();
+        scene.activeOcclusionObservation.admittedDraws.clear();
+        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+        {
+            material.activeOcclusionFirstTriangle = std::numeric_limits<std::size_t>::max();
+            material.activeOcclusionTriangleCount = 0;
+        }
+        reason = "observer-resource-or-metadata-failure";
+        return false;
+    }
+}
+
+LevelScene::ActiveOcclusionObservation* beginActiveOcclusionObservation(
+    LevelScene& scene, const std::uint32_t engineFrame, const bool viewValid)
+{
+    if (!scene.activeOcclusionEnabled || !activeOcclusionFrameInWindow(engineFrame))
+        return nullptr;
+
+    LevelScene::ActiveOcclusionObservation& observation = scene.activeOcclusionObservation;
+    if (scene.activeOcclusionScopesBegun >= LevelScene::ActiveOcclusionMaxScopes)
+    {
+        observation.complete = true;
+        observation.failed = true;
+        observation.scopeId = 0u;
+        observation.engineFrame = UINT32_MAX;
+        observation.admittedDraws.clear();
+        for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+        {
+            if (material.activeOcclusionTriangleCount != 0u)
+            {
+                material.activeOcclusionConstantsValid = false;
+                material.activeOcclusionConstantsScopeId = 0u;
+                material.activeOcclusionConstantsFrame = UINT32_MAX;
+            }
+        }
+        if (!scene.activeOcclusionScopeCapLogged)
+        {
+            std::fprintf(stderr,
+                "METAL_ACTIVE_OCCLUSION_FRAME frame=%u status=skipped "
+                "reason=observation-scope-cap scopes=%u\n",
+                engineFrame, LevelScene::ActiveOcclusionMaxScopes);
+            scene.activeOcclusionScopeCapLogged = true;
+        }
+        return nullptr;
+    }
+    ++scene.activeOcclusionScopesBegun;
+    observation.admittedDraws.clear();
+    observation.engineFrame = engineFrame;
+    observation.scopeId = scene.activeOcclusionNextScopeId++;
+    if (observation.scopeId == 0u)
+        observation.scopeId = scene.activeOcclusionNextScopeId++;
+    if (scene.activeOcclusionNextScopeId == 0u)
+        scene.activeOcclusionNextScopeId = 1u;
+    observation.complete = false;
+    observation.failed = !viewValid;
+    observation.viewportWidth = 0u;
+    observation.viewportHeight = 0u;
+    for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+    {
+        if (material.activeOcclusionTriangleCount != 0u)
+        {
+            material.activeOcclusionConstantsValid = false;
+            material.activeOcclusionConstantsScopeId = 0u;
+            material.activeOcclusionConstantsFrame = UINT32_MAX;
+        }
+    }
+    if (scene.gBufferTargets.empty() || !scene.gBufferTargets.front())
+    {
+        observation.failed = true;
+        return &observation;
+    }
+    observation.viewportWidth = scene.gBufferTargets.front()->Descriptor().width;
+    observation.viewportHeight = scene.gBufferTargets.front()->Descriptor().height;
+    if (observation.viewportWidth == 0u || observation.viewportHeight == 0u)
+        observation.failed = true;
+    return &observation;
+}
+
+LevelScene::ActiveOcclusionObservation* currentActiveOcclusionObservation(
+    LevelScene& scene, const std::uint32_t engineFrame)
+{
+    LevelScene::ActiveOcclusionObservation& observation = scene.activeOcclusionObservation;
+    if (!scene.activeOcclusionEnabled || !activeOcclusionFrameInWindow(engineFrame) ||
+        observation.scopeId == 0u || observation.engineFrame != engineFrame ||
+        observation.complete)
+        return nullptr;
+    return &observation;
+}
+
+void completeActiveOcclusionObservation(LevelScene& scene,
+    LevelScene::ActiveOcclusionObservation* const observation)
+{
+    if (!observation || observation != &scene.activeOcclusionObservation ||
+        observation->scopeId == 0u)
+        return;
+    if (observation->failed)
+    {
+        std::fprintf(stderr,
+            "METAL_ACTIVE_OCCLUSION_FRAME frame=%u scope=%llu status=skipped "
+            "reason=invalid-view-or-receipt-allocation-failure\n",
+            observation->engineFrame,
+            static_cast<unsigned long long>(observation->scopeId));
+        return;
+    }
+    observation->complete = true;
+    std::fprintf(stderr,
+        "METAL_ACTIVE_OCCLUSION_FRAME frame=%u scope=%llu status=complete "
+        "admitted_draws=%zu source_triangles=%zu viewport=%ux%u\n",
+        observation->engineFrame,
+        static_cast<unsigned long long>(observation->scopeId),
+        observation->admittedDraws.size(),
+        scene.activeOcclusionSourceCatalog.Triangles().size(),
+        observation->viewportWidth, observation->viewportHeight);
 }
 
 std::string automaticLinearTlab(
@@ -1034,7 +1711,9 @@ bool validateLuminanceMscReflection(
         const char* tlab;
         const char* vertexInputs;
     };
-    static const std::array<ShaderContract, 5> Contracts = {{
+    static const std::array<ShaderContract, 6> Contracts = {{
+        {"bloom_build.ps", "ps", 4,
+            "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]", nullptr},
         {"stub_notransform_build.vs", "vs", 1,
             "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"}]",
             "\"name\":\"texcoord3\""},
@@ -1107,11 +1786,15 @@ bool prepareLevelScene(
     LevelScene& scene,
     std::string& error)
 {
+    scene.staticConstantGroupPlan.Clear();
+    scene.staticConstantBufferGroups.clear();
+    scene.staticConstantGroupsEnabled = false;
     if (!xray::metal::LoadR4LevelGeometryWithBytes(
             levelDirectory, scene.geometry, scene.geometryBytes, error))
         return false;
 
     scene.productionMsc = !vertexMetallibPath.empty() && !fragmentMetallibPath.empty();
+    scene.activeOcclusionRequested = activeOcclusionOptedIn();
     if (scene.productionMsc &&
         !validateLmhMscReflection(vertexMetallibPath, fragmentMetallibPath, error))
         return false;
@@ -1329,6 +2012,7 @@ bool prepareLevelScene(
             if (!addTextureAsset(input.baseDdsPath, material.textureAssetIndex))
                 return false;
             material.visualId = found->visualId;
+            material.visualType = found->visualType;
             material.shaderId = found->shaderId;
             material.vertexBufferId = found->vertexBufferId;
             material.vertexBase = found->vertexBase;
@@ -1390,6 +2074,33 @@ bool prepareLevelScene(
             scene.textureMaterials.emplace_back(std::move(material));
         }
         scene.hemiDiagnostic = everyMaterialHasHemi;
+    }
+
+    if (scene.activeOcclusionRequested)
+    {
+        const char* activeOcclusionReason = nullptr;
+        if (!appendActiveOcclusionSource(scene, vertexMetallibPath,
+                fragmentMetallibPath, activeOcclusionReason))
+            scene.activeOcclusionDisableReason = activeOcclusionReason;
+        std::fprintf(stderr,
+            "METAL_ACTIVE_OCCLUSION_PREP status=%s reason=%s catalog_visuals=%zu "
+            "catalog_triangles=%zu catalog_bytes=%zu candidate_visuals=%zu candidate_triangles=%zu "
+            "omitted_visuals=%zu omitted_triangles=%zu mate_hints_cleared=%zu "
+            "excluded_materials=%zu excluded_trees=%zu invalid_visuals=%zu cap_visuals=%zu max_triangles=%zu\n",
+            scene.activeOcclusionEnabled ? "enabled" : "disabled",
+            scene.activeOcclusionEnabled ? "qualified-source-snapshot" :
+                (scene.activeOcclusionDisableReason ? scene.activeOcclusionDisableReason :
+                    "no-candidates"),
+            scene.activeOcclusionSourceVisuals,
+            scene.activeOcclusionSourceCatalog.Triangles().size(),
+            scene.activeOcclusionSourceCatalog.StorageBytes(),
+            scene.activeOcclusionCandidateVisuals,
+            scene.activeOcclusionCandidateTriangles,
+            scene.activeOcclusionOmittedVisuals, scene.activeOcclusionOmittedTriangles,
+            scene.activeOcclusionMateHintsCleared,
+            scene.activeOcclusionExcludedMaterials, scene.activeOcclusionExcludedTrees,
+            scene.activeOcclusionInvalidVisuals, scene.activeOcclusionCapVisuals,
+            LevelScene::ActiveOcclusionMaxTriangles);
     }
 
     if (scene.productionMsc)
@@ -1748,34 +2459,140 @@ bool prepareLevelScene(
                 descriptor.label = label;
                 return resources.CreateBuffer(descriptor, bytes, size, error);
             };
-            for (LevelScene::TextureMaterial& material : scene.textureMaterials)
-            {
-                std::array<std::uint8_t, 160> vertexGlobals{};
-                std::array<std::uint8_t, 176> fragmentGlobals{};
-                std::array<std::uint8_t, 256> transforms{};
-                const Matrix4 worldViewProjection = multiply(
-                    scene.uniformData.viewProjection, material.modelTransform);
-                const Matrix4 worldView = multiply(scene.view, material.modelTransform);
-                std::memcpy(vertexGlobals.data() + 0, &worldViewProjection, sizeof(Matrix4));
-                std::memcpy(vertexGlobals.data() + 64,
-                    &scene.uniformData.viewProjection, sizeof(Matrix4));
-                std::memcpy(transforms.data() + 0, &worldViewProjection, sizeof(Matrix4));
-                std::memcpy(transforms.data() + 64, &worldView, sizeof(Matrix4));
-                std::memcpy(transforms.data() + 128, &material.modelTransform, sizeof(Matrix4));
-                const float materialClass[4] = {0.0f, 0.0f, 0.0f, 0.25f};
-                std::memcpy(transforms.data() + 192, materialClass, sizeof(materialClass));
 
-                material.mscVertexGlobals = createConstantBuffer(
-                    vertexGlobals.data(), vertexGlobals.size(), "R4 MSC VS globals b0");
-                material.mscVertexTransforms = createConstantBuffer(
-                    transforms.data(), transforms.size(), "R4 MSC VS transforms b1");
-                material.mscFragmentGlobals = createConstantBuffer(
-                    fragmentGlobals.data(), fragmentGlobals.size(), "R4 MSC PS globals b0");
-                material.mscFragmentTransforms = createConstantBuffer(
-                    transforms.data(), transforms.size(), "R4 MSC PS transforms b1");
-                if (!material.mscVertexGlobals || !material.mscVertexTransforms ||
-                    !material.mscFragmentGlobals || !material.mscFragmentTransforms)
-                    return false;
+            if (staticConstantGroupsOptedIn())
+            {
+                bool candidateReady = false;
+                xray::metal::R4StaticConstantGroupPlan candidatePlan;
+                std::vector<LevelScene::StaticConstantBufferGroup> candidateGroups;
+                std::vector<std::shared_ptr<IR4Buffer>> candidateFragmentGlobals;
+                try
+                {
+                    std::vector<xray::metal::R4StaticConstantModelKey> keys;
+                    keys.reserve(scene.textureMaterials.size());
+                    for (const LevelScene::TextureMaterial& material : scene.textureMaterials)
+                        keys.emplace_back(xray::metal::R4StaticConstantKeyFromBytes(
+                            material.modelTransform.elements));
+
+                    candidateReady = xray::metal::BuildR4StaticConstantGroupPlan(
+                        keys, candidatePlan);
+                    if (candidateReady)
+                    {
+                        candidateGroups.reserve(candidatePlan.GroupCount());
+                        candidateFragmentGlobals.reserve(scene.textureMaterials.size());
+                        for (std::size_t groupIndex = 0;
+                            groupIndex < candidatePlan.GroupCount(); ++groupIndex)
+                        {
+                            const std::size_t representative =
+                                candidatePlan.representativeMaterial[groupIndex];
+                            const Matrix4& model = scene.textureMaterials[representative].modelTransform;
+                            const auto payload = xray::metal::BuildR4StaticConstantInitialPayload(
+                                model, scene.uniformData.viewProjection, scene.view, multiply);
+                            LevelScene::StaticConstantBufferGroup group;
+                            group.mscVertexGlobals = createConstantBuffer(
+                                payload.vertexGlobals.data(), payload.vertexGlobals.size(),
+                                "R4 MSC VS globals b0 grouped");
+                            group.mscVertexTransforms = createConstantBuffer(
+                                payload.vertexTransforms.data(), payload.vertexTransforms.size(),
+                                "R4 MSC VS transforms b1 grouped");
+                            group.mscFragmentTransforms = createConstantBuffer(
+                                payload.fragmentTransforms.data(), payload.fragmentTransforms.size(),
+                                "R4 MSC PS transforms b1 grouped");
+                            if (!group.mscVertexGlobals || !group.mscVertexTransforms ||
+                                !group.mscFragmentTransforms)
+                            {
+                                candidateReady = false;
+                                break;
+                            }
+                            candidateGroups.emplace_back(std::move(group));
+                        }
+                    }
+
+                    if (candidateReady)
+                    {
+                        const std::array<std::uint8_t, 176> fragmentGlobals{};
+                        for (std::size_t materialIndex = 0;
+                            materialIndex < scene.textureMaterials.size(); ++materialIndex)
+                        {
+                            auto buffer = createConstantBuffer(fragmentGlobals.data(),
+                                fragmentGlobals.size(), "R4 MSC PS globals b0");
+                            if (!buffer)
+                            {
+                                candidateReady = false;
+                                break;
+                            }
+                            candidateFragmentGlobals.emplace_back(std::move(buffer));
+                        }
+                    }
+
+                    if (candidateReady)
+                    {
+                        for (std::size_t materialIndex = 0;
+                            materialIndex < scene.textureMaterials.size(); ++materialIndex)
+                        {
+                            LevelScene::TextureMaterial& material =
+                                scene.textureMaterials[materialIndex];
+                            const std::size_t groupIndex = candidatePlan.materialGroup[materialIndex];
+                            material.mscVertexGlobals = candidateGroups[groupIndex].mscVertexGlobals;
+                            material.mscVertexTransforms = candidateGroups[groupIndex].mscVertexTransforms;
+                            material.mscFragmentGlobals = candidateFragmentGlobals[materialIndex];
+                            material.mscFragmentTransforms = candidateGroups[groupIndex].mscFragmentTransforms;
+                        }
+                        scene.staticConstantGroupPlan = std::move(candidatePlan);
+                        scene.staticConstantBufferGroups = std::move(candidateGroups);
+                        scene.staticConstantGroupsEnabled = true;
+                        std::fprintf(stderr,
+                            "METAL_STATIC_CONSTANT_GROUPS status=enabled materials=%zu groups=%zu\n",
+                            scene.textureMaterials.size(), scene.staticConstantGroupPlan.GroupCount());
+                    }
+                }
+                catch (...)
+                {
+                    candidateReady = false;
+                }
+
+                if (!candidateReady)
+                {
+                    candidateGroups.clear();
+                    candidateFragmentGlobals.clear();
+                    candidatePlan.Clear();
+                    error.clear();
+                    std::fprintf(stderr,
+                        "METAL_STATIC_CONSTANT_GROUPS status=fallback reason=plan-or-buffer-allocation\n");
+                }
+            }
+
+            if (!scene.staticConstantGroupsEnabled)
+            {
+                for (LevelScene::TextureMaterial& material : scene.textureMaterials)
+                {
+                    std::array<std::uint8_t, 160> vertexGlobals{};
+                    std::array<std::uint8_t, 176> fragmentGlobals{};
+                    std::array<std::uint8_t, 256> transforms{};
+                    const Matrix4 worldViewProjection = multiply(
+                        scene.uniformData.viewProjection, material.modelTransform);
+                    const Matrix4 worldView = multiply(scene.view, material.modelTransform);
+                    std::memcpy(vertexGlobals.data() + 0, &worldViewProjection, sizeof(Matrix4));
+                    std::memcpy(vertexGlobals.data() + 64,
+                        &scene.uniformData.viewProjection, sizeof(Matrix4));
+                    std::memcpy(transforms.data() + 0, &worldViewProjection, sizeof(Matrix4));
+                    std::memcpy(transforms.data() + 64, &worldView, sizeof(Matrix4));
+                    std::memcpy(transforms.data() + 128, &material.modelTransform, sizeof(Matrix4));
+                    const float materialClass[4] = {0.0f, 0.0f, 0.0f, 0.25f};
+                    std::memcpy(transforms.data() + 192, materialClass, sizeof(materialClass));
+
+                    material.mscVertexGlobals = createConstantBuffer(
+                        vertexGlobals.data(), vertexGlobals.size(), "R4 MSC VS globals b0");
+                    material.mscVertexTransforms = createConstantBuffer(
+                        transforms.data(), transforms.size(), "R4 MSC VS transforms b1");
+                    material.mscFragmentGlobals = createConstantBuffer(
+                        fragmentGlobals.data(), fragmentGlobals.size(), "R4 MSC PS globals b0");
+                    material.mscFragmentTransforms = createConstantBuffer(
+                        transforms.data(), transforms.size(), "R4 MSC PS transforms b1");
+                    if (!material.mscVertexGlobals || !material.mscVertexTransforms ||
+                        !material.mscFragmentGlobals || !material.mscFragmentTransforms)
+                        return false;
+                }
             }
 
             R4GraphicsPipelineDesc displayPipeline;
@@ -1914,6 +2731,12 @@ bool prepareLevelScene(
 
                 if (scene.productionLuminance)
                 {
+                    R4SamplerDesc rtlinear;
+                    rtlinear.minFilter = rtlinear.magFilter = R4SamplerFilter::Linear;
+                    rtlinear.mipFilter = R4SamplerFilter::Nearest;
+                    rtlinear.addressU = rtlinear.addressV = rtlinear.addressW = R4SamplerAddressMode::ClampToEdge;
+                    rtlinear.label = "R4 luminance exact smp_rtlinear";
+                    scene.luminanceLinearSampler = resources.CreateSampler(rtlinear, error);
                     const auto luminancePath = [&luminanceShaderDirectory](const char* basename) {
                         return (luminanceShaderDirectory /
                             (std::string(basename) + ".metallib")).string();
@@ -1946,6 +2769,19 @@ bool prepareLevelScene(
                     buildPipeline.cullMode = R4CullMode::None;
                     scene.luminanceBuildPipeline =
                         backend.CreateGraphicsPipeline(buildPipeline, error);
+                    const std::string bloomFragmentPath = luminancePath("bloom_build.ps");
+                    buildPipeline.label = "R4 exact rt_Bloom1 256x256 luminance source";
+                    buildPipeline.shaderKey = "r4-luminance-bloom-build-msc-e06";
+                    buildPipeline.fragmentMetallibPath = bloomFragmentPath.c_str();
+                    buildPipeline.colorFormats = {R4PixelFormat::RGBA8Unorm};
+                    scene.luminanceBloomPipeline = backend.CreateGraphicsPipeline(buildPipeline, error);
+                    R4Texture2DDesc bloomTarget;
+                    bloomTarget.width = bloomTarget.height = 256u;
+                    bloomTarget.format = R4PixelFormat::RGBA8Unorm;
+                    bloomTarget.storage = R4ResourceStorage::Private;
+                    bloomTarget.usage = R4TextureUsage::RenderTarget | R4TextureUsage::ShaderRead;
+                    bloomTarget.label = "R4 exact rt_Bloom1 luminance source";
+                    scene.luminanceBloom256 = resources.CreateTexture2D(bloomTarget, error);
 
                     auto makeFilterPipeline = [&](const char* label, const char* key,
                                                    const std::string& fragmentPath,
@@ -2102,7 +2938,8 @@ bool prepareLevelScene(
                         pipeline.colorFormats = {R4PixelFormat::RGBA16Float};
                         pipeline.depthFormat = R4PixelFormat::Depth32FloatStencil8;
                         pipeline.depthCompare = depthCompare;
-                        pipeline.cullMode = R4CullMode::None;
+                        pipeline.cullMode = R4CullMode::Back;
+                        pipeline.frontFace = R4Winding::Clockwise;
                         pipeline.stencil.enabled = true;
                         pipeline.stencil.frontFace.compare = R4CompareFunction::LessEqual;
                         pipeline.stencil.frontFace.depthStencilPass = stencilPass;
@@ -2120,6 +2957,14 @@ bool prepareLevelScene(
                         "r4-sun-far-nomsaa-msc-v1", sunFarPath,
                         R4CompareFunction::Always, 0x00, R4StencilOperation::Keep);
 
+                    scene.sunMiddlePipeline = createSunPipeline(
+                        "R4 converted direct-sun middle cascade",
+                        "r4-sun-middle-nomsaa-nominmax-msc-v1", sunNearPath,
+                        R4CompareFunction::GreaterEqual, 0xfe, R4StencilOperation::Zero);
+                    scene.sunFarZPipeline = createSunPipeline(
+                        "R4 converted direct-sun far depth-cull cascade",
+                        "r4-sun-far-zcull-nomsaa-msc-v1", sunFarPath,
+                        R4CompareFunction::Less, 0x00, R4StencilOperation::Keep);
                     const xray::metal::R4VertexBufferSummary& shadowVertexBuffer =
                         !scene.textureMaterials.empty() ?
                             scene.geometry.vertexBuffers[scene.textureMaterials.front().vertexBufferId] :
@@ -2198,6 +3043,50 @@ bool prepareLevelScene(
                         }};
                         arefShadowPipeline.vertexLayouts = {{6, arefVertexBuffer.stride}};
                         scene.sunShadowArefPipeline = backend.CreateGraphicsPipeline(arefShadowPipeline, error);
+                    }
+                    if (!scene.sunShadowArefPipeline &&
+                        std::filesystem::is_regular_file(shadowArefVertexPath) &&
+                        std::filesystem::is_regular_file(shadowArefFragmentPath))
+                    {
+                        R4GraphicsPipelineDesc arefShadowPipeline = shadowPipeline;
+                        arefShadowPipeline.label = "R4 converted direct-sun alpha-tested shadow map";
+                        arefShadowPipeline.shaderKey = "r4-shadow-direct-base-aref-r32-msc-v1";
+                        arefShadowPipeline.vertexMetallibPath = shadowArefVertexPath.c_str();
+                        arefShadowPipeline.fragmentMetallibPath = shadowArefFragmentPath.c_str();
+                        arefShadowPipeline.vertexAttributes = {{
+                            {11, 6, 12u, R4VertexFormat::UChar4Normalized},
+                            {12, 6, 16u, R4VertexFormat::UChar4Normalized},
+                            {13, 6, 20u, R4VertexFormat::UChar4Normalized},
+                            {14, 6, 28u, R4VertexFormat::Short2},
+                            {15, 6, 0u, R4VertexFormat::Float3},
+                        }};
+                        arefShadowPipeline.vertexLayouts = {{6, 32u}};
+                        scene.sunShadowArefPipeline = backend.CreateGraphicsPipeline(arefShadowPipeline, error);
+                    }
+                    if (scene.sunShadowArefPipeline && arefMaterial != scene.textureMaterials.end())
+                    {
+                        const xray::metal::R4VertexBufferSummary& arefVertexBuffer =
+                            scene.geometry.vertexBuffers[arefMaterial->vertexBufferId];
+                        R4GraphicsPipelineDesc alphaIgnorePipeline = shadowPipeline;
+                        alphaIgnorePipeline.label = "R4 converted direct-sun AREF vertex opaque shadow validation";
+                        alphaIgnorePipeline.shaderKey = "r4-shadow-direct-base-aref-no-alpha-validation-v1";
+                        alphaIgnorePipeline.vertexMetallibPath = shadowArefVertexPath.c_str();
+                        alphaIgnorePipeline.fragmentMetallibPath = shadowFragmentPath.c_str();
+                        alphaIgnorePipeline.vertexAttributes = {{
+                            {11, 6, arefMaterial->normalOffset, R4VertexFormat::UChar4Normalized},
+                            {12, 6, arefMaterial->tangentOffset, R4VertexFormat::UChar4Normalized},
+                            {13, 6, arefMaterial->binormalOffset, R4VertexFormat::UChar4Normalized},
+                            {14, 6, arefMaterial->uvOffset, R4VertexFormat::Short2},
+                            {15, 6, arefVertexBuffer.positionOffset, R4VertexFormat::Float3},
+                        }};
+                        alphaIgnorePipeline.vertexLayouts = {{6, arefVertexBuffer.stride}};
+                        std::string alphaIgnorePipelineError;
+                        scene.sunShadowArefNoAlphaPipeline = backend.CreateGraphicsPipeline(
+                            alphaIgnorePipeline, alphaIgnorePipelineError);
+                        if (!scene.sunShadowArefNoAlphaPipeline && !alphaIgnorePipelineError.empty())
+                            std::fprintf(stderr,
+                                "METAL_SUN_SHADOW_AREF_NO_ALPHA_UNAVAILABLE reason=\"%s\"\n",
+                                alphaIgnorePipelineError.c_str());
                     }
 
                     std::array<CombineVertex, 4> maskVertices{};
@@ -2303,6 +3192,23 @@ bool prepareLevelScene(
                     shadowColorDesc.label = "R4 direct-sun far R32 shadow map";
                     scene.sunShadowTexture =
                         resources.CreateTexture2D(shadowColorDesc, error);
+                    scene.sunCascades[0].shadow = scene.sunNearShadowTexture;
+                    scene.sunCascades[2].shadow = scene.sunShadowTexture;
+                    shadowColorDesc.label = "R4 direct-sun middle R32 shadow map";
+                    scene.sunCascades[1].shadow = resources.CreateTexture2D(shadowColorDesc, error);
+                    for (unsigned cascade = 0; cascade < 3; ++cascade)
+                    {
+        std::array<std::uint8_t,444> globals{};
+                        std::array<SunVolumeVertex,8> volume{};
+                        scene.sunCascades[cascade].globals = createConstantBuffer(globals.data(),
+                            cascade==2 ? 444 : 432, "R4 sun cascade PS globals");
+                        R4BufferDesc volumeDesc;
+                        volumeDesc.size=sizeof(volume); volumeDesc.storage=R4ResourceStorage::Shared;
+                        volumeDesc.usage=R4BufferUsage::Vertex; volumeDesc.label="R4 sun cascade world cuboid";
+                        scene.sunCascades[cascade].volume=resources.CreateBuffer(volumeDesc,nullptr,0,error);
+                        if (scene.sunCascades[cascade].volume && !resources.UpdateBuffer(
+                            scene.sunCascades[cascade].volume,0,volume.data(),sizeof(volume),error)) return false;
+                    }
                     R4Texture2DDesc shadowDepthDesc;
                     shadowDepthDesc.width = 2048;
                     shadowDepthDesc.height = 2048;
@@ -2335,7 +3241,8 @@ bool prepareLevelScene(
                     !scene.lightingLinearSampler)
                     return false;
                 if (scene.productionLuminance &&
-                    (!scene.luminanceBuildPipeline || !scene.luminanceFilterPipeline ||
+                    (!scene.luminanceBloomPipeline || !scene.luminanceBloom256 || !scene.luminanceLinearSampler ||
+                     !scene.luminanceBuildPipeline || !scene.luminanceFilterPipeline ||
                      !scene.luminanceAdaptPipeline || !scene.luminanceBuildVertices ||
                      !scene.luminanceFilter64Vertices || !scene.luminanceFilter8Vertices ||
                      !scene.luminanceIndices || !scene.luminance64 || !scene.luminance8 ||
@@ -2349,7 +3256,7 @@ bool prepareLevelScene(
                     return false;
                 if (scene.productionSun &&
                     (!scene.sunMaskPipeline || !scene.sunNearPipeline ||
-                     !scene.sunFarPipeline || !scene.sunShadowPipeline ||
+                     !scene.sunFarPipeline || !scene.sunMiddlePipeline || !scene.sunFarZPipeline || !scene.sunShadowPipeline ||
                      !scene.sunMaskVertices ||
                      !scene.sunMaskIndices || !scene.sunVolumeVertices ||
                      !scene.sunVolumeIndices || !scene.sunVertexGlobals ||
@@ -2360,6 +3267,9 @@ bool prepareLevelScene(
                      !scene.sunMaskTexture || !scene.sunNearShadowTexture || !scene.sunShadowTexture ||
                      !scene.sunShadowDepthTarget || !scene.sunSssTexture ||
                      !scene.sunShadowSampler))
+                    return false;
+                if (scene.productionSun && std::any_of(scene.sunCascades.begin(),scene.sunCascades.end(),
+                    [](const auto& cascade) { return !cascade.shadow || !cascade.globals || !cascade.volume; }))
                     return false;
                 if (scene.productionSun && std::any_of(
                         scene.textureMaterials.begin(), scene.textureMaterials.end(),
@@ -2444,8 +3354,19 @@ bool updateBaseLightingConstants(
     putFloat4(globals, 208, combineEnvironment[0], combineEnvironment[1],
         combineEnvironment[2], combineEnvironment[3]);
     putFloat4(globals, 224, hmodelStuff[0], hmodelStuff[1], hmodelStuff[2], hmodelStuff[3]);
-    putFloat4(globals, 288, 1.0f, 0.0f, 0.0f, 0.0f);
-    putFloat4(globals, 320, 1.0f, 0.0f, 0.0f, 0.0f);
+    // The combine consumer must use the same authored controls as the
+    // AO/IL producers. In particular IL stores only a 1/scale footprint.
+    const auto putSsfxControls = [&](std::size_t offset, const std::array<float, 4>& value,
+                                      const std::array<float, 4>& fallback) {
+        const auto& controls = liveEnvironment && finite4(value) ? value : fallback;
+        putFloat4(globals, offset, controls[0], controls[1], controls[2], controls[3]);
+    };
+    const std::array<float, 4> disabledSsfx{1.0f, 0.0f, 0.0f, 0.0f};
+    const std::array<float, 4> emptySsfx{};
+    putSsfxControls(288u, environment ? environment->ssfxAo : disabledSsfx, disabledSsfx);
+    putSsfxControls(304u, environment ? environment->ssfxAoSetup1 : emptySsfx, emptySsfx);
+    putSsfxControls(320u, environment ? environment->ssfxIl : disabledSsfx, disabledSsfx);
+    putSsfxControls(336u, environment ? environment->ssfxIlSetup1 : emptySsfx, emptySsfx);
     if (liveEnvironment)
         putFloat4(globals, 368, environment->skyColor[0], environment->skyColor[1],
             environment->skyColor[2], environment->skyRotation);
@@ -2496,8 +3417,16 @@ bool updateBaseLightingConstants(
         liveEnvironment ? environment->hemiColor[2] : 0.58f,
         liveEnvironment ? environment->hemiColor[3] : 0.0f);
     putFloat4(staticGlobals, 384, scene.eye.x, scene.eye.y, scene.eye.z, 0.0f);
-    const float verticalTan = -std::tan(55.0f * 3.14159265358979323846f / 360.0f);
-    const float horizontalTan = -verticalTan * (16.0f / 9.0f);
+    const float fallbackVerticalTan = -std::tan(55.0f * 3.14159265358979323846f / 360.0f);
+    const float fallbackHorizontalTan = -fallbackVerticalTan * (16.0f / 9.0f);
+    const float projectionX = scene.projection.elements[0];
+    const float projectionY = scene.projection.elements[5];
+    const float horizontalTan = std::isfinite(projectionX) && std::fabs(projectionX) > 1.0e-6f ?
+        1.0f / projectionX : fallbackHorizontalTan;
+    const float verticalTan = std::isfinite(projectionY) && std::fabs(projectionY) > 1.0e-6f ?
+        -1.0f / projectionY : fallbackVerticalTan;
+    scene.positionDecompressionParams={horizontalTan,verticalTan,
+        (2.0f*horizontalTan)/static_cast<float>(width),(2.0f*verticalTan)/static_cast<float>(height)};
     putFloat4(staticGlobals, 400,
         horizontalTan, verticalTan,
         (2.0f * horizontalTan) / static_cast<float>(width),
@@ -2526,7 +3455,7 @@ bool updateBaseLightingConstants(
     const float adaptedLuminance = std::max(0.0f, 0.30f * adaptedSunColor[0] +
         0.48f * adaptedSunColor[1] + 0.22f * adaptedSunColor[2]);
     putFloat4(dynamicLight, 0, adaptedSunColor[0], adaptedSunColor[1], adaptedSunColor[2],
-        adaptedLuminance);
+        liveEnvironment ? environment->adaptedSunSpecular : 0.5f);
     putFloat4(dynamicLight, 32, adaptedSunDirectionView.x, adaptedSunDirectionView.y,
         adaptedSunDirectionView.z, 0.0f);
 
@@ -2579,168 +3508,69 @@ bool updateBaseLightingConstants(
     constantSunMask.elements[12] = 0.5f;
     constantSunMask.elements[13] = 0.5f;
     constantSunMask.elements[15] = 1.0f;
-    const Vec3 sunDirection = adaptedSunDirectionWorld;
-    const float lightDistance = scene.radius * 3.0f;
-    const Vec3 farLightEye{
-        scene.center.x - sunDirection.x * lightDistance,
-        scene.center.y - sunDirection.y * lightDistance,
-        scene.center.z - sunDirection.z * lightDistance,
-    };
-    Matrix4 farLightView = makeLookAt(farLightEye, scene.center);
-    stabilizeOrthographicShadowView(farLightView, scene.radius * 1.75f,
-        scene.radius * 1.75f, 2048u);
-    const Matrix4 farLightProjection = makeOrthographic(
-        scene.radius * 1.75f, scene.radius * 1.75f,
-        std::max(0.1f, scene.radius * 0.01f), scene.radius * 6.0f);
-    const Matrix4 farLightViewProjection = multiply(farLightProjection, farLightView);
-    scene.sunShadowViewProjection = farLightViewProjection;
-
-    // R4 applies a separate, tightly fitted near cascade before the far map.
-    // The old Metal path rendered only the far map over the whole frame, which
-    // made close receivers use the coarse level-sized projection.  Keep the
-    // split at the original default near distance (20 m) and cover the full
-    // near receiver disk plus its shadow casters.
-    constexpr float SunNearDistance = 20.0f;
-    const float nearRadius = std::min(scene.radius * 1.75f, SunNearDistance * 1.5f);
-    const Vec3 nearCenter = scene.gameplayViewValid ? scene.eye : scene.center;
-    const Vec3 nearLightEye{
-        nearCenter.x - sunDirection.x * nearRadius * 3.0f,
-        nearCenter.y - sunDirection.y * nearRadius * 3.0f,
-        nearCenter.z - sunDirection.z * nearRadius * 3.0f,
-    };
-    Matrix4 nearLightView = makeLookAt(nearLightEye, nearCenter);
-    stabilizeOrthographicShadowView(nearLightView, nearRadius, nearRadius, 2048u);
-    const Matrix4 nearLightProjection = makeOrthographic(
-        nearRadius, nearRadius, std::max(0.1f, nearRadius * 0.01f), nearRadius * 6.0f);
-    const Matrix4 nearLightViewProjection = multiply(nearLightProjection, nearLightView);
-    scene.sunNearShadowViewProjection = nearLightViewProjection;
-    Matrix4 nearShadowTexgen = screenTexgen;
-    nearShadowTexgen.elements[10] = 1.0f;
-    nearShadowTexgen.elements[14] = -0.00001f;
-    Matrix4 farShadowTexgen = screenTexgen;
-    farShadowTexgen.elements[10] = 1.0f;
-    farShadowTexgen.elements[14] = -0.00002f;
-    const Matrix4 nearShadowLookup = multiply(
-        nearShadowTexgen, multiply(nearLightViewProjection, inverseView));
-    Matrix4 farShadowLookup = multiply(
-        farShadowTexgen, multiply(farLightViewProjection, inverseView));
-    // R4's far path applies the default TSM receiver translation after its
-    // projection.  Retain that source default while the native backend does
-    // not yet receive the live r2_sun_tsm_bias console value.
-    Matrix4 farTsmBias{};
-    farTsmBias.elements[0] = farTsmBias.elements[5] = farTsmBias.elements[10] =
-        farTsmBias.elements[15] = 1.0f;
-    farTsmBias.elements[12] = sunDirection.x * -0.01f;
-    farTsmBias.elements[13] = sunDirection.y * -0.01f;
-    farTsmBias.elements[14] = sunDirection.z * -0.01f;
-    farShadowLookup = multiply(farShadowLookup, farTsmBias);
-
-    std::array<std::uint8_t, 224> sunVertexGlobals{};
-    std::array<std::uint8_t, 256> sunVertexTransforms{};
-    std::array<std::uint8_t, 432> sunNearFragmentGlobals{};
-    std::array<std::uint8_t, 444> sunFarFragmentGlobals{};
-    std::array<std::uint8_t, 48> maskDynamicLight{};
-    std::memcpy(sunVertexGlobals.data() + 160, &screenTexgen, sizeof(Matrix4));
-    std::memcpy(sunVertexTransforms.data() + 0, &identity, sizeof(Matrix4));
-    std::memcpy(sunNearFragmentGlobals.data() + 224,
-        &constantSunMask, sizeof(Matrix4));
-    std::memcpy(sunNearFragmentGlobals.data() + 288,
-        &nearShadowLookup, sizeof(Matrix4));
-    putFloat4(sunNearFragmentGlobals, 416, 1.0f, 0.0f, 0.0f, 0.0f);
-    putFloat4(sunFarFragmentGlobals, 272, 1.0f, 0.0f, 0.0f, 0.0f);
-    std::memcpy(sunFarFragmentGlobals.data() + 304,
-        &constantSunMask, sizeof(Matrix4));
-    std::memcpy(sunFarFragmentGlobals.data() + 368,
-        &farShadowLookup, sizeof(Matrix4));
-    const float viewShadowProjection[3] = {0.0f, 0.0f, 0.0f};
-    std::memcpy(sunFarFragmentGlobals.data() + 432,
-        viewShadowProjection, sizeof(viewShadowProjection));
+    scene.sunCascadesValid = scene.gameplayViewValid && environment && environment->sunCascades.valid;
+    scene.sunZCulling = environment && environment->sunZCulling;
+    if (scene.sunCascadesValid) scene.sunCascadeContract = environment->sunCascades;
+    const Matrix4 texgen = multiply(screenTexgen, scene.uniformData.viewProjection);
+    std::array<std::uint8_t,224> sunVertexGlobals{};
+    std::array<std::uint8_t,256> sunVertexTransforms{};
+    std::array<std::uint8_t,48> maskDynamicLight{};
+    std::memcpy(sunVertexGlobals.data()+160,&texgen,sizeof(Matrix4));
+    std::memcpy(sunVertexTransforms.data(),&scene.uniformData.viewProjection,sizeof(Matrix4));
+    for (unsigned cascade=0; scene.sunCascadesValid && cascade<3; ++cascade)
+    {
+        auto& gpu=scene.sunCascades[cascade];
+        const auto& source=scene.sunCascadeContract.cascades[cascade];
+        std::memcpy(&gpu.lightViewProjection,source.lightViewProjection.data(),sizeof(Matrix4));
+        Matrix4 adjust=screenTexgen;
+        adjust.elements[10]=environment->sunDepthScale[cascade==0?0:1];
+        adjust.elements[14]=source.bias;
+        Matrix4 lookup=multiply(adjust,multiply(gpu.lightViewProjection,inverseView));
+        if (cascade==2)
+        {
+            Matrix4 bias=identity;
+            bias.elements[12]=adaptedSunDirectionView.x*environment->sunTsmBias;
+            bias.elements[13]=adaptedSunDirectionView.y*environment->sunTsmBias;
+            bias.elements[14]=adaptedSunDirectionView.z*environment->sunTsmBias;
+            lookup=multiply(lookup,bias);
+        }
+        gpu.shadowLookup = lookup;
+        std::array<std::uint8_t,444> globals{};
+        std::memcpy(globals.data()+160,environment->ssfxFloraFixes1.data(),sizeof(float)*4);
+        std::memcpy(globals.data()+176,environment->ssfxFloraFixes2.data(),sizeof(float)*4);
+        std::memcpy(globals.data()+192,environment->ssfxLightSetup1.data(),sizeof(float)*4);
+        std::memcpy(globals.data()+(cascade==2?288:208),environment->ssfxShadowBias.data(),sizeof(float)*4);
+        if (cascade==2)
+        {
+            putFloat4(globals,272,1,0,0,0);
+            std::memcpy(globals.data()+304,&constantSunMask,sizeof(Matrix4));
+            std::memcpy(globals.data()+368,&lookup,sizeof(Matrix4));
+            const Vec3 projected=transformDirection(lookup,{0,0,1});
+            const float length=std::hypot(projected.x,projected.y);
+            const float viewShadow[3]={length>1e-8f?projected.x/length:0,
+                length>1e-8f?projected.y/length:0,0};
+            std::memcpy(globals.data()+432,viewShadow,sizeof(viewShadow));
+        }
+        else
+        {
+            std::memcpy(globals.data()+224,&constantSunMask,sizeof(Matrix4));
+            std::memcpy(globals.data()+288,&lookup,sizeof(Matrix4));
+            putFloat4(globals,416,1,0,0,0);
+        }
+        if (!resources.UpdateBuffer(gpu.globals,0,globals.data(),cascade==2?444:432,error) ||
+            !resources.UpdateBuffer(gpu.volume,0,source.receiverVolume.data(),sizeof(SunVolumeVertex)*8,error))
+            return false;
+    }
     const float maskDirectionScale = -std::sqrt(adaptedLuminance + 1.0e-6f);
     putFloat4(maskDynamicLight, 32, adaptedSunDirectionView.x * maskDirectionScale,
         adaptedSunDirectionView.y * maskDirectionScale,
         adaptedSunDirectionView.z * maskDirectionScale, 0.0f);
-    std::array<std::uint8_t, 256> nearShadowTransforms{};
-    std::array<std::uint8_t, 256> farShadowTransforms{};
-    const Matrix4 firstNearShadowWorldViewProjection = multiply(
-        nearLightViewProjection, !scene.textureMaterials.empty() ?
-            scene.textureMaterials.front().modelTransform : identity);
-    const Matrix4 firstFarShadowWorldViewProjection = multiply(
-        farLightViewProjection, !scene.textureMaterials.empty() ?
-            scene.textureMaterials.front().modelTransform : identity);
-    std::memcpy(nearShadowTransforms.data(),
-        &firstNearShadowWorldViewProjection, sizeof(Matrix4));
-    std::memcpy(farShadowTransforms.data(),
-        &firstFarShadowWorldViewProjection, sizeof(Matrix4));
-
-    if (!resources.UpdateBuffer(scene.sunMaskVertices, 0,
-               maskVertices.data(), sizeof(maskVertices), error))
+    if (!resources.UpdateBuffer(scene.sunMaskVertices,0,maskVertices.data(),sizeof(maskVertices),error) ||
+        !resources.UpdateBuffer(scene.sunVertexGlobals,0,sunVertexGlobals.data(),sunVertexGlobals.size(),error) ||
+        !resources.UpdateBuffer(scene.sunVertexTransforms,0,sunVertexTransforms.data(),sunVertexTransforms.size(),error) ||
+        !resources.UpdateBuffer(scene.sunMaskDynamicLight,0,maskDynamicLight.data(),maskDynamicLight.size(),error))
         return false;
-    if (!resources.UpdateBuffer(scene.sunVertexGlobals, 0,
-            sunVertexGlobals.data(), sunVertexGlobals.size(), error))
-        return false;
-    if (!resources.UpdateBuffer(scene.sunVertexTransforms, 0,
-            sunVertexTransforms.data(), sunVertexTransforms.size(), error))
-        return false;
-    // The source renderer moves the cuboid split to r2_sun_near in projected
-    // depth each frame.  Its static native replacement was fixed at 0.70,
-    // so the near stencil range varied with FOV and camera projection.  Keep
-    // the same 20 m source default and derive its Metal depth from this frame.
-    float cascadeDepth = 0.70f;
-    if (scene.gameplayViewValid)
-    {
-        const Vec3 forward = normalize(transformDirection(inverseView, {0.0f, 0.0f, -1.0f}));
-        const Vec3 splitPoint{
-            scene.eye.x + forward.x * SunNearDistance,
-            scene.eye.y + forward.y * SunNearDistance,
-            scene.eye.z + forward.z * SunNearDistance,
-        };
-        const Vec4 splitClip = transformPointToClip(scene.uniformData.viewProjection, splitPoint);
-        if (std::isfinite(splitClip.z) && std::isfinite(splitClip.w) &&
-            std::fabs(splitClip.w) > 1.0e-6f)
-            cascadeDepth = std::clamp(splitClip.z / splitClip.w, 0.0f, 1.0f);
-    }
-    const std::array<SunVolumeVertex, 8> volumeVertices = {{
-        {{-1.0f, -1.0f, cascadeDepth, 1.0f}},
-        {{-1.0f, -1.0f, 1.00f, 1.0f}},
-        {{-1.0f,  1.0f, 1.00f, 1.0f}},
-        {{-1.0f,  1.0f, cascadeDepth, 1.0f}},
-        {{ 1.0f,  1.0f, 1.00f, 1.0f}},
-        {{ 1.0f,  1.0f, cascadeDepth, 1.0f}},
-        {{ 1.0f, -1.0f, 1.00f, 1.0f}},
-        {{ 1.0f, -1.0f, cascadeDepth, 1.0f}},
-    }};
-    if (!resources.UpdateBuffer(scene.sunVolumeVertices, 0, volumeVertices.data(),
-            sizeof(volumeVertices), error))
-        return false;
-    if (!resources.UpdateBuffer(scene.sunNearFragmentGlobals, 0,
-            sunNearFragmentGlobals.data(), sunNearFragmentGlobals.size(), error))
-        return false;
-    if (!resources.UpdateBuffer(scene.sunFarFragmentGlobals, 0,
-            sunFarFragmentGlobals.data(), sunFarFragmentGlobals.size(), error))
-        return false;
-    if (!resources.UpdateBuffer(scene.sunMaskDynamicLight, 0,
-            maskDynamicLight.data(), maskDynamicLight.size(), error))
-        return false;
-    for (LevelScene::TextureMaterial& material : scene.textureMaterials)
-    {
-        const Matrix4 nearShadowWorldViewProjection = multiply(
-            nearLightViewProjection, material.modelTransform);
-        const Matrix4 farShadowWorldViewProjection = multiply(
-            farLightViewProjection, material.modelTransform);
-        std::memcpy(nearShadowTransforms.data(), &nearShadowWorldViewProjection, sizeof(Matrix4));
-        std::memcpy(farShadowTransforms.data(), &farShadowWorldViewProjection, sizeof(Matrix4));
-        if (!resources.UpdateBuffer(material.sunNearShadowTransforms, 0,
-                nearShadowTransforms.data(), nearShadowTransforms.size(), error))
-            return false;
-        if (!resources.UpdateBuffer(material.sunShadowTransforms, 0,
-                farShadowTransforms.data(), farShadowTransforms.size(), error))
-            return false;
-    }
-    if (!resources.UpdateBuffer(scene.sunNearShadowTransforms, 0,
-            nearShadowTransforms.data(), nearShadowTransforms.size(), error))
-        return false;
-    return resources.UpdateBuffer(scene.sunShadowTransforms, 0,
-        farShadowTransforms.data(), farShadowTransforms.size(), error);
+    return true;
 }
 
 bool ensureLevelDepthTarget(IR4Backend& backend, LevelScene& scene, std::string& error)
@@ -2875,8 +3705,10 @@ bool ensureLevelDepthTarget(IR4Backend& backend, LevelScene& scene, std::string&
 
 bool uploadLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
 {
-    if (scene.uploaded)
+    if (scene.uploaded || scene.pendingUploaded)
         return true;
+    for (LevelScene::TextureAsset& asset : scene.textureAssets)
+        asset.uploadedBytes = 0u;
     IR4Resources& resources = backend.Resources();
     for (std::size_t i = 0; i < scene.geometry.vertexBuffers.size(); ++i)
     {
@@ -2909,8 +3741,6 @@ bool uploadLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error
                 return false;
             asset.uploadedBytes += mip.bytesPerImage;
         }
-        asset.ddsTexture.bytes.clear();
-        asset.ddsTexture.bytes.shrink_to_fit();
     }
     if (scene.lutAtlas && !scene.lutAtlasUploaded && !scene.lutAtlasDds.bytes.empty())
     {
@@ -2928,14 +3758,13 @@ bool uploadLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error
                     error))
                 return false;
         }
-        scene.lutAtlasDds.bytes.clear();
-        scene.lutAtlasDds.bytes.shrink_to_fit();
-        scene.lutAtlasUploaded = true;
+        scene.pendingLutAtlasUploaded = true;
         std::fprintf(stderr, "METAL_LUT_ATLAS_UPLOADED width=%u height=%u mips=%u format=%u\n",
             scene.lutAtlas->Descriptor().width, scene.lutAtlas->Descriptor().height,
             scene.lutAtlas->Descriptor().mipLevels, static_cast<unsigned>(scene.lutAtlas->Descriptor().format));
     }
-    if (scene.productionBaseLighting && !scene.lightingInputsUploaded)
+    if (scene.productionBaseLighting && !scene.lightingInputsUploaded &&
+        !scene.pendingLightingInputsUploaded)
     {
         const float tonemap = 1.0f;
         const std::uint8_t white[4] = {255, 255, 255, 255};
@@ -2982,13 +3811,75 @@ bool uploadLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error
                     blackSss, sizeof(blackSss), 4, 4, error))
                 return false;
         }
+        scene.pendingLightingInputsUploaded = true;
+    }
+    scene.pendingUploaded = true;
+    return true;
+}
+
+void commitLevelSceneUploads(LevelScene& scene)
+{
+    if (!scene.pendingUploaded)
+        return;
+    scene.uploaded = true;
+    if (scene.pendingLightingInputsUploaded)
         scene.lightingInputsUploaded = true;
+    if (scene.pendingLutAtlasUploaded)
+    {
+        scene.lutAtlasUploaded = true;
+        scene.lutAtlasDds.bytes.clear();
+        scene.lutAtlasDds.bytes.shrink_to_fit();
+    }
+    for (LevelScene::TextureAsset& asset : scene.textureAssets)
+    {
+        asset.ddsTexture.bytes.clear();
+        asset.ddsTexture.bytes.shrink_to_fit();
     }
     scene.geometryBytes.clear();
     scene.geometryBytes.shrink_to_fit();
-    scene.uploaded = true;
-    return true;
+    scene.pendingUploaded = false;
+    scene.pendingLightingInputsUploaded = false;
+    scene.pendingLutAtlasUploaded = false;
 }
+
+void discardLevelSceneUploads(LevelScene& scene)
+{
+    scene.pendingUploaded = false;
+    scene.pendingLightingInputsUploaded = false;
+    scene.pendingLutAtlasUploaded = false;
+    for (LevelScene::TextureAsset& asset : scene.textureAssets)
+        asset.uploadedBytes = 0u;
+}
+
+// The standalone bootstrap owns its SubmitFrame boundary directly instead of
+// using MetalR4EngineScene::OnFrameSubmitted/DiscardUnsubmittedFrame.
+class StandaloneLevelSceneUploadTransaction
+{
+public:
+    explicit StandaloneLevelSceneUploadTransaction(LevelScene* scene) : m_scene(scene) {}
+    ~StandaloneLevelSceneUploadTransaction()
+    {
+        if (m_scene && m_attempted && !m_committed)
+            discardLevelSceneUploads(*m_scene);
+    }
+
+    void BeginAttempt()
+    {
+        m_attempted = m_scene && !m_scene->uploaded;
+    }
+
+    void Commit()
+    {
+        if (m_scene && m_attempted)
+            commitLevelSceneUploads(*m_scene);
+        m_committed = true;
+    }
+
+private:
+    LevelScene* m_scene = nullptr;
+    bool m_attempted = false;
+    bool m_committed = false;
+};
 
 bool updateLuminanceConstants(
     IR4Backend& backend,
@@ -3018,8 +3909,8 @@ bool updateLuminanceConstants(
     const std::array<std::uint8_t, 528> filter8FragmentGlobals = screenGlobals(8, 8);
 
     std::array<LuminanceBuildVertex, 4> buildVertices{};
-    const float halfX = 1.0f / static_cast<float>(sourceWidth);
-    const float halfY = 1.0f / static_cast<float>(sourceHeight);
+    const float halfX = 1.0f / 256.0f;
+    const float halfY = 1.0f / 256.0f;
     const float oneX = 2.0f * halfX;
     const float oneY = 2.0f * halfY;
     const float ax[4] = {halfX, halfX + oneX, halfX, halfX + oneX};
@@ -3176,17 +4067,64 @@ bool drawLuminanceAdaptation(
         pass.viewport.height = extent;
         return backend.BeginRenderPass(pass, error) && draw() && backend.EndRenderPass(error);
     };
+    // phase_bloom always builds rt_Bloom1 before phase_luminance, even
+    // when SSFX bypasses the later legacy bloom filters.
+    std::array<LuminanceBuildVertex, 4> bloomVertices{};
+    const auto& sourceDesc = scene.lightingTargets[1]->Descriptor();
+    const float halfX = 0.5f / float(sourceDesc.width), halfY = 0.5f / float(sourceDesc.height);
+    const float one = 1.0f / 512.0f;
+    for (std::size_t i = 0; i < bloomVertices.size(); ++i)
+    {
+        const bool right = i >= 2u, down = i % 2u == 0u;
+        auto& v = bloomVertices[i];
+        // Source EPS geometry and original half-pixel transform retained.
+        v.position[0] = (right ? 256.0f : 0.0f) + 0.00001f;
+        v.position[1] = (down ? 256.0f : 0.0f) + 0.00001f;
+        v.position[2] = 0.00001f; v.position[3] = 1.0f;
+        for (std::size_t k = 0; k < 4u; ++k)
+        {
+            v.texcoord[k][0] = (right ? 1.0f : 0.0f) + halfX + (k % 2u ? one : 0.0f);
+            v.texcoord[k][1] = (down ? 1.0f : 0.0f) + halfY + (k >= 2u ? one : 0.0f);
+        }
+    }
+    std::array<std::uint8_t, 528> vertexGlobals{};
+    const float screen[4] = {256.0f, 256.0f, 1.0f/256.0f, 1.0f/256.0f};
+    std::memcpy(vertexGlobals.data() + 416u, screen, sizeof(screen));
+    std::array<std::uint8_t, 176> bloomGlobals{};
+    const float params[4] = {scene.luminanceBloomThreshold, scene.luminanceBloomThreshold,
+        scene.luminanceBloomThreshold, 0.0f}; // Winning PS reads X only.
+    std::memcpy(bloomGlobals.data() + 160u, params, sizeof(params));
+    R4FrameBufferSlice vertices, globals, parameters;
+    if (!backend.UploadFrameData(bloomVertices.data(), sizeof(bloomVertices), 16u, vertices, error) ||
+        !backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u, globals, error) ||
+        !backend.UploadFrameData(bloomGlobals.data(), bloomGlobals.size(), 256u, parameters, error)) return false;
+    if (!renderPass("R4 exact bloom_build luminance source 256x256", 256u, scene.luminanceBloom256, [&] {
+        R4MscStageBindings vs; vs.stage = R4ShaderStage::Vertex; vs.tlabSize = 24u;
+        vs.resources = {{R4MscResourceType::ConstantBuffer, 0u, globals.buffer, globals.offset, globals.size, nullptr, nullptr}};
+        R4MscStageBindings ps; ps.stage = R4ShaderStage::Fragment; ps.tlabSize = 96u;
+        ps.resources = {
+            {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, scene.lightingTargets[1], nullptr},
+            {R4MscResourceType::ConstantBuffer, 24u, parameters.buffer, parameters.offset, parameters.size, nullptr, nullptr},
+            {R4MscResourceType::ConstantBuffer, 48u, scene.luminanceBuildFragmentGlobals, 0u, 528u, nullptr, nullptr},
+            {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, scene.luminanceLinearSampler},
+        };
+        R4IndexedDrawDesc draw; draw.indexBuffer = scene.luminanceIndices;
+        draw.indexCount = 6u; draw.indexType = R4IndexType::UInt16;
+        return backend.BindGraphicsPipeline(scene.luminanceBloomPipeline, error) &&
+            backend.BindVertexBuffer(6u, vertices.buffer, vertices.offset, error) &&
+            backend.BindMscResources(vs, error) && backend.BindMscResources(ps, error) && backend.DrawIndexed(draw, error);
+    })) return false;
     if (!renderPass("R4 converted luminance build 64x64", 64, scene.luminance64, [&] {
             return drawLuminancePass(backend, scene.luminanceBuildPipeline,
                 scene.luminanceBuildVertices, scene.luminanceBuildVertexGlobals,
-                scene.lightingTargets[1], scene.luminanceBuildFragmentGlobals,
-                scene.lightingLinearSampler, scene.luminanceIndices, error);
+                scene.luminanceBloom256, scene.luminanceBuildFragmentGlobals,
+                scene.luminanceLinearSampler, scene.luminanceIndices, error);
         }) ||
         !renderPass("R4 converted luminance filter 8x8", 8, scene.luminance8, [&] {
             return drawLuminancePass(backend, scene.luminanceFilterPipeline,
                 scene.luminanceFilter64Vertices, scene.luminanceFilter64VertexGlobals,
                 scene.luminance64, scene.luminanceFilter64FragmentGlobals,
-                scene.lightingLinearSampler, scene.luminanceIndices, error);
+                scene.luminanceLinearSampler, scene.luminanceIndices, error);
         }))
         return false;
 
@@ -3209,7 +4147,7 @@ bool drawLuminanceAdaptation(
             {R4MscResourceType::Sampler, 96, nullptr, 0, 0,
                 nullptr, scene.lightingNoFilterSampler},
             {R4MscResourceType::Sampler, 120, nullptr, 0, 0,
-                nullptr, scene.lightingLinearSampler},
+                nullptr, scene.luminanceLinearSampler},
         };
         if (!backend.BindGraphicsPipeline(scene.luminanceAdaptPipeline, error) ||
             !backend.BindVertexBuffer(6, scene.luminanceFilter8Vertices, 0, error) ||
@@ -3230,7 +4168,7 @@ bool drawLuminanceAdaptation(
         environment.engineFrame - scene.luminanceLastTelemetryFrame >= 300u)
     {
         std::fprintf(stderr,
-            "METAL_LUMINANCE_FRAME frame=%u source=combine_high chain=64x64,8x8,1x1 "
+            "METAL_LUMINANCE_FRAME frame=%u source=rt_Bloom1_RGBA8 chain=256x256,64x64,8x8,1x1 "
             "middle_gray=%.4f amount=%.4f low_lum=%.4f adaptation=%.6f ping_pong=true\n",
             environment.engineFrame, environment.tonemapParameters[0],
             environment.tonemapParameters[1], environment.tonemapParameters[2],
@@ -3240,7 +4178,8 @@ bool drawLuminanceAdaptation(
     return true;
 }
 
-bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
+bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error,
+    LevelScene::ActiveOcclusionObservation* const activeOcclusionObservation = nullptr)
 {
     if (scene.textureMaterials.empty() &&
         !backend.BindVertexBuffer(1, scene.uniforms, 0, error))
@@ -3265,6 +4204,7 @@ bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
         std::shared_ptr<IR4GraphicsPipeline> selectedPipeline =
             scene.pipelines[visual.vertexBufferId];
         bool alphaTested = false;
+        const LevelScene::TextureMaterial* activeOcclusionMaterial = nullptr;
         if (!scene.textureMaterials.empty())
         {
             const auto material = scene.textureMaterialByVisual.find(visual.visualId);
@@ -3291,6 +4231,15 @@ bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
                     ++automaticLmhArefCulled;
                 continue;
             }
+            if (activeOcclusionObservation && !activeOcclusionObservation->failed &&
+                binding.shaderName == "default" && binding.visualType != 7u &&
+                binding.visualType != 11u && binding.activeOcclusionTriangleCount != 0u &&
+                binding.activeOcclusionFirstTriangle != std::numeric_limits<std::size_t>::max() &&
+                selectedPipeline == scene.pipelines[visual.vertexBufferId] &&
+                binding.activeOcclusionConstantsValid &&
+                binding.activeOcclusionConstantsFrame == activeOcclusionObservation->engineFrame &&
+                binding.activeOcclusionConstantsScopeId == activeOcclusionObservation->scopeId)
+                activeOcclusionMaterial = &binding;
             if (scene.productionMsc)
             {
                 R4MscStageBindings vertexBindings;
@@ -3373,6 +4322,75 @@ bool drawLevelScene(IR4Backend& backend, LevelScene& scene, std::string& error)
         draw.baseVertex = static_cast<std::int32_t>(visual.vertexBase);
         if (!backend.DrawIndexed(draw, error))
             return false;
+        if (activeOcclusionMaterial && activeOcclusionObservation &&
+            !activeOcclusionObservation->failed)
+        {
+            const std::size_t firstTriangle =
+                activeOcclusionMaterial->activeOcclusionFirstTriangle;
+            const std::size_t triangleCount =
+                activeOcclusionMaterial->activeOcclusionTriangleCount;
+            const auto& catalogTriangles = scene.activeOcclusionSourceCatalog.Triangles();
+            if (firstTriangle > catalogTriangles.size() ||
+                triangleCount > catalogTriangles.size() - firstTriangle ||
+                activeOcclusionObservation->admittedDraws.size() >=
+                    scene.activeOcclusionSourceVisuals)
+            {
+                activeOcclusionObservation->failed = true;
+                activeOcclusionObservation->admittedDraws.clear();
+            }
+            else
+            {
+                try
+                {
+                    LevelScene::ActiveOcclusionDrawReceipt receipt;
+                    receipt.drawId = activeOcclusionObservation->admittedDraws.size() + 1u;
+                    receipt.scopeId = activeOcclusionObservation->scopeId;
+                    receipt.engineFrame = activeOcclusionObservation->engineFrame;
+                    receipt.visualId = activeOcclusionMaterial->visualId;
+                    receipt.firstTriangle = static_cast<std::uint32_t>(firstTriangle);
+                    receipt.triangleCount = static_cast<std::uint32_t>(triangleCount);
+                    receipt.viewportWidth = activeOcclusionObservation->viewportWidth;
+                    receipt.viewportHeight = activeOcclusionObservation->viewportHeight;
+                    receipt.viewportY = xray::metal::active_occlusion_catalog::
+                        ViewportYDirection::ClipPositiveYMapsToLowerPixelY;
+                    // The exact qualified production descriptor for this path:
+                    // opaque flat MSC, Clockwise front, Back cull, Less/write,
+                    // and G-buffer stencil Always/Replace under reference 1.
+                    receipt.clockwiseFrontFace = true;
+                    receipt.backFaceCull = true;
+                    receipt.depthLess = true;
+                    receipt.opaque = true;
+                    receipt.writesDepth = true;
+                    receipt.stencilPassGuaranteed = true;
+                    receipt.drawSucceeded = true;
+                    if (activeOcclusionMaterial->localPositionBounds.available)
+                    {
+                        receipt.localBounds.minimum =
+                            activeOcclusionMaterial->localPositionBounds.minimum;
+                        receipt.localBounds.maximum =
+                            activeOcclusionMaterial->localPositionBounds.maximum;
+                    }
+                    else
+                    {
+                        const float unknown = std::numeric_limits<float>::quiet_NaN();
+                        receipt.localBounds.minimum.fill(unknown);
+                        receipt.localBounds.maximum.fill(unknown);
+                    }
+                    std::memcpy(receipt.uploadedWvp.data(),
+                        activeOcclusionMaterial->activeOcclusionUploadedWvp.data(),
+                        sizeof(receipt.uploadedWvp));
+                    std::memcpy(receipt.uploadedJitter.data(),
+                        activeOcclusionMaterial->activeOcclusionUploadedJitter.data(),
+                        sizeof(receipt.uploadedJitter));
+                    activeOcclusionObservation->admittedDraws.emplace_back(std::move(receipt));
+                }
+                catch (const std::bad_alloc&)
+                {
+                    activeOcclusionObservation->failed = true;
+                    activeOcclusionObservation->admittedDraws.clear();
+                }
+            }
+        }
         if (scene.automaticLmhFrustumCulling)
         {
             ++automaticLmhSubmitted;
@@ -3481,9 +4499,15 @@ bool drawBaseLighting(IR4Backend& backend, LevelScene& scene, std::string& error
     return backend.DrawIndexed(draw, error);
 }
 
-bool drawSunShadowMap(IR4Backend& backend, LevelScene& scene, bool nearCascade,
-    std::string& error)
+// The optional flags support an isolated AREF coverage comparison. Existing
+// production callers retain the normal alpha-tested route and no telemetry.
+bool drawSunShadowMap(IR4Backend& backend, LevelScene& scene, unsigned cascade,
+    std::string& error, bool alphaOnly = false, bool ignoreAlpha = false,
+    std::size_t* outDrawCount = nullptr, const char* textureNameContains = nullptr,
+    const std::vector<std::size_t>* casterIndices = nullptr)
 {
+    if (outDrawCount)
+        *outDrawCount = 0u;
     if (!scene.productionSun || !scene.sunShadowPipeline ||
         !scene.sunShadowTransforms)
     {
@@ -3496,26 +4520,44 @@ bool drawSunShadowMap(IR4Backend& backend, LevelScene& scene, bool nearCascade,
     vertexBindings.stage = R4ShaderStage::Vertex;
     vertexBindings.tlabSize = 24;
     std::size_t lastVertexBuffer = std::numeric_limits<std::size_t>::max();
-    for (const LevelScene::TextureMaterial& material : scene.textureMaterials)
+    const std::size_t count = casterIndices ? casterIndices->size() : scene.textureMaterials.size();
+    for (std::size_t i = 0; i < count; ++i)
     {
+        const std::size_t index = casterIndices ? (*casterIndices)[i] : i;
+        if (index >= scene.textureMaterials.size())
+        { error = "E08 static sun caster index is out of range"; return false; }
+        const LevelScene::TextureMaterial& material = scene.textureMaterials[index];
         const bool alphaTested = material.shaderName == "def_shaders\\def_aref";
-        const std::shared_ptr<IR4GraphicsPipeline>& pipeline = alphaTested ?
-            scene.sunShadowArefPipeline : scene.sunShadowPipeline;
+        if (alphaOnly && !alphaTested)
+            continue;
+        if (textureNameContains && (material.textureAssetIndex>=scene.textureAssets.size() ||
+            scene.textureAssets[material.textureAssetIndex].ddsPath.string().find(textureNameContains)==std::string::npos))
+            continue;
+        const bool alphaIgnored = alphaTested && ignoreAlpha;
+        const std::shared_ptr<IR4GraphicsPipeline>& pipeline = alphaIgnored ?
+            scene.sunShadowArefNoAlphaPipeline : alphaTested ?
+                scene.sunShadowArefPipeline : scene.sunShadowPipeline;
         if (!pipeline)
         {
-            error = "alpha-tested R4 shadow caster pipeline is unavailable";
+            error = alphaIgnored ? "alpha-ignore R4 validation shadow caster pipeline is unavailable" :
+                "alpha-tested R4 shadow caster pipeline is unavailable";
             return false;
         }
         if (!backend.BindGraphicsPipeline(pipeline, error))
             return false;
+        std::array<std::uint8_t,256> transforms{};
+        const Matrix4 wvp=multiply(scene.sunCascades[cascade].lightViewProjection,material.modelTransform);
+        std::memcpy(transforms.data(),&wvp,sizeof(wvp));
+        if (!backend.Resources().UpdateBuffer(scene.sunShadowTransforms,0,transforms.data(),transforms.size(),error))
+            return false;
         vertexBindings.resources = {{
             R4MscResourceType::ConstantBuffer, 0,
-            nearCascade ? material.sunNearShadowTransforms : material.sunShadowTransforms,
+            scene.sunShadowTransforms,
             0, 256, nullptr, nullptr,
         }};
         if (!backend.BindMscResources(vertexBindings, error))
             return false;
-        if (alphaTested)
+        if (alphaTested && !alphaIgnored)
         {
             if (material.textureAssetIndex >= scene.textureAssets.size() ||
                 !scene.textureAssets[material.textureAssetIndex].texture || !scene.lightingLinearSampler)
@@ -3551,6 +4593,8 @@ bool drawSunShadowMap(IR4Backend& backend, LevelScene& scene, bool nearCascade,
         draw.baseVertex = static_cast<std::int32_t>(material.vertexBase);
         if (!backend.DrawIndexed(draw, error))
             return false;
+        if (outDrawCount)
+            ++*outDrawCount;
     }
     return true;
 }
@@ -3605,11 +4649,14 @@ bool drawSunMask(IR4Backend& backend, LevelScene& scene, std::string& error)
 bool drawSunCascade(
     IR4Backend& backend,
     LevelScene& scene,
-    bool farCascade,
+    unsigned cascade,
     std::string& error)
 {
+    if (!scene.sunCascadesValid) return true;
+    const bool farCascade=cascade==2;
     const std::shared_ptr<IR4GraphicsPipeline>& pipeline = farCascade ?
-        scene.sunFarPipeline : scene.sunNearPipeline;
+        (scene.sunZCulling ? scene.sunFarZPipeline : scene.sunFarPipeline) :
+        (cascade==0 ? scene.sunNearPipeline : scene.sunMiddlePipeline);
     if (!scene.productionSun || !pipeline || !scene.sunVolumeVertices ||
         !scene.sunVolumeIndices)
     {
@@ -3655,10 +4702,10 @@ bool drawSunCascade(
         textureBinding(0, scene.gBufferTargets[0]),
         textureBinding(24, scene.gBufferTargets[1]),
         textureBinding(48, scene.sunMaskTexture),
-        textureBinding(72, farCascade ? scene.sunSssTexture : scene.sunNearShadowTexture),
-        textureBinding(96, farCascade ? scene.sunShadowTexture : scene.sunSssTexture),
+        textureBinding(72, farCascade ? scene.sunSssTexture : scene.sunCascades[cascade].shadow),
+        textureBinding(96, farCascade ? scene.sunCascades[cascade].shadow : scene.sunSssTexture),
         bufferBinding(120,
-            farCascade ? scene.sunFarFragmentGlobals : scene.sunNearFragmentGlobals,
+            scene.sunCascades[cascade].globals,
             farCascade ? 444 : 432),
         bufferBinding(144, scene.baseLightingStaticGlobals, 528),
         bufferBinding(168, scene.baseLightingDynamicLight, 48),
@@ -3669,7 +4716,7 @@ bool drawSunCascade(
 
     if (!backend.BindGraphicsPipeline(pipeline, error) ||
         !backend.SetStencilReference(5, error) ||
-        !backend.BindVertexBuffer(6, scene.sunVolumeVertices, 0, error) ||
+        !backend.BindVertexBuffer(6, scene.sunCascades[cascade].volume, 0, error) ||
         !backend.BindMscResources(vertexBindings, error) ||
         !backend.BindMscResources(fragmentBindings, error))
         return false;
@@ -4247,6 +5294,7 @@ int main(int argc, char** argv)
                     running = false;
                     break;
                 }
+                StandaloneLevelSceneUploadTransaction levelUploadTransaction(levelScene.get());
 
                 if (!resourceUploadsSubmitted)
                 {
@@ -4291,11 +5339,25 @@ int main(int argc, char** argv)
                            "bc1_upload=8 argument_buffer_sampler=ready invalid_layouts=rejected\n");
                 }
 
+                if (levelScene)
+                    levelUploadTransaction.BeginAttempt();
                 if (levelScene &&
                     (!ensureLevelDepthTarget(*backend, *levelScene, error) ||
                      !uploadLevelScene(*backend, *levelScene, error)))
                 {
                     fprintf(stderr, "METAL_BOOTSTRAP_ERROR level_upload: %s\n", error.c_str());
+                    runtimeFailed = true;
+                    running = false;
+                    break;
+                }
+
+                if (!backend->DeferRelease(
+                        [&deferredReleaseCount] {
+                            deferredReleaseCount.fetch_add(1, std::memory_order_relaxed);
+                        },
+                        error))
+                {
+                    fprintf(stderr, "METAL_BOOTSTRAP_ERROR frame: %s\n", error.c_str());
                     runtimeFailed = true;
                     running = false;
                     break;
@@ -4337,7 +5399,7 @@ int main(int argc, char** argv)
                     shadowPass.depthStencilAttachment.depthStoreAction =
                         R4StoreAction::DontCare;
                     if (!backend->BeginRenderPass(shadowPass, error) ||
-                        !drawSunShadowMap(*backend, *levelScene, true, error) ||
+                        !drawSunShadowMap(*backend, *levelScene, 0u, error) ||
                         !backend->EndRenderPass(error))
                     {
                         fprintf(stderr, "METAL_BOOTSTRAP_ERROR direct-sun shadow: %s\n",
@@ -4349,7 +5411,7 @@ int main(int argc, char** argv)
                     shadowPass.label = "R4 converted direct-sun far shadow map";
                     shadowPass.colorAttachments.front().texture = levelScene->sunShadowTexture;
                     if (!backend->BeginRenderPass(shadowPass, error) ||
-                        !drawSunShadowMap(*backend, *levelScene, false, error) ||
+                        !drawSunShadowMap(*backend, *levelScene, 2u, error) ||
                         !backend->EndRenderPass(error))
                     {
                         fprintf(stderr, "METAL_BOOTSTRAP_ERROR direct-sun far shadow: %s\n",
@@ -4469,7 +5531,7 @@ int main(int argc, char** argv)
                         sunPass.colorAttachments = {sunAccumulatorAttachment};
                         sunPass.depthStencilAttachment = sunDepthStencil;
                         if (!backend->BeginRenderPass(sunPass, error) ||
-                            !drawSunCascade(*backend, *levelScene, false, error) ||
+                            !drawSunCascade(*backend, *levelScene, 0u, error) ||
                             !backend->EndRenderPass(error))
                         {
                             fprintf(stderr, "METAL_BOOTSTRAP_ERROR direct-sun near cascade: %s\n",
@@ -4480,7 +5542,7 @@ int main(int argc, char** argv)
                         }
                         sunPass.label = "R4 converted direct-sun far cascade";
                         if (!backend->BeginRenderPass(sunPass, error) ||
-                            !drawSunCascade(*backend, *levelScene, true, error) ||
+                            !drawSunCascade(*backend, *levelScene, 2u, error) ||
                             !backend->EndRenderPass(error))
                         {
                             fprintf(stderr, "METAL_BOOTSTRAP_ERROR direct-sun cascade: %s\n",
@@ -4537,6 +5599,7 @@ int main(int argc, char** argv)
                     break;
                 }
 
+                levelUploadTransaction.Commit();
                 ++renderedFrames;
             }
         }

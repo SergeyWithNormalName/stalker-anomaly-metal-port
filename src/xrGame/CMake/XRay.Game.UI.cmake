@@ -558,6 +558,8 @@ add_module(XRay.Game.UI.Tutorial
 
 add_module(XRay.Game.UI.Windows
   SOURCES
+  GamepadUiNavigation.cpp
+  GamepadUiNavigation.h
   callback_info.h
   ui/uiabstract.h
 

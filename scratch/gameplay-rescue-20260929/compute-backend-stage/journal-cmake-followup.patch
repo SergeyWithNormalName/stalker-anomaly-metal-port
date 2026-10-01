@@ -1,0 +1,16 @@
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@
+ add_executable(XRay.Metal.DynamicWorldPreparedStateProbe tests/R4DynamicWorldPreparedStateProbe.cpp)
+ target_compile_features(XRay.Metal.DynamicWorldPreparedStateProbe PRIVATE cxx_std_17)
+ target_include_directories(XRay.Metal.DynamicWorldPreparedStateProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+ add_test(NAME XRay.Metal.DynamicWorldPreparedState.SelfTest COMMAND XRay.Metal.DynamicWorldPreparedStateProbe)
++
++add_executable(XRay.Metal.ComputeSkinPoseJournalProbe
++  tests/R4ComputeSkinPoseJournalProbe.cpp
++)
++target_compile_features(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ComputeSkinPoseJournal.SelfTest
++  COMMAND XRay.Metal.ComputeSkinPoseJournalProbe
++)

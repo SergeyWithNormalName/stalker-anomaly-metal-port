@@ -7,6 +7,7 @@
 #include "actor.h"
 #include "xr_level_controller.h"
 #include "../xrEngine/CustomHud.h"
+#include "../xrEngine/xr_input.h"
 
 dlgItem::dlgItem(CUIWindow* pWnd)
 {
@@ -79,6 +80,11 @@ void CDialogHolder::StartMenu(CUIDialogWnd* pDialog, bool bDoHideIndicators)
 
 	if (pDialog->NeedCursor())
 		GetUICursor().Show();
+
+#if defined(XR_PLATFORM_APPLE)
+	if (pInput)
+		pInput->SetRelativeMouseMode(false);
+#endif
 
 	if (g_pGameLevel)
 	{
@@ -313,6 +319,9 @@ bool CDialogHolder::IR_UIOnKeyboardPress(int dik)
 	//mouse click
 	if (dik == MOUSE_1 || dik == MOUSE_2 || dik == MOUSE_3)
 	{
+#if defined(XR_PLATFORM_APPLE)
+		GetUICursor().UpdateCursorPosition(0, 0);
+#endif
 		Fvector2 cp = GetUICursor().GetCursorPosition();
 		EUIMessages action = (dik == MOUSE_1)
 			                     ? WINDOW_LBUTTON_DOWN
@@ -353,6 +362,9 @@ bool CDialogHolder::IR_UIOnKeyboardRelease(int dik)
 	//mouse click
 	if (dik == MOUSE_1 || dik == MOUSE_2 || dik == MOUSE_3)
 	{
+#if defined(XR_PLATFORM_APPLE)
+		GetUICursor().UpdateCursorPosition(0, 0);
+#endif
 		Fvector2 cp = GetUICursor().GetCursorPosition();
 		EUIMessages action = (dik == MOUSE_1)
 			                     ? WINDOW_LBUTTON_UP

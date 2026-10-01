@@ -47,6 +47,7 @@ public:
 private:
 	void InternalCloseLog();
 	std::atomic_bool bIsAlive;
+	std::atomic_bool bWorkerExited;
 	ThreadID hLogThread;
 
 	void InternalOpenLogFile();

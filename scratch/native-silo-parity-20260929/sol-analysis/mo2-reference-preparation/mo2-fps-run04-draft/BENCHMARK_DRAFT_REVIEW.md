@@ -1,0 +1,13 @@
+# Run04 matched-frame diagnostic draft
+
+This package does not stage a clone runtime or change the live run03 files. Run03 completed with `result_is_acceptance=true`, the nonce and exact save path verified, the stock executable hash unchanged, and 393 observer world rows. Its measured conditions include calendar `2018-10-26T08:09:47`, Device factor 1, game factor `1e-6`, Cordon, `w_clear2`, and a 1920x1200 drawable. The run03 result SHA-256 is pinned in `benchmark-plan.json`. Run04 remains blocked until the root reviews and asks for a fresh staging pass.
+
+The only timed profile changes are from the exact approved `matched_profile_saved_slowclock_v2.lua` SHA `20568c539a6a58c4c907dc93225e84c8a383354e580caa7098f06d8e7afeb21f`: warmup 3s to 20s and measured phase 3s to 20s. The candidate SHA is `41312db9a6b06ef5876bc34fe3753e8cc6480711672618dd345331773f1601fb`. Comparing against `matched_profile_portal_roi.lua`, the candidate is identical except for the header comment. No other Lua logic, weather, camera, factors, save, or resolution changes.
+
+The future run must use a new output/receipt directory, fresh hook nonce, canonical `user.ltx`, pinned stock executable, and the already reviewed MO2/GPTK/D3DMetal launch path. Add `METAL_PERFORMANCE_PER_FRAME_SIGNPOSTS=1` to the launch environment. The checked-in tree has no direct consumer of that variable, so the capture result must establish whether usable signposts were emitted.
+
+After the run has closed, the postcollector validates every measured phase row: level, weather, calendar, Device/game factors, drawable dimensions, fixed camera and direction. It requires the `weather_committed`, `measure_start`, and `measure_end` markers and at least 100 measured rows. Only then does it call `metalperftrace collect` over the marker-bounded epoch seconds and filter the overview with the unique actual `AnomalyDX11.exe` host PID. It rejects ambiguity and never uses the MO2 launcher PID, Wine WPID, or Wine module TID as the trace process selector. These artifacts are for first-pass diagnostics; they do not establish a winner or quality acceptance.
+
+An optional stock-only screenshot may be added after `measure_end` using the verified console command. It remains outside the measured/signpost interval. The native screenshot implementation is a 128x128 placeholder, so the plan forbids comparing it to a Windows rendered screenshot. The exact 20s profile remains unchanged unless root explicitly elects this separate visual sidecar.
+
+`POSTCOLLECT_DRAFT.py` is syntax/validation logic only and has not been run on a captured run04. No build, game launch, or clone/runtime write was performed for this draft.

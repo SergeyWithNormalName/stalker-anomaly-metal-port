@@ -4,17 +4,31 @@
 #include "ui/UIStatic.h"
 #include "ui/UIBtnHint.h"
 #include "xrEngine/IInputReceiver.h"
+#include "xrEngine/xr_input.h"
 
 #define C_DEFAULT	D3DCOLOR_XRGB(0xff,0xff,0xff)
 
+void CUICursor::Show()
+{
+	bVisible = true;
+#if defined(XR_PLATFORM_APPLE)
+	if (pInput)
+		pInput->SetRelativeMouseMode(false);
+	UpdateCursorPosition(0, 0);
+#endif
+}
+
 CUICursor::CUICursor()
-	: m_static(NULL), m_b_use_win_cursor(false)
+	: m_b_use_win_cursor(false), m_static(NULL), m_gamepadFocusStatic(NULL),
+	  m_gamepadFocusMode(false), m_gamepadFocusRectValid(false)
 {
 	bVisible = false;
 	vPrevPos.set(0.0f, 0.0f);
 	vPos.set(0.f, 0.f);
 	InitInternal();
-	Device.seqRender.Add(this, -3/*2*/);
+	// Keep gamepad focus visible above native popups such as combo boxes,
+	// which redraw themselves late in the UI render sequence.
+	Device.seqRender.Add(this, -3);
 	Device.seqResolutionChanged.Add(this);
 }
 
@@ -22,6 +36,7 @@ CUICursor::CUICursor()
 CUICursor::~CUICursor()
 {
 	xr_delete(m_static);
+	xr_delete(m_gamepadFocusStatic);
 	Device.seqRender.Remove(this);
 	Device.seqResolutionChanged.Remove(this);
 }
@@ -29,6 +44,7 @@ CUICursor::~CUICursor()
 void CUICursor::OnScreenResolutionChanged()
 {
 	xr_delete(m_static);
+	xr_delete(m_gamepadFocusStatic);
 	InitInternal();
 }
 
@@ -45,10 +61,21 @@ void CUICursor::InitInternal()
 
 	m_static->SetWndSize(sz);
 	m_static->SetStretchTexture(true);
+	m_gamepadFocusStatic = xr_new<CUIStatic>();
+	// Cursor construction precedes the XML texture atlas registry. Resolve the
+	// atlas directly so the focus border never binds the missing-texture fallback.
+	m_gamepadFocusStatic->InitTextureEx("ui\\ui_common");
+	m_gamepadFocusStatic->SetTextureRect(Frect().set(1021.0f, 1021.0f, 1023.0f, 1023.0f));
+	m_gamepadFocusStatic->SetStretchTexture(true);
+	m_gamepadFocusStatic->SetTextureColor(D3DCOLOR_ARGB(225, 225, 225, 225));
 
+#if defined(XR_PLATFORM_APPLE)
+	m_b_use_win_cursor = true;
+#else
 	u32 screen_size_x = GetSystemMetrics(SM_CXSCREEN);
 	u32 screen_size_y = GetSystemMetrics(SM_CYSCREEN);
 	m_b_use_win_cursor = (screen_size_y >= Device.dwHeight && screen_size_x >= Device.dwWidth);
+#endif
 }
 
 //--------------------------------------------------------------------
@@ -62,6 +89,27 @@ void CUICursor::OnRender()
 		g_statHint->OnRender();
 
 	if (!IsVisible()) return;
+	if (m_gamepadFocusMode)
+	{
+		if (m_gamepadFocusRectValid)
+		{
+			const Frect& r = m_gamepadFocusRect;
+			const float border = 2.0f;
+			const Frect edges[] = {
+				Frect().set(r.x1, r.y1, r.x2, r.y1 + border),
+				Frect().set(r.x1, r.y2 - border, r.x2, r.y2),
+				Frect().set(r.x1, r.y1, r.x1 + border, r.y2),
+				Frect().set(r.x2 - border, r.y1, r.x2, r.y2),
+			};
+			for (const Frect& edge : edges)
+			{
+				m_gamepadFocusStatic->SetWndPos(edge.lt);
+				m_gamepadFocusStatic->SetWndSize(Fvector2().set(edge.width(), edge.height()));
+				m_gamepadFocusStatic->Draw();
+			}
+		}
+		return;
+	}
 #ifdef DEBUG
 	VERIFY(last_render_frame != Device.dwFrame);
 	last_render_frame = Device.dwFrame;
@@ -81,6 +129,18 @@ void CUICursor::OnRender()
 	u32 curFrame = Device.dwFrame;
 	if (curFrame == last_render_frame)
 		return;
+
+#if defined(XR_PLATFORM_APPLE)
+	if (m_b_use_win_cursor && Device.clientWidth > 0 && Device.clientHeight > 0)
+	{
+		Ivector2 pti;
+		IInputReceiver::IR_GetMousePosReal(pti);
+		vPos.x = (float)pti.x * (UI_BASE_WIDTH / (float)Device.clientWidth);
+		vPos.y = (float)pti.y * (UI_BASE_HEIGHT / (float)Device.clientHeight);
+		clamp(vPos.x, 0.f, UI_BASE_WIDTH);
+		clamp(vPos.y, 0.f, UI_BASE_HEIGHT);
+	}
+#endif
 
 	m_static->SetWndPos(vPos);
 	m_static->Update();
@@ -107,7 +167,7 @@ void CUICursor::UpdateCursorPosition(int _dx, int _dy)
 {
 	Fvector2 p;
 	vPrevPos = vPos;
-	if (m_b_use_win_cursor)
+	if (m_b_use_win_cursor && Device.clientWidth > 0 && Device.clientHeight > 0)
 	{
 		Ivector2 pti;
 		IInputReceiver::IR_GetMousePosReal(pti);
@@ -124,14 +184,49 @@ void CUICursor::UpdateCursorPosition(int _dx, int _dy)
 	}
 	clamp(vPos.x, 0.f, UI_BASE_WIDTH);
 	clamp(vPos.y, 0.f, UI_BASE_HEIGHT);
+	// Platform warps used to synchronize legacy hover report the same logical
+	// position. Only actual mouse movement takes control back from the pad.
+	if ((_dx || _dy) && (std::fabs(vPos.x - vPrevPos.x) > 2.0f ||
+		std::fabs(vPos.y - vPrevPos.y) > 2.0f))
+		SetGamepadFocus(false);
+}
+
+void CUICursor::SetGamepadFocus(bool enabled, const Frect* rect)
+{
+	m_gamepadFocusMode = enabled;
+	m_gamepadFocusRectValid = enabled && rect;
+	if (rect)
+		m_gamepadFocusRect = *rect;
+}
+
+void CUICursor::MoveCursorGamepad(float dx, float dy)
+{
+	vPrevPos = vPos;
+	vPos.x += dx;
+	vPos.y += dy;
+	clamp(vPos.x, 0.f, UI_BASE_WIDTH);
+	clamp(vPos.y, 0.f, UI_BASE_HEIGHT);
+
+	// SetUICursorPosition warps the platform cursor so the on screen pointer
+	// agrees with the logical one; on platforms where the cursor is driven by
+	// the real mouse this is the only way the logical position survives.
+	SetUICursorPosition(vPos);
 }
 
 void CUICursor::SetUICursorPosition(Fvector2 pos)
 {
 	vPos = pos;
 	POINT p;
-	p.x = iFloor(vPos.x / (UI_BASE_WIDTH / (float)Device.clientWidth));
-	p.y = iFloor(vPos.y / (UI_BASE_HEIGHT / (float)Device.clientHeight));
+	if (Device.clientWidth > 0 && Device.clientHeight > 0)
+	{
+		p.x = iFloor(vPos.x / (UI_BASE_WIDTH / (float)Device.clientWidth));
+		p.y = iFloor(vPos.y / (UI_BASE_HEIGHT / (float)Device.clientHeight));
+	}
+	else
+	{
+		p.x = iFloor(vPos.x);
+		p.y = iFloor(vPos.y);
+	}
 	if (m_b_use_win_cursor)
 		ClientToScreen(Device.m_hWnd, (LPPOINT)&p);
 	SetCursorPos(p.x, p.y);

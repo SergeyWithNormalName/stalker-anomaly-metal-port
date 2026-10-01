@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SOURCES=(deffer_base_bump.vs deffer_base_bump.ps deffer_base_flat.vs deffer_base_flat.ps deffer_model_bump.vs deffer_model_flat.vs)
+SOURCES=(deffer_base_bump.vs deffer_base_bump.ps deffer_base_flat.vs deffer_base_flat.ps deffer_model_bump.vs deffer_model_flat.vs model_def_lplanes.vs base_lplanes.ps)
 if [[ -z "$SOURCE_ROOT" || -z "$OUTPUT_DIR" || ! -x "$DXC" || ! -x "$MSC" ]]; then
     echo "Missing source root, output directory, DXC, or MSC" >&2
     exit 1
@@ -87,10 +87,12 @@ compile_shader deffer_base_flat.vs vs_6_0 SKIN_NONE
 compile_shader deffer_base_flat.ps ps_6_0 SKIN_NONE
 compile_shader deffer_model_bump.vs vs_6_0 SKIN_0
 compile_shader deffer_model_flat.vs vs_6_0 SKIN_0
+compile_shader model_def_lplanes.vs vs_6_0 SKIN_0
+compile_shader base_lplanes.ps ps_6_0 SKIN_NONE
 
 RECEIPT="$OUTPUT_ABS/dynamic-world-msc-receipt.txt"
 {
-    echo "evidence_scope=exact_live_dynamic_ogf_base_and_cpu_skinned_dxc_msc_artifacts"
+    echo "evidence_scope=exact_live_dynamic_ogf_base_cpu_skinned_and_models_lightplanes_dxc_msc_artifacts"
     echo "source_root=$(realpath "$SOURCE_ROOT")"
     echo "source_tree_sha256=$(cd "$SOURCE_ROOT" && find -s . -type f -exec shasum -a 256 {} \; | shasum -a 256 | awk '{print $1}')"
     echo "dxc_path=$(realpath "$DXC")"
@@ -112,4 +114,4 @@ RECEIPT="$OUTPUT_ABS/dynamic-world-msc-receipt.txt"
     done
 } > "$RECEIPT"
 
-echo "R4_DYNAMIC_WORLD_MSC_READY shaders=6 receipt=$RECEIPT"
+echo "R4_DYNAMIC_WORLD_MSC_READY shaders=${#SOURCES[@]} receipt=$RECEIPT"

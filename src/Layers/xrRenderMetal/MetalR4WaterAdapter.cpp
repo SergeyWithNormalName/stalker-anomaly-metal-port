@@ -42,6 +42,23 @@ Matrix4 multiply(const Matrix4& a, const Matrix4& b)
     return result;
 }
 
+Matrix4 inverseRigidTransform(const Matrix4& matrix)
+{
+    Matrix4 inverse{};
+    for (std::size_t row = 0; row < 3u; ++row)
+        for (std::size_t column = 0; column < 3u; ++column)
+            inverse.values[column * 4u + row] = matrix.values[row * 4u + column];
+    inverse.values[15] = 1.0f;
+    for (std::size_t row = 0; row < 3u; ++row)
+    {
+        float translation = 0.0f;
+        for (std::size_t column = 0; column < 3u; ++column)
+            translation -= inverse.values[column * 4u + row] * matrix.values[12u + column];
+        inverse.values[12u + row] = translation;
+    }
+    return inverse;
+}
+
 Matrix4 texelAdjust(const std::uint32_t width, const std::uint32_t height)
 {
     Matrix4 result{};
@@ -103,7 +120,9 @@ bool makeGeometryPipeline(IR4Backend& backend, const std::filesystem::path& shad
         {16u, 6u, layout.texcoordOffset, R4VertexFormat::Short2},
     };
     pipeline.vertexLayouts = {{6u, layout.stride}};
-    pipeline.colorFormats = {ssr ? R4PixelFormat::RGBA8Unorm : R4PixelFormat::RGBA16Float};
+    // Both the SSR target and production combine_1 color target are RGBA8.
+    // Metal validation rejects the old RGBA16Float final PSO at bind time.
+    pipeline.colorFormats = {R4PixelFormat::RGBA8Unorm};
     pipeline.depthFormat = R4PixelFormat::Depth32FloatStencil8;
     pipeline.depthCompare = R4CompareFunction::LessEqual;
     pipeline.depthWrite = false;
@@ -148,22 +167,11 @@ struct MetalR4WaterAdapter::Impl
         xray::metal::R4DdsTexture dds;
         std::shared_ptr<IR4Texture> texture;
     };
-    struct FrameBuffers
-    {
-        std::shared_ptr<IR4Buffer> fullscreenVertices;
-        std::shared_ptr<IR4Buffer> ssrGlobals;
-        std::shared_ptr<IR4Buffer> finalGlobals;
-        std::shared_ptr<IR4Buffer> blurGlobals;
-        std::shared_ptr<IR4Buffer> noBlurGlobals;
-        std::shared_ptr<IR4Buffer> wavesGlobals;
-    };
     struct Draw
     {
         R4StaticWaterDrawRecord record;
         std::shared_ptr<IR4GraphicsPipeline> ssrPipeline;
         std::shared_ptr<IR4GraphicsPipeline> finalPipeline;
-        std::vector<std::shared_ptr<IR4Buffer>> vertexGlobals;
-        std::vector<std::shared_ptr<IR4Buffer>> transforms;
     };
     std::vector<Draw> draws;
     std::vector<TextureAsset> textures;
@@ -171,7 +179,7 @@ struct MetalR4WaterAdapter::Impl
     std::shared_ptr<IR4Texture> perlin, base, normal, rainSplash, caustics, wind, height, blueNoise;
     std::shared_ptr<IR4Sampler> baseSampler, linearSampler, noFilterSampler;
     std::shared_ptr<IR4Buffer> fullscreenIndices;
-    std::vector<FrameBuffers> frames;
+    std::uint32_t frameContextCount = 0u;
     std::shared_ptr<IR4GraphicsPipeline> blurPipeline;
     std::shared_ptr<IR4GraphicsPipeline> noBlurPipeline;
     std::shared_ptr<IR4GraphicsPipeline> wavesPipeline;
@@ -182,6 +190,9 @@ struct MetalR4WaterAdapter::Impl
     std::shared_ptr<IR4Texture> sceneSnapshot;
     bool historyNeedsClear = true;
     bool texturesUploaded = false;
+    bool pendingFrame = false;
+    bool pendingTexturesUploaded = false;
+    bool pendingClearedHistory = false;
     std::uint32_t lastLoggedFrame = UINT32_MAX;
 };
 
@@ -285,28 +296,7 @@ bool MetalR4WaterAdapter::Prepare(IR4Backend& backend,
         status = m_status;
         return true;
     }
-    const std::uint32_t frameContexts = std::max(1u, backend.FrameContextCount());
-    m_impl->frames.resize(frameContexts);
-    for (Impl::FrameBuffers& frame : m_impl->frames)
-    {
-        if (!makeBuffer(backend.Resources(), sizeof(ScreenVertex) * 4u, R4BufferUsage::Vertex,
-                "R4 SSFX water fullscreen vertices", frame.fullscreenVertices, error) ||
-            !makeBuffer(backend.Resources(), SsrGlobalsSize, R4BufferUsage::Uniform,
-                "R4 SSFX water SSR globals", frame.ssrGlobals, error) ||
-            !makeBuffer(backend.Resources(), FinalGlobalsSize, R4BufferUsage::Uniform,
-                "R4 SSFX water final globals", frame.finalGlobals, error) ||
-            !makeBuffer(backend.Resources(), BlurGlobalsSize, R4BufferUsage::Uniform,
-                "R4 SSFX water blur globals", frame.blurGlobals, error) ||
-            !makeBuffer(backend.Resources(), NoBlurGlobalsSize, R4BufferUsage::Uniform,
-                "R4 SSFX water no-blur globals", frame.noBlurGlobals, error) ||
-            !makeBuffer(backend.Resources(), WavesGlobalsSize, R4BufferUsage::Uniform,
-                "R4 SSFX water waves globals", frame.wavesGlobals, error))
-        {
-            m_status = "SSFX water per-frame resource allocation failed: " + error;
-            status = m_status;
-            return true;
-        }
-    }
+    m_impl->frameContextCount = std::max(1u, backend.FrameContextCount());
 
     std::unordered_map<std::string, std::shared_ptr<IR4GraphicsPipeline>> ssrCache;
     std::unordered_map<std::string, std::shared_ptr<IR4GraphicsPipeline>> finalCache;
@@ -353,20 +343,6 @@ bool MetalR4WaterAdapter::Prepare(IR4Backend& backend,
         draw.record = record;
         draw.ssrPipeline = ssr;
         draw.finalPipeline = final;
-        draw.vertexGlobals.resize(frameContexts);
-        draw.transforms.resize(frameContexts);
-        for (std::uint32_t frame = 0; frame < frameContexts; ++frame)
-        {
-            if (!makeBuffer(backend.Resources(), WaterVertexGlobalsSize, R4BufferUsage::Uniform,
-                    "R4 SSFX water vertex globals", draw.vertexGlobals[frame], error) ||
-                !makeBuffer(backend.Resources(), DynamicTransformsSize, R4BufferUsage::Uniform,
-                    "R4 SSFX water dynamic transforms", draw.transforms[frame], error))
-            {
-                m_status = "SSFX water per-draw resource allocation failed: " + error;
-                status = m_status;
-                return true;
-            }
-        }
         m_impl->draws.emplace_back(std::move(draw));
     }
     if (!makeFullscreenPipeline(backend, options.shaderDirectory, "ssfx_water_blur.ps.metallib",
@@ -465,6 +441,7 @@ bool MetalR4WaterAdapter::PrepareRenderTargets(IR4Backend& backend, const std::u
         return false;
     }
     m_impl->historyNeedsClear = true;
+    m_impl->pendingFrame = false;
     return true;
 }
 
@@ -481,6 +458,7 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         error = "SSFX water draw is missing a scene-owned resource";
         return false;
     }
+    bool uploadedTextures = false;
     if (!m_impl->texturesUploaded)
     {
         for (Impl::TextureAsset& asset : m_impl->textures)
@@ -494,13 +472,12 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
                         mip.bytesPerRow, mip.bytesPerImage, error))
                     return false;
             }
-            asset.dds.bytes.clear();
-            asset.dds.bytes.shrink_to_fit();
         }
-        m_impl->texturesUploaded = true;
+        uploadedTextures = true;
     }
     const R4Texture2DDesc& sceneDescriptor = inputs.sceneColor->Descriptor();
     if (sceneDescriptor.width == 0u || sceneDescriptor.height == 0u ||
+        sceneDescriptor.format != R4PixelFormat::RGBA8Unorm ||
         m_impl->sceneSnapshot->Descriptor().format != sceneDescriptor.format ||
         m_impl->sceneSnapshot->Descriptor().width != sceneDescriptor.width ||
         m_impl->sceneSnapshot->Descriptor().height != sceneDescriptor.height)
@@ -509,12 +486,11 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         return false;
     }
     const std::uint32_t frameSlot = backend.ActiveFrameContextIndex();
-    if (frameSlot >= m_impl->frames.size())
+    if (frameSlot >= m_impl->frameContextCount)
     {
         error = "SSFX water active frame context exceeds its resources";
         return false;
     }
-    Impl::FrameBuffers& frame = m_impl->frames[frameSlot];
     const float width = static_cast<float>(sceneDescriptor.width);
     const float height = static_cast<float>(sceneDescriptor.height);
     constexpr float depth = 1.0e-5f;
@@ -524,14 +500,23 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         {{1.0f, 1.0f}, {width, height, depth, 1.0f}},
         {{1.0f, 0.0f}, {width, 0.0f, depth, 1.0f}},
     }};
-    if (!backend.Resources().UpdateBuffer(frame.fullscreenVertices, 0u, fullscreenVertices.data(),
-            sizeof(fullscreenVertices), error))
+    // Windows water blur keeps a half-size viewport and authors UVs only over
+    // [0, 0.5] on its full-screen quad. The screen-space VS converts positions
+    // against the full target extent, so preserve the full-size geometry and
+    // encode that UV range explicitly for Metal.
+    const std::array<ScreenVertex, 4> halfUvVertices = {{
+        {{0.0f, 0.5f}, {0.0f, height, depth, 1.0f}},
+        {{0.0f, 0.0f}, {0.0f, 0.0f, depth, 1.0f}},
+        {{0.5f, 0.5f}, {width, height, depth, 1.0f}},
+        {{0.5f, 0.0f}, {width, 0.0f, depth, 1.0f}},
+    }};
+    R4FrameBufferSlice fullscreenVerticesSlice;
+    R4FrameBufferSlice halfUvVerticesSlice;
+    if (!backend.UploadFrameData(fullscreenVertices.data(), sizeof(fullscreenVertices), 16u,
+            fullscreenVerticesSlice, error) ||
+        !backend.UploadFrameData(halfUvVertices.data(), sizeof(halfUvVertices), 16u,
+            halfUvVerticesSlice, error))
         return false;
-
-    const auto updateGlobals = [&](const std::shared_ptr<IR4Buffer>& buffer,
-        const void* bytes, const std::size_t size) {
-        return backend.Resources().UpdateBuffer(buffer, 0u, bytes, size, error);
-    };
     std::array<std::uint8_t, SsrGlobalsSize> ssrGlobals{};
     std::memcpy(ssrGlobals.data() + 288u, inputs.environment.ssfxWater.data(), 16u);
     std::array<std::uint8_t, FinalGlobalsSize> finalGlobals{};
@@ -541,7 +526,9 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
     const std::array<float, 4> windSetup = {{inputs.environment.windAnimation,
         inputs.environment.windVelocity, 0.0f, 0.0f}};
     std::memcpy(finalGlobals.data() + 368u, windSetup.data(), sizeof(windSetup));
-    const std::array<float, 4> windAnimation = {{inputs.environment.windAnimation, 0.0f, 0.0f, 0.0f}};
+    // Windows binds the full wind_anim float4; the water HLSL consumes .w/.ww.
+    const std::array<float, 4> windAnimation = {{0.0f, 0.0f, 0.0f,
+        inputs.environment.windAnimation}};
     std::memcpy(finalGlobals.data() + 384u, windAnimation.data(), sizeof(windAnimation));
     std::array<std::uint8_t, BlurGlobalsSize> blurGlobals{};
     const std::array<float, 4> blurSetupX = {{1.0f, 0.0f, 0.0f,
@@ -554,16 +541,24 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
     std::memcpy(noBlurGlobals.data() + 256u, noBlurSetup.data(), sizeof(noBlurSetup));
     std::array<std::uint8_t, WavesGlobalsSize> wavesGlobals{};
     std::memcpy(wavesGlobals.data() + 160u, windSetup.data(), sizeof(windSetup));
-    if (!updateGlobals(frame.ssrGlobals, ssrGlobals.data(), ssrGlobals.size()) ||
-        !updateGlobals(frame.finalGlobals, finalGlobals.data(), finalGlobals.size()) ||
-        !updateGlobals(frame.blurGlobals, blurGlobals.data(), blurGlobals.size()) ||
-        !updateGlobals(frame.noBlurGlobals, noBlurGlobals.data(), noBlurGlobals.size()) ||
-        !updateGlobals(frame.wavesGlobals, wavesGlobals.data(), wavesGlobals.size()))
+    R4FrameBufferSlice finalGlobalsSlice;
+    R4FrameBufferSlice blurGlobalsXSlice;
+    R4FrameBufferSlice noBlurGlobalsSlice;
+    R4FrameBufferSlice wavesGlobalsSlice;
+    if (!backend.UploadFrameData(finalGlobals.data(), finalGlobals.size(), 256u,
+            finalGlobalsSlice, error) ||
+        !backend.UploadFrameData(blurGlobals.data(), blurGlobals.size(), 256u,
+            blurGlobalsXSlice, error) ||
+        !backend.UploadFrameData(noBlurGlobals.data(), noBlurGlobals.size(), 256u,
+            noBlurGlobalsSlice, error) ||
+        !backend.UploadFrameData(wavesGlobals.data(), wavesGlobals.size(), 256u,
+            wavesGlobalsSlice, error))
         return false;
 
     // The history is sampled by SSR before it is replaced by this frame. A
     // resize starts from deterministic black rather than uninitialized VRAM.
-    if (m_impl->historyNeedsClear)
+    bool clearedHistory = false;
+    if (m_impl->historyNeedsClear || inputs.cameraCut || !inputs.previousValid)
     {
         R4RenderPassDesc clearHistory;
         clearHistory.label = "R4 SSFX water temporal history clear";
@@ -574,7 +569,7 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         clearHistory.colorAttachments = {color};
         if (!backend.BeginRenderPass(clearHistory, error) || !backend.EndRenderPass(error))
             return false;
-        m_impl->historyNeedsClear = false;
+        clearedHistory = true;
     }
     if (!backend.CopyTexture2D(inputs.sceneColor, m_impl->sceneSnapshot, error))
         return false;
@@ -583,6 +578,27 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
     std::memcpy(view.values, inputs.view.data(), sizeof(view.values));
     std::memcpy(projection.values, inputs.projection.data(), sizeof(projection.values));
     const Matrix4 vp = multiply(projection, view);
+
+    Matrix4 previousReprojection = projection;
+    if (inputs.previousValid && !inputs.cameraCut)
+    {
+        Matrix4 prevView{}, prevProj{};
+        std::memcpy(prevView.values, inputs.previousView.data(), sizeof(prevView.values));
+        std::memcpy(prevProj.values, inputs.previousProjection.data(), sizeof(prevProj.values));
+        const Matrix4 prevVp = multiply(prevProj, prevView);
+        previousReprojection = multiply(prevVp, inverseRigidTransform(view));
+    }
+    else
+    {
+        m_impl->historyNeedsClear = true;
+    }
+    std::memcpy(ssrGlobals.data() + 304u, projection.values, sizeof(projection.values));
+    std::memcpy(ssrGlobals.data() + 368u, previousReprojection.values, sizeof(previousReprojection.values));
+    R4FrameBufferSlice ssrGlobalsSlice;
+    if (!backend.UploadFrameData(ssrGlobals.data(), ssrGlobals.size(), 256u,
+            ssrGlobalsSlice, error))
+        return false;
+
     const float scale = std::max(1.0f, inputs.environment.ssfxWater[0]);
     const std::uint32_t ssrWidth = std::max(1u, static_cast<std::uint32_t>(width / scale));
     const std::uint32_t ssrHeight = std::max(1u, static_cast<std::uint32_t>(height / scale));
@@ -601,8 +617,11 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
     ssrPass.viewport = {0.0, 0.0, double(ssrWidth), double(ssrHeight), 0.0, 1.0};
     if (!backend.BeginRenderPass(ssrPass, error))
         return false;
-    for (Impl::Draw& draw : m_impl->draws)
+    std::vector<R4FrameBufferSlice> vertexGlobalsSlices(m_impl->draws.size());
+    std::vector<R4FrameBufferSlice> transformsSlices(m_impl->draws.size());
+    for (std::size_t drawIndex = 0u; drawIndex < m_impl->draws.size(); ++drawIndex)
     {
+        Impl::Draw& draw = m_impl->draws[drawIndex];
         Matrix4 model{};
         std::memcpy(model.values, draw.record.model.data(), sizeof(model.values));
         const Matrix4 wvp = multiply(vp, model);
@@ -614,16 +633,14 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         const Matrix4 wv = multiply(view, model);
         std::memcpy(transforms.data() + 64u, wv.values, 48u);
         std::memcpy(transforms.data() + 128u, model.values, 48u);
-        if (!updateGlobals(draw.vertexGlobals[frameSlot], vertexGlobals.data(), vertexGlobals.size()) ||
-            !updateGlobals(draw.transforms[frameSlot], transforms.data(), transforms.size()))
-            return false;
-        std::memcpy(ssrGlobals.data() + 304u, wvp.values, sizeof(wvp.values));
-        std::memcpy(ssrGlobals.data() + 368u, wvp.values, sizeof(wvp.values));
-        if (!updateGlobals(frame.ssrGlobals, ssrGlobals.data(), ssrGlobals.size()))
+        if (!backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u,
+                vertexGlobalsSlices[drawIndex], error) ||
+            !backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
+                transformsSlices[drawIndex], error))
             return false;
         R4MscStageBindings vs{R4ShaderStage::Vertex, 72u, {{
-            {R4MscResourceType::ConstantBuffer,0u,draw.vertexGlobals[frameSlot],0u,WaterVertexGlobalsSize,nullptr,nullptr},
-            {R4MscResourceType::ConstantBuffer,24u,draw.transforms[frameSlot],0u,DynamicTransformsSize,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,0u,vertexGlobalsSlices[drawIndex].buffer,vertexGlobalsSlices[drawIndex].offset,vertexGlobalsSlices[drawIndex].size,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,24u,transformsSlices[drawIndex].buffer,transformsSlices[drawIndex].offset,transformsSlices[drawIndex].size,nullptr,nullptr},
             {R4MscResourceType::ConstantBuffer,48u,inputs.staticGlobals,0u,StaticGlobalsSize,nullptr,nullptr}}}};
         R4MscStageBindings ps{R4ShaderStage::Fragment, 264u, {{
             {R4MscResourceType::Texture,0u,nullptr,0u,0u,inputs.position,nullptr},
@@ -632,7 +649,7 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
             {R4MscResourceType::Texture,72u,nullptr,0u,0u,inputs.environment1,nullptr},
             {R4MscResourceType::Texture,96u,nullptr,0u,0u,m_impl->blueNoise,nullptr},
             {R4MscResourceType::Texture,120u,nullptr,0u,0u,m_impl->ssrHistory,nullptr},
-            {R4MscResourceType::ConstantBuffer,144u,frame.ssrGlobals,0u,SsrGlobalsSize,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,144u,ssrGlobalsSlice.buffer,ssrGlobalsSlice.offset,ssrGlobalsSlice.size,nullptr,nullptr},
             {R4MscResourceType::ConstantBuffer,168u,inputs.staticGlobals,0u,StaticGlobalsSize,nullptr,nullptr},
             {R4MscResourceType::Sampler,192u,nullptr,0u,0u,nullptr,m_impl->linearSampler},
             {R4MscResourceType::Sampler,216u,nullptr,0u,0u,nullptr,m_impl->noFilterSampler},
@@ -654,8 +671,9 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
 
     const auto drawFullscreen = [&](const std::shared_ptr<IR4GraphicsPipeline>& pipeline,
         const std::shared_ptr<IR4Texture>& source, const std::shared_ptr<IR4Texture>& destination,
-        const std::shared_ptr<IR4Buffer>& globals, const std::size_t globalsSize,
-        const char* label, const bool halfViewport, const std::shared_ptr<IR4Texture>& extra) {
+        const R4FrameBufferSlice& globalsSlice,
+        const char* label, const bool halfViewport, const R4FrameBufferSlice& verticesSlice,
+        const std::shared_ptr<IR4Texture>& extra) {
         R4RenderPassDesc pass;
         pass.label = label;
         pass.useDrawable = false;
@@ -675,7 +693,8 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         if (extra)
             resources.push_back({R4MscResourceType::Texture,24u,nullptr,0u,0u,extra,nullptr});
         const std::uint32_t constantOffset = extra ? 24u : 24u;
-        resources.push_back({R4MscResourceType::ConstantBuffer,constantOffset,globals,0u,globalsSize,nullptr,nullptr});
+        resources.push_back({R4MscResourceType::ConstantBuffer,constantOffset,
+            globalsSlice.buffer,globalsSlice.offset,globalsSlice.size,nullptr,nullptr});
         if (!extra)
             resources.push_back({R4MscResourceType::ConstantBuffer,48u,inputs.staticGlobals,0u,StaticGlobalsSize,nullptr,nullptr});
         const std::uint32_t samplerOffset = extra ? 48u : 72u;
@@ -686,31 +705,36 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
         indexed.indexCount = 6u;
         indexed.indexType = R4IndexType::UInt16;
         return backend.BeginRenderPass(pass, error) && backend.BindGraphicsPipeline(pipeline, error) &&
-            backend.BindVertexBuffer(6u, frame.fullscreenVertices, 0u, error) &&
+            backend.BindVertexBuffer(6u, verticesSlice.buffer, verticesSlice.offset, error) &&
             backend.BindMscResources(vs, error) && backend.BindMscResources(ps, error) &&
             backend.DrawIndexed(indexed, error) && backend.EndRenderPass(error);
     };
     if (inputs.environment.ssfxWater[1] > 0.0f)
     {
         if (!drawFullscreen(m_impl->blurPipeline, m_impl->ssrRaw, m_impl->blurIntermediate,
-                frame.blurGlobals, BlurGlobalsSize, "R4 SSFX water horizontal blur", true, nullptr))
+                blurGlobalsXSlice, "R4 SSFX water horizontal blur", true,
+                halfUvVerticesSlice, nullptr))
             return false;
         const std::array<float, 4> blurSetupY = {{0.0f, 1.0f, 0.0f, 1.0f}};
         std::memcpy(blurGlobals.data() + 256u, blurSetupY.data(), sizeof(blurSetupY));
-        if (!updateGlobals(frame.blurGlobals, blurGlobals.data(), blurGlobals.size()) ||
+        R4FrameBufferSlice blurGlobalsYSlice;
+        if (!backend.UploadFrameData(blurGlobals.data(), blurGlobals.size(), 256u,
+                blurGlobalsYSlice, error) ||
             !drawFullscreen(m_impl->blurPipeline, m_impl->blurIntermediate, m_impl->ssrRaw,
-                frame.blurGlobals, BlurGlobalsSize, "R4 SSFX water vertical blur", false, nullptr))
+                blurGlobalsYSlice, "R4 SSFX water vertical blur", true,
+                halfUvVerticesSlice, nullptr))
             return false;
     }
     else
     {
         if (!backend.CopyTexture2D(m_impl->ssrRaw, m_impl->blurIntermediate, error) ||
             !drawFullscreen(m_impl->noBlurPipeline, m_impl->blurIntermediate, m_impl->ssrRaw,
-                frame.noBlurGlobals, NoBlurGlobalsSize, "R4 SSFX water no-blur", false, nullptr))
+                noBlurGlobalsSlice, "R4 SSFX water no-blur", true,
+                halfUvVerticesSlice, nullptr))
             return false;
     }
-    if (!drawFullscreen(m_impl->wavesPipeline, m_impl->height, m_impl->waves, frame.wavesGlobals,
-            WavesGlobalsSize, "R4 SSFX water waves", false, nullptr))
+    if (!drawFullscreen(m_impl->wavesPipeline, m_impl->height, m_impl->waves, wavesGlobalsSlice,
+            "R4 SSFX water waves", false, fullscreenVerticesSlice, nullptr))
         return false;
 
     R4RenderPassDesc finalPass;
@@ -726,11 +750,12 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
     finalPass.depthStencilAttachment.depthStoreAction = R4StoreAction::Store;
     if (!backend.BeginRenderPass(finalPass, error))
         return false;
-    for (Impl::Draw& draw : m_impl->draws)
+    for (std::size_t drawIndex = 0u; drawIndex < m_impl->draws.size(); ++drawIndex)
     {
+        Impl::Draw& draw = m_impl->draws[drawIndex];
         R4MscStageBindings vs{R4ShaderStage::Vertex, 72u, {{
-            {R4MscResourceType::ConstantBuffer,0u,draw.vertexGlobals[frameSlot],0u,WaterVertexGlobalsSize,nullptr,nullptr},
-            {R4MscResourceType::ConstantBuffer,24u,draw.transforms[frameSlot],0u,DynamicTransformsSize,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,0u,vertexGlobalsSlices[drawIndex].buffer,vertexGlobalsSlices[drawIndex].offset,vertexGlobalsSlices[drawIndex].size,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,24u,transformsSlices[drawIndex].buffer,transformsSlices[drawIndex].offset,transformsSlices[drawIndex].size,nullptr,nullptr},
             {R4MscResourceType::ConstantBuffer,48u,inputs.staticGlobals,0u,StaticGlobalsSize,nullptr,nullptr}}}};
         R4MscStageBindings ps{R4ShaderStage::Fragment, 408u, {{
             {R4MscResourceType::Texture,0u,nullptr,0u,0u,m_impl->base,nullptr},
@@ -745,7 +770,7 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
             {R4MscResourceType::Texture,216u,nullptr,0u,0u,m_impl->caustics,nullptr},
             {R4MscResourceType::Texture,240u,nullptr,0u,0u,m_impl->wind,nullptr},
             {R4MscResourceType::Texture,264u,nullptr,0u,0u,m_impl->waves,nullptr},
-            {R4MscResourceType::ConstantBuffer,288u,frame.finalGlobals,0u,FinalGlobalsSize,nullptr,nullptr},
+            {R4MscResourceType::ConstantBuffer,288u,finalGlobalsSlice.buffer,finalGlobalsSlice.offset,finalGlobalsSlice.size,nullptr,nullptr},
             {R4MscResourceType::ConstantBuffer,312u,inputs.staticGlobals,0u,StaticGlobalsSize,nullptr,nullptr},
             {R4MscResourceType::Sampler,336u,nullptr,0u,0u,nullptr,m_impl->baseSampler},
             {R4MscResourceType::Sampler,360u,nullptr,0u,0u,nullptr,m_impl->linearSampler},
@@ -775,5 +800,32 @@ bool MetalR4WaterAdapter::Draw(IR4Backend& backend, const FrameInputs& inputs, s
             ssrWidth, ssrHeight, inputs.environment.ssfxWater[1] > 0.0f ? "on" : "off");
         m_impl->lastLoggedFrame = inputs.environment.engineFrame;
     }
+    m_impl->pendingTexturesUploaded = uploadedTextures;
+    m_impl->pendingClearedHistory = clearedHistory;
+    m_impl->pendingFrame = true;
     return true;
+}
+
+void MetalR4WaterAdapter::DiscardUnsubmittedFrame()
+{
+    if (m_impl)
+        m_impl->pendingFrame = false;
+}
+
+void MetalR4WaterAdapter::CommitSubmittedFrame()
+{
+    if (!m_impl || !m_impl->pendingFrame)
+        return;
+    if (m_impl->pendingTexturesUploaded)
+    {
+        m_impl->texturesUploaded = true;
+        for (Impl::TextureAsset& asset : m_impl->textures)
+        {
+            asset.dds.bytes.clear();
+            asset.dds.bytes.shrink_to_fit();
+        }
+    }
+    if (m_impl->pendingClearedHistory)
+        m_impl->historyNeedsClear = false;
+    m_impl->pendingFrame = false;
 }

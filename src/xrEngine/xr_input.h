@@ -76,6 +76,7 @@ private:
 
 	void MouseUpdate();
 	void KeyUpdate();
+	void GamepadUpdate(u32 prevTimeMs);
 
 public:
 	void resetMouseState();

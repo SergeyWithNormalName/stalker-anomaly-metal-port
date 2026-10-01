@@ -1,18 +1,29 @@
 #include "../xrRenderPC_R4/stdafx.h"
 
 #include "MetalRenderDeviceRender.h"
+#include "MetalR4SunCascadeCapture.h"
+#include "MetalR4VolumetricCapture.h"
+#include "R4GameplayFrameAdmission.h"
+#include "MetalR4FloraMaterialCapture.h"
 #include "../xrRender/Blender_BmmD.h"
 #include "../xrRender/FBasicVisual.h"
 #include "../xrRender/MetalParticleCapture.h"
 #include "../xrRender/MetalRainCapture.h"
 #include "../xrRender/MetalLensFlareCapture.h"
 #include "../xrRender/light.h"
+#include "../xrRender/xrRender_console.h"
+#include "../../xrEngine/igame_persistent.h"
+#include "../../xrEngine/environment.h"
+#include "../../xrEngine/xr_efflensflare.h"
 
 #include <SDL.h>
 
 extern "C" void MacOS_ActivateAppWindow(void* sdlWindow);
 
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <unordered_set>
@@ -26,6 +37,10 @@ extern Fvector4 ps_ssfx_hud_drops_2;
 extern int scope_3D_fake_enabled;
 extern u32 psCurrentVidMode[];
 extern XRAPI_API xr_token* vid_mode_token;
+
+// Source LOD controls captured before the value-only OmniFace setup.
+extern float r_ssaGLOD_start, r_ssaGLOD_end;
+extern ENGINE_API BOOL g_appLoaded;
 
 namespace
 {
@@ -77,6 +92,88 @@ bool apply_metal_benchmark_window_override(SDL_Window* window)
     psCurrentVidMode[1] = logicalHeight;
     Msg("* [Metal] benchmark logical window override: %ux%u", logicalWidth, logicalHeight);
     return true;
+}
+
+bool temporalLifecycleProbeEnabled()
+{
+    const char* value = std::getenv("XRAY_METAL_TEMPORAL_LIFECYCLE_PROBE");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+R4GameplayFrameAdmission gameplayFrameAdmission(const MetalR4EngineScene& scene,
+    const MetalR4EngineScene::ViewState& view, const R4EnvironmentSnapshot& environment,
+    const IR4Backend* backend, const bool levelReady,
+    const bool requireWorldLightingSnapshots = true)
+{
+    const auto world = backend ? backend->EngineWorldSnapshot() : nullptr;
+    const auto lighting = backend ? backend->EngineLightingFrameSnapshot() : nullptr;
+    return EvaluateR4GameplayFrameAdmission(!g_appLoaded || !g_loading_events.empty(), scene.IsPrepared(),
+        levelReady, Device.dwFrame, view.valid, view.engineFrame, environment.valid,
+        environment.engineFrame, static_cast<bool>(world), world ? world->engineFrame : 0u,
+        static_cast<bool>(lighting), lighting ? lighting->engineFrame : 0u,
+        requireWorldLightingSnapshots);
+}
+
+struct TemporalLifecycleProbeState
+{
+    std::uint32_t preparedBeginTicks = 0u;
+    bool acquireSkipped = false;
+    bool encodeDiscarded = false;
+    bool reloadAttempted = false;
+    bool multiViewChecked = false;
+    bool resizeStarted = false;
+    bool resizeRequested = false;
+    bool resizeChanged = false;
+    bool resizeRestored = false;
+    bool nativeRetinaValueSaved = false;
+    bool originalNativeRetinaPresent = false;
+    bool nativeRetinaForcedOff = false;
+    std::string originalNativeRetinaValue;
+    std::uint32_t originalWidth = 0u;
+    std::uint32_t originalHeight = 0u;
+    std::uint32_t probeWidth = 0u;
+    std::uint32_t probeHeight = 0u;
+};
+
+TemporalLifecycleProbeState& temporalLifecycleProbeState()
+{
+    static TemporalLifecycleProbeState state;
+    return state;
+}
+
+bool disableTemporalProbeNativeRetina(TemporalLifecycleProbeState& state)
+{
+    if (!state.nativeRetinaValueSaved)
+    {
+        const char* value = std::getenv("XRAY_METAL_NATIVE_RETINA");
+        state.originalNativeRetinaPresent = value != nullptr;
+        if (value)
+            state.originalNativeRetinaValue = value;
+        state.nativeRetinaValueSaved = true;
+    }
+    if (::setenv("XRAY_METAL_NATIVE_RETINA", "0", 1) != 0)
+        return false;
+    state.nativeRetinaForcedOff = true;
+    return true;
+}
+
+bool restoreTemporalProbeNativeRetina(TemporalLifecycleProbeState& state,
+    const std::uint32_t engineFrame)
+{
+    if (!state.nativeRetinaValueSaved || !state.nativeRetinaForcedOff)
+        return true;
+    const int result = state.originalNativeRetinaPresent ?
+        ::setenv("XRAY_METAL_NATIVE_RETINA", state.originalNativeRetinaValue.c_str(), 1) :
+        ::unsetenv("XRAY_METAL_NATIVE_RETINA");
+    std::fprintf(stderr,
+        "METAL_TEMPORAL_LIFECYCLE_PROBE event=restore_native_retina_env engine_frame=%u original_present=%u result=%s\n",
+        engineFrame, state.originalNativeRetinaPresent ? 1u : 0u,
+        result == 0 ? "restored" : "failed");
+    if (result == 0)
+    {
+        state.nativeRetinaForcedOff = false;
+    }
+    return result == 0;
 }
 
 void fill_metal_vid_mode_list(SDL_Window* window)
@@ -434,7 +531,8 @@ void MetalRenderDeviceRender::Reset(HWND hWnd, u32& width, u32& height, float& h
         return;
     }
 
-    backend->ResizeDrawable();
+    backend->ResizeDrawable(psCurrentVidMode[0], psCurrentVidMode[1]);
+    scene.InvalidateHistory();
     UpdateDimensions(width, height, halfWidth, halfHeight);
     fill_metal_vid_mode_list(reinterpret_cast<SDL_Window*>(hWnd));
     deviceState = backend->HasCommandBufferError() ? dsLost : dsOK;
@@ -578,6 +676,20 @@ void MetalRenderDeviceRender::Create(
                 Msg("! [Metal] Load production R4 terrain materials skipped: %s", error.c_str());
             }
         }
+        if (!options.flora.leafVertexMetallibPath.empty() || !options.flora.trunkVertexMetallibPath.empty())
+        {
+            string_path shaderLibrary;
+            FS.update_path(shaderLibrary,"$game_data$","shaders.xr");
+            if (!LoadR4FloraBlenderMaterials(shaderLibrary,options.flora.shaderMaterials,error))
+            {
+                ReportFailure("LoadFloraBlenderMaterials",error);
+                return;
+            }
+            for (const auto& material:options.flora.shaderMaterials)
+                if (material.shaderName=="flora\\leaf_wave" || material.shaderName=="flora\\trunk_wave")
+                    std::fprintf(stderr,"METAL_FLORA_BLENDER material=%s alpha=%u object_lod=%u source=shaders.xr\n",
+                        material.shaderName.c_str(),material.alphaBlend,material.objectLod);
+        }
         sceneOptions = std::move(options);
         sceneOptionsReady = true;
         if (!sceneOptions.levelDirectory.empty())
@@ -677,12 +789,116 @@ void MetalRenderDeviceRender::Begin()
         s_firstFrameActivated = true;
     }
 
+    if (temporalLifecycleProbeEnabled())
+    {
+        TemporalLifecycleProbeState& probe = temporalLifecycleProbeState();
+        if (probe.resizeRestored && probe.nativeRetinaForcedOff)
+            restoreTemporalProbeNativeRetina(probe, Device.dwFrame);
+    }
+
+    if (temporalLifecycleProbeEnabled() && scene.IsPrepared() && g_pGameLevel != nullptr &&
+        viewState.valid && environmentSnapshot.valid)
+    {
+        TemporalLifecycleProbeState& probe = temporalLifecycleProbeState();
+        ++probe.preparedBeginTicks;
+        if (!probe.acquireSkipped && probe.preparedBeginTicks >= 5u)
+        {
+            probe.acquireSkipped = true;
+            std::fprintf(stderr,
+                "METAL_TEMPORAL_LIFECYCLE_PROBE event=skip_acquire prepared_begin=%u engine_frame=%u submitted_serial=%llu\n",
+                probe.preparedBeginTicks, Device.dwFrame,
+                static_cast<unsigned long long>(backend->LastSubmittedSerial()));
+            ::setenv("XRAY_METAL_TEMPORAL_FORCE_ACQUIRE_RETRY", "1", 1);
+        }
+        if (!probe.reloadAttempted && probe.preparedBeginTicks >= 10u)
+        {
+            probe.reloadAttempted = true;
+            const std::filesystem::path levelDirectory = preparedLevelDirectory;
+            const bool canReload = !levelDirectory.empty();
+            bool reloaded = false;
+            if (canReload)
+            {
+                UnloadLevelScene();
+                reloaded = LoadLevelScene(levelDirectory);
+            }
+            if (!reloaded)
+                scene.InvalidateHistory();
+            std::fprintf(stderr,
+                "METAL_TEMPORAL_LIFECYCLE_PROBE event=producer_reload prepared_begin=%u engine_frame=%u result=%s fallback=%s\n",
+                probe.preparedBeginTicks, Device.dwFrame,
+                reloaded ? "reloaded" : "unavailable",
+                reloaded ? "none" : "history_invalidate");
+        }
+        if (!probe.resizeStarted && probe.preparedBeginTicks >= 25u)
+        {
+            probe.resizeStarted = true;
+            backend->DrawableSize(probe.originalWidth, probe.originalHeight);
+            if (probe.originalWidth != 0u && probe.originalHeight != 0u)
+            {
+                probe.probeWidth = std::max(1u, probe.originalWidth / 2u);
+                probe.probeHeight = std::max(1u, probe.originalHeight / 2u);
+                if (probe.probeWidth == probe.originalWidth && probe.originalWidth > 1u)
+                    --probe.probeWidth;
+                if (probe.probeHeight == probe.originalHeight && probe.originalHeight > 1u)
+                    --probe.probeHeight;
+                probe.resizeRequested = probe.probeWidth != probe.originalWidth ||
+                    probe.probeHeight != probe.originalHeight;
+            }
+            if (probe.resizeRequested)
+            {
+                const bool retinaDisabled = disableTemporalProbeNativeRetina(probe);
+                if (retinaDisabled)
+                {
+                    backend->ResizeDrawable(probe.probeWidth, probe.probeHeight);
+                    std::uint32_t resizedWidth = 0u, resizedHeight = 0u;
+                    backend->DrawableSize(resizedWidth, resizedHeight);
+                    probe.resizeChanged = resizedWidth != probe.originalWidth ||
+                        resizedHeight != probe.originalHeight;
+                }
+                scene.InvalidateHistory();
+            }
+            std::fprintf(stderr,
+                "METAL_TEMPORAL_LIFECYCLE_PROBE event=resize prepared_begin=%u engine_frame=%u original=%ux%u test=%ux%u changed=%u retina_override=%u\n",
+                probe.preparedBeginTicks, Device.dwFrame, probe.originalWidth,
+                probe.originalHeight, probe.probeWidth, probe.probeHeight,
+                probe.resizeChanged ? 1u : 0u, probe.nativeRetinaForcedOff ? 1u : 0u);
+        }
+        if (!probe.resizeRestored && probe.preparedBeginTicks >= 30u)
+        {
+            probe.resizeRestored = true;
+            bool restored = !probe.resizeRequested;
+            if (probe.resizeRequested)
+            {
+                // Restore the exact prior policy before asking the backend to
+                // return to the original extent. With native-retina enabled,
+                // ResizeDrawable() must see the original window backing size.
+                const bool retinaRestored = restoreTemporalProbeNativeRetina(
+                    probe, Device.dwFrame);
+                if (retinaRestored)
+                    backend->ResizeDrawable(probe.originalWidth, probe.originalHeight);
+                scene.InvalidateHistory();
+                std::uint32_t restoredWidth = 0u, restoredHeight = 0u;
+                backend->DrawableSize(restoredWidth, restoredHeight);
+                restored = restoredWidth == probe.originalWidth &&
+                    restoredHeight == probe.originalHeight && retinaRestored;
+            }
+            std::fprintf(stderr,
+                "METAL_TEMPORAL_LIFECYCLE_PROBE event=resize_restore prepared_begin=%u engine_frame=%u extent=%ux%u restored=%u\n",
+                probe.preparedBeginTicks, Device.dwFrame, probe.originalWidth,
+                probe.originalHeight, restored ? 1u : 0u);
+        }
+    }
+
     std::string error;
     switch (backend->BeginFrame(error))
     {
     case R4FrameAcquireResult::Ready:
+    {
         frameActive = true;
-        if (scene.IsPrepared() && g_pGameLevel != nullptr)
+        const bool levelReady = g_pGameLevel != nullptr && g_pGameLevel->bReady;
+        if (gameplayFrameAdmission(scene, viewState, environmentSnapshot, backend.get(), levelReady,
+                false) ==
+            R4GameplayFrameAdmission::Ready)
         {
             deviceState = dsOK;
             return;
@@ -697,6 +913,8 @@ void MetalRenderDeviceRender::Begin()
             if (!backend->BeginRenderPass(clearPass, error))
             {
                 ReportFailure("Begin clear pass", error);
+                scene.DiscardUnsubmittedFrame();
+                backend->DiscardFrame();
                 frameActive = false;
                 passActive = false;
                 deviceState = dsLost;
@@ -706,6 +924,7 @@ void MetalRenderDeviceRender::Begin()
         }
         deviceState = dsOK;
         return;
+    }
     case R4FrameAcquireResult::Retry:
         // There is no drawable this tick.  Do not submit an empty command
         // buffer; the following engine frame will retry acquisition.
@@ -725,8 +944,60 @@ void MetalRenderDeviceRender::End()
     if (!backend || !frameActive)
         return;
 
+	double e01SceneMs = 0.0;
 	std::string error;
 	std::size_t submittedLightingCount = 0u;
+	if (!g_appLoaded || !g_loading_events.empty())
+	{
+		consecutiveSceneRenderFailures = 0u;
+		// LoadDraw runs through this renderer while engine-owned level events are
+		// still being processed. Present its clear/loading UI frame without
+		// recapturing gameplay lighting, HUD, particles, or world renderables.
+		if (!passActive)
+		{
+			R4RenderPassDesc clearPass;
+			clearPass.label = "Engine Metal loading clear";
+			clearPass.useDrawable = true;
+			clearPass.drawableColor.loadAction = R4LoadAction::Clear;
+			clearPass.drawableColor.storeAction = R4StoreAction::Store;
+			clearPass.drawableColor.clearColor = {0.008, 0.012, 0.020, 1.0};
+			if (!backend->BeginRenderPass(clearPass, error))
+			{
+				ReportFailure("Begin loading clear pass", error);
+				backend->DiscardFrame();
+				frameActive = false;
+				passActive = false;
+				deviceState = dsLost;
+				return;
+			}
+			passActive = true;
+		}
+		if (!backend->EndRenderPass(error))
+		{
+			ReportFailure("End loading clear pass", error);
+			backend->DiscardFrame();
+			frameActive = false;
+			passActive = false;
+			deviceState = dsLost;
+			return;
+		}
+		passActive = false;
+		xray::metal::ui::FrameBatch loadingUi = xray::metal::ui::DrainFrameBatch();
+		if ((!loadingUi.draws.empty() || loadingUi.droppedDraws != 0u) &&
+			!backend->RenderUIOverlay(loadingUi, error))
+			Msg("! METAL_LOADING_UI_SKIP error=%s", error.c_str());
+		scene.DiscardUnsubmittedFrame();
+		if (!backend->SubmitFrame(error))
+		{
+			ReportFailure("Submit loading frame", error);
+			backend->DiscardFrame();
+			deviceState = dsLost;
+		}
+		else
+			deviceState = dsOK;
+		frameActive = false;
+		return;
+	}
 	{
 		xr_vector<CDSGraphManager::MetalLocalLight> capturedLights;
 		CDSGraphManager::MetalLocalLightCaptureStats captureStats;
@@ -737,13 +1008,17 @@ void MetalRenderDeviceRender::End()
 		// fields now into value records; nothing below retains a live light pointer.
 		captureStats.spatial = u32(RImplementation.v_all_lights.size());
 		capturedLights.reserve(RImplementation.v_all_lights.size() * 6u);
+		std::unordered_map<u64, light*> lightByIdentity;
+		std::unordered_map<u64, light*> lightByParentIdentity;
+		lightByIdentity.reserve(RImplementation.v_all_lights.size());
+		lightByParentIdentity.reserve(RImplementation.v_all_lights.size());
 		static const Fvector omniNorm[6] = {
 			{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, -1.f},
 			{0.f, 0.f, 1.f}, {0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}};
 		static const Fvector omniDir[6] = {
 			{1.f, 0.f, 0.f}, {-1.f, 0.f, 0.f}, {0.f, 1.f, 0.f},
 			{0.f, -1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, -1.f}};
-		for (const light* source : RImplementation.v_all_lights)
+		for (light* source : RImplementation.v_all_lights)
 		{
 			if (!source || !source->flags.bActive)
 			{
@@ -754,13 +1029,22 @@ void MetalRenderDeviceRender::End()
 			if (sourceType == IRender_Light::DIRECT || sourceType == IRender_Light::REFLECTED ||
 				sourceType == IRender_Light::OMNIPART)
 				continue;
+			// Match the R2/R4 producer's package-level static-light setting.
+			if (source->flags.bStatic && !ps_r2_ls_flags.test(R2FLAG_R1LIGHTS))
+				continue;
 			const u64 parentIdentity = static_cast<u64>(reinterpret_cast<uintptr_t>(source));
+			lightByParentIdentity.emplace(parentIdentity, source);
 			const auto append = [&](CDSGraphManager::MetalLocalLight::Type type,
 				const Fvector& direction, const Fvector& right, const u8 omniFace)
 			{
 				CDSGraphManager::MetalLocalLight target;
-				target.identity = (parentIdentity << 3u) |
+				target.parentIdentity = parentIdentity;
+                target.identity = (parentIdentity << 3u) |
 					(omniFace == 0xff ? 0u : u64(omniFace + 1u));
+				light* faceSource = source;
+				if (omniFace != 0xff && sourceType == IRender_Light::POINT && source->omnipart[omniFace])
+					faceSource = source->omnipart[omniFace];
+				lightByIdentity.emplace(target.identity, faceSource);
 				target.type = type;
 				target.position.set(source->position);
 				target.direction.set(direction);
@@ -826,10 +1110,21 @@ void MetalRenderDeviceRender::End()
 		lightingFrame.shadowDepthBias = ps_r2_ls_depth_bias;
 		lightingFrame.lights.reserve(capturedLights.size());
 		std::size_t staticPointSpot = 0u;
+        // A controlled shadow fixture may isolate real Lua-created engine
+        // lamps by their captured world position. No light is manufactured;
+        // the normal capture/admission and point-face expansion happen first.
+        // This keeps the separately audited atlas overflow out of caster tests.
+        Fvector fixtureLightPosition{};
+        const char* fixtureLightSelector=std::getenv("XRAY_METAL_SHADOW_FIXTURE_LIGHT_POSITION");
+        const bool isolateFixtureLights=fixtureLightSelector &&
+            std::sscanf(fixtureLightSelector,"%f,%f,%f",&fixtureLightPosition.x,&fixtureLightPosition.y,&fixtureLightPosition.z)==3;
 		for (const CDSGraphManager::MetalLocalLight& source : capturedLights)
 		{
+            if (isolateFixtureLights && (!source.shadowed || source.staticLight ||
+                source.position.distance_to_sqr(fixtureLightPosition)>1.0e-6f)) continue;
 			R4EngineLocalLight target;
 			target.lightId = source.identity;
+            target.parentLightId = source.parentIdentity;
 			switch (source.type)
 			{
 			case CDSGraphManager::MetalLocalLight::Type::Point: target.type = R4EngineLocalLightType::Point; break;
@@ -847,6 +1142,8 @@ void MetalRenderDeviceRender::End()
 			target.active = source.active;
 			target.staticLight = source.staticLight;
 			target.shadowed = source.shadowed;
+            target.decorative = source.decorative;
+            target.cameraDistance = source.cameraDistance;
 			target.hudMode = source.hudMode;
 			target.omniFace = source.omniFace;
 			// shared_str represents an absent authored cookie as nullptr.  The
@@ -855,9 +1152,53 @@ void MetalRenderDeviceRender::End()
 			// copying it so point lights and cookie-less spots cannot fault during
 			// level startup.
 			target.projectorTexture = shared_str_or_empty(source.projectorTexture);
+			if (target.type == R4EngineLocalLightType::OmniFace)
+			{
+				const auto parentLight = lightByParentIdentity.find(source.parentIdentity);
+				if (parentLight != lightByParentIdentity.end() && parentLight->second)
+				{
+					const std::array<float, 3> cameraPosition = {
+						Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z};
+					light& parent = *parentLight->second;
+                    target.volumetricEnabled = parent.flags.bVolumetric;
+                    target.volumetricQuality = parent.m_volumetric_quality;
+                    target.rawColor = {parent.color.r, parent.color.g, parent.color.b};
+                    CaptureMetalR4OmniFaceVolumetricValues(target, cameraPosition,
+                        {ps_ssfx_volumetric.x, ps_ssfx_volumetric.y,
+                            ps_ssfx_volumetric.z, ps_ssfx_volumetric.w},
+                        ps_r2_slight_fade, r_ssaGLOD_start, r_ssaGLOD_end);
+				}
+			}
+			else
+			{
+				const auto sourceLight = lightByIdentity.find(source.identity);
+				if (sourceLight != lightByIdentity.end() && sourceLight->second)
+				{
+					light& engineLight = *sourceLight->second;
+					target.volumetricEnabled = engineLight.flags.bVolumetric;
+					target.volumetricVisibilityDistance = engineLight.vis.distance;
+					target.volumetricQuality = engineLight.m_volumetric_quality;
+					target.volumetricIntensity = engineLight.m_volumetric_intensity;
+					target.volumetricDistance = engineLight.m_volumetric_distance;
+					target.volumetricLod = engineLight.get_LOD();
+					target.volumetricPlayerLight = engineLight.sss_is_playerlight;
+					target.rawColor = {engineLight.color.r, engineLight.color.g, engineLight.color.b};
+					if (engineLight.SpatialComponent)
+					{
+						target.volumetricSphereCenter = {
+							engineLight.SpatialComponent->spatial.sphere.P.x,
+							engineLight.SpatialComponent->spatial.sphere.P.y,
+							engineLight.SpatialComponent->spatial.sphere.P.z};
+						target.volumetricSphereRadius = engineLight.SpatialComponent->spatial.sphere.R;
+					}
+				}
+			}
 			if (target.staticLight) ++staticPointSpot;
 			lightingFrame.lights.emplace_back(std::move(target));
 		}
+        if (isolateFixtureLights && Device.dwFrame%5u==0u)
+            Msg("* METAL_SHADOW_FIXTURE_LIGHTS frame=%u engine_captured=%zu selected_real_records=%zu position=%.6f,%.6f,%.6f",
+                Device.dwFrame,capturedLights.size(),lightingFrame.lights.size(),fixtureLightPosition.x,fixtureLightPosition.y,fixtureLightPosition.z);
 		if (!backend->SubmitEngineLightingFrame(lightingFrame, error))
 		{
 			ReportFailure("Submit engine local lights", error);
@@ -890,6 +1231,7 @@ void MetalRenderDeviceRender::End()
 			target.bounds = { source.bounds.P.x, source.bounds.P.y, source.bounds.P.z, source.bounds.R };
 			target.visualType = source.visualType;
 			target.objectId = source.objectId;
+            target.castsShadow = source.castsShadow;
 			target.hotness = {source.hotness.x, source.hotness.y, source.hotness.z, source.hotness.w};
 			target.material = {source.material.x, source.material.y,
 				source.material.z, source.material.w};
@@ -1018,6 +1360,11 @@ void MetalRenderDeviceRender::End()
 			target.previousBoneTransforms = source.previousBoneTransforms;
 			target.eligibleGeometryIndices.assign(source.eligibleGeometryIndices.begin(),
 				source.eligibleGeometryIndices.end());
+            target.emissiveGeometryIndices.assign(source.emissiveGeometryIndices.begin(), source.emissiveGeometryIndices.end());
+            target.geometryShaderFlags.reserve(source.geometryShaderFlags.size());
+            for (const auto& flags : source.geometryShaderFlags)
+                target.geometryShaderFlags.push_back({flags.priority, flags.strictB2F, flags.emissive,
+                    flags.distort, flags.wmark, flags.scopeLense});
 			target.scopeLeaves.reserve(source.scopeLeaves.size());
 			for (const CDSGraphManager::MetalHudRenderable::ScopeLeaf& sourceLeaf : source.scopeLeaves)
 			{
@@ -1069,6 +1416,41 @@ void MetalRenderDeviceRender::End()
 		if (scene.IsPrepared())
 			scene.SubmitParticleFrame(std::move(particles));
 	}
+    // Run the value-only producers before draining their per-frame captures.
+    if (scene.IsPrepared() && g_pGameLevel && g_pGamePersistent)
+    {
+        CEnvironment& environment = g_pGamePersistent->Environment();
+        const bool pp = g_pGamePersistent->OnRenderPPUI_query();
+        const bool menu = g_pGamePersistent->m_pMainMenu &&
+            g_pGamePersistent->m_pMainMenu->CanSkipSceneRendering();
+        const bool called = !pp && !menu;
+        static u32 lastWeatherFrame = u32(-1);
+        static bool lastCalled = false;
+        static float lastDensity = -1.0f;
+        if (lastWeatherFrame == u32(-1) || Device.dwFrame < lastWeatherFrame ||
+            Device.dwFrame - lastWeatherFrame >= 300u || called != lastCalled ||
+            std::abs(environment.CurrentEnv->rain_density - lastDensity) >= 0.2f)
+        {
+            Msg("* METAL_WEATHER_PRECONDITION frame=%u called=%u pp=%u menu_skip=%u rain_density=%.3f paused=%u lens_id=%s",
+                Device.dwFrame, called ? 1u : 0u, pp ? 1u : 0u, menu ? 1u : 0u,
+                environment.CurrentEnv->rain_density, environment.m_paused ? 1u : 0u,
+                shared_str_or_empty(environment.CurrentEnv->lens_flare_id));
+            lastWeatherFrame = Device.dwFrame; lastCalled = called;
+            lastDensity = environment.CurrentEnv->rain_density;
+        }
+        if (called)
+        {
+            // CRender::Render normally refreshes this CPU frustum before the
+            // weather producers; its Metal early return skips that step.
+            RImplementation.ViewBase.CreateFromMatrix(Device.mFullTransform,
+                FRUSTUM_P_LRTB + FRUSTUM_P_FAR);
+            environment.eff_LensFlare->Render(TRUE, FALSE, FALSE);
+            if (ps_r2_anomaly_flags.test(R2_AN_FLAG_FLARES) && ps_r2_heatvision == 0)
+                environment.RenderFlares();
+            environment.RenderLast();
+        }
+    }
+
 	{
 		xray::metal::rain::FrameBatch rain = xray::metal::rain::DrainFrame();
 		if (scene.IsPrepared())
@@ -1076,6 +1458,8 @@ void MetalRenderDeviceRender::End()
 	}
 	{
 		xray::metal::lensflare::Frame flare = xray::metal::lensflare::Drain();
+        if (!flare.draws.empty() && (Device.dwFrame < 100u || Device.dwFrame % 300u == 0u))
+            Msg("* METAL_LENS_CAPTURE frame=%u draws=%zu", Device.dwFrame, flare.draws.size());
 		if (scene.IsPrepared())
 			scene.SubmitLensFlareFrame(std::move(flare));
 	}
@@ -1084,7 +1468,8 @@ void MetalRenderDeviceRender::End()
         const float dx = viewState.eye[0] - lastLoggedSceneEye[0];
         const float dy = viewState.eye[1] - lastLoggedSceneEye[1];
         const float dz = viewState.eye[2] - lastLoggedSceneEye[2];
-        if (!sceneCameraLogged || dx * dx + dy * dy + dz * dz >= 25.0f)
+        const float distSq = dx * dx + dy * dy + dz * dz;
+        if (!sceneCameraLogged || distSq >= 25.0f)
         {
             Msg("* METAL_ENGINE_CAMERA frame=%u eye=%.3f,%.3f,%.3f forward=%.3f,%.3f,%.3f",
                 Device.dwFrame, viewState.eye[0], viewState.eye[1], viewState.eye[2],
@@ -1093,35 +1478,205 @@ void MetalRenderDeviceRender::End()
             lastLoggedSceneEye = viewState.eye;
             sceneCameraLogged = true;
         }
+        if (sceneCameraLogged && distSq > 2500.0f)
+        {
+            viewState.cameraCut = true;
+        }
+        if (Device.dwFrame % 300 == 1 && backend)
+        {
+            const auto worldSnap = backend->EngineWorldSnapshot();
+            const auto lightSnap = backend->EngineLightingFrameSnapshot();
+            const auto hudSnap = backend->EngineHudSnapshot();
+            Msg("* METAL_FRAME_STAMPS engine=%u camera=%u world=%u light=%u env=%u hud=%u cut=%d",
+                Device.dwFrame, viewState.engineFrame,
+                worldSnap ? worldSnap->engineFrame : 0,
+                lightSnap ? lightSnap->engineFrame : 0,
+                environmentSnapshot.engineFrame,
+                hudSnap ? hudSnap->engineFrame : 0,
+                viewState.cameraCut ? 1 : 0);
+        }
     }
-    if (scene.IsPrepared() && g_pGameLevel != nullptr)
+    bool gameplaySceneRendered = false;
+    const bool levelReady = g_pGameLevel != nullptr && g_pGameLevel->bReady;
+    const R4GameplayFrameAdmission admission = gameplayFrameAdmission(
+        scene, viewState, environmentSnapshot, backend.get(), levelReady);
+    if (scene.IsPrepared() && g_pGameLevel != nullptr && admission == R4GameplayFrameAdmission::Ready)
     {
         if (passActive)
         {
-            ReportFailure("Render production R4 scene",
-                "unexpected render pass active before scene bridge");
-            ShutdownBackend();
-            deviceState = dsLost;
-            return;
+            // Begin may have started a clear pass before the final same-frame
+            // snapshots were published. Close it before admitting the world.
+            if (!backend->EndRenderPass(error))
+            {
+                ReportFailure("End loading clear pass", error);
+                ShutdownBackend();
+                const std::string fatalError = "Metal renderer could not close its loading clear pass: " + error;
+                Debug.fatal(DEBUG_INFO, "%s", fatalError.c_str());
+                return;
+            }
+            passActive = false;
         }
         R4GameplayVisionSnapshot vision;
         CopyGameplayVisionSnapshotForFrame(Device.dwFrame, vision);
+        scene.SubmitLuminanceBloomThreshold(Device.dwFrame, ps_r2_ls_bloom_threshold);
+        scene.SubmitEmissiveFactor(Device.dwFrame,
+            g_pGamePersistent->pda_shader_data.pda_display_factor);
+        const auto e01SceneStart = std::chrono::steady_clock::now();
+        if (viewState.valid && environmentSnapshot.valid)
+        {
+            Fmatrix view, projection;
+            std::memcpy(&view, viewState.view.data(), sizeof(view));
+            std::memcpy(&projection, viewState.projection.data(), sizeof(projection));
+            Fvector eye{viewState.eye[0],viewState.eye[1],viewState.eye[2]};
+            Fvector forward{view._13,view._23,view._33};
+            Fvector lightDirection{environmentSnapshot.adaptedSunDirection[0],
+                environmentSnapshot.adaptedSunDirection[1],environmentSnapshot.adaptedSunDirection[2]};
+            // Light_DB positions the adapted sun 500m upstream of this camera.
+            Fvector lightPosition; lightPosition.mad(eye, lightDirection, -500.0f);
+            environmentSnapshot.sunCascades = BuildMetalR4SunCascades(view, projection, eye, forward,
+                lightPosition, lightDirection, environmentSnapshot.ssfxShadowCascades,
+                2048u, environmentSnapshot.sunResetLastCascade, viewState.engineFrame);
+        }
+        if (std::getenv("XRAY_METAL_E08_GPU_PASSES") && Device.dwFrame % 120u == 0u)
+            std::fprintf(stderr, "METAL_E08_SUN_BUILD frame=%u cpu_ms=%.6f\n", Device.dwFrame,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e01SceneStart).count());
         if (!scene.Render(*backend, viewState, environmentSnapshot, vision, error))
         {
             ReportFailure("Render production R4 scene", error);
+            scene.DiscardUnsubmittedFrame();
+            backend->DiscardFrame();
+            frameActive = false;
+            passActive = false;
             if (backend->HasCommandBufferError())
             {
                 ShutdownBackend();
-                deviceState = dsLost;
+                const std::string fatalError = "Metal renderer stopped after an unrecoverable frame failure: " + error;
+                Debug.fatal(DEBUG_INFO, "%s", fatalError.c_str());
                 return;
             }
+            ++consecutiveSceneRenderFailures;
+            if (consecutiveSceneRenderFailures >= 3u)
+            {
+                const std::string fatalError = "Metal renderer stopped after " +
+                    std::to_string(consecutiveSceneRenderFailures) +
+                    " consecutive scene failures: " + error;
+                ShutdownBackend();
+                Debug.fatal(DEBUG_INFO, "%s", fatalError.c_str());
+                return;
+            }
+            deviceState = dsOK;
+            return;
         }
+        consecutiveSceneRenderFailures = 0u;
+        gameplaySceneRendered = true;
+        const char* coldUploadProbe = std::getenv("XRAY_METAL_TEMPORAL_COLD_UPLOAD_PROBE");
+        static bool coldEncodeDiscarded = false;
+        if (coldUploadProbe && std::strcmp(coldUploadProbe, "1") == 0 && !coldEncodeDiscarded)
+        {
+            coldEncodeDiscarded = true;
+            std::fprintf(stderr, "METAL_TEMPORAL_COLD_UPLOAD_ABORT engine_frame=%u submitted_serial=%llu\n",
+                Device.dwFrame, static_cast<unsigned long long>(backend->LastSubmittedSerial()));
+            scene.DiscardUnsubmittedFrame();
+            backend->DiscardFrame();
+            frameActive = false;
+            passActive = false;
+            deviceState = dsOK;
+            return;
+        }
+		if (temporalLifecycleProbeEnabled())
+		{
+			TemporalLifecycleProbeState& probe = temporalLifecycleProbeState();
+			if (!probe.encodeDiscarded && probe.preparedBeginTicks >= 15u)
+			{
+				probe.encodeDiscarded = true;
+				std::fprintf(stderr,
+					"METAL_TEMPORAL_LIFECYCLE_PROBE event=discard_encoded_frame prepared_begin=%u engine_frame=%u submitted_serial=%llu\n",
+					probe.preparedBeginTicks, Device.dwFrame,
+					static_cast<unsigned long long>(backend->LastSubmittedSerial()));
+				scene.DiscardUnsubmittedFrame();
+				backend->DiscardFrame();
+				frameActive = false;
+				passActive = false;
+				deviceState = dsOK;
+				return;
+			}
+			if (!probe.multiViewChecked && probe.preparedBeginTicks >= 20u)
+			{
+				probe.multiViewChecked = true;
+				std::string secondViewError;
+				const bool secondViewRendered = scene.Render(*backend, viewState,
+					environmentSnapshot, vision, secondViewError);
+				const bool rejectedBeforeEncoding = !secondViewRendered &&
+					secondViewError ==
+						"only one primary world view may produce temporal history per Metal submission";
+				std::fprintf(stderr,
+					"METAL_TEMPORAL_LIFECYCLE_PROBE event=multiple_view prepared_begin=%u engine_frame=%u result=%s error=\"%s\"\n",
+					probe.preparedBeginTicks, Device.dwFrame,
+					rejectedBeforeEncoding ? "rejected_before_encoding" : "unexpected",
+					secondViewError.c_str());
+				if (!rejectedBeforeEncoding)
+				{
+					scene.DiscardUnsubmittedFrame();
+					backend->DiscardFrame();
+					frameActive = false;
+					passActive = false;
+					deviceState = dsOK;
+					return;
+				}
+			}
+		}
+		e01SceneMs = std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - e01SceneStart).count();
 		if (!sceneFrameLogged)
 		{
 			Msg("* METAL_ENGINE_FIRST_FRAME camera=%s", std::getenv("XRAY_METAL_FIXED_SCENE_CAMERA") ?
                 "fixed_scene" : (viewState.valid ? "engine" : "engine_pending"));
 			sceneFrameLogged = true;
-		}
+        }
+    }
+    if (!gameplaySceneRendered)
+    {
+        consecutiveSceneRenderFailures = 0u;
+        if (!passActive)
+        {
+            R4RenderPassDesc clearPass;
+            clearPass.label = "Engine Metal loading/coherence clear";
+            clearPass.useDrawable = true;
+            clearPass.drawableColor.loadAction = R4LoadAction::Clear;
+            clearPass.drawableColor.storeAction = R4StoreAction::Store;
+            clearPass.drawableColor.clearColor = {0.008, 0.012, 0.020, 1.0};
+            if (!backend->BeginRenderPass(clearPass, error))
+            {
+                ReportFailure("Begin loading/coherence clear pass", error);
+                scene.DiscardUnsubmittedFrame();
+                backend->DiscardFrame();
+                frameActive = false;
+                passActive = false;
+                deviceState = dsLost;
+                return;
+            }
+            passActive = true;
+        }
+        if (scene.IsPrepared() && admission != R4GameplayFrameAdmission::Ready)
+        {
+            static R4GameplayFrameAdmission lastLoggedAdmission = R4GameplayFrameAdmission::Ready;
+            static std::uint32_t lastLoggedAdmissionFrame = UINT32_MAX;
+            const bool reasonChanged = admission != lastLoggedAdmission;
+            const bool intervalElapsed = lastLoggedAdmissionFrame == UINT32_MAX ||
+                Device.dwFrame < lastLoggedAdmissionFrame ||
+                Device.dwFrame - lastLoggedAdmissionFrame >= 300u;
+            if (reasonChanged || intervalElapsed)
+            {
+                const auto world = backend->EngineWorldSnapshot();
+                const auto lighting = backend->EngineLightingFrameSnapshot();
+                Msg("* METAL_GAMEPLAY_SCENE_DEFER frame=%u reason=%s view=%u env=%u world=%u light=%u",
+                    Device.dwFrame, R4GameplayFrameAdmissionName(admission), viewState.engineFrame,
+                    environmentSnapshot.engineFrame, world ? world->engineFrame : 0u,
+                    lighting ? lighting->engineFrame : 0u);
+                lastLoggedAdmission = admission;
+                lastLoggedAdmissionFrame = Device.dwFrame;
+            }
+        }
     }
     if (passActive)
     {
@@ -1146,13 +1701,26 @@ void MetalRenderDeviceRender::End()
         }
     }
 
+    backend->SetE01FrameTiming(Device.dwFrame, environmentSnapshot.engineFrame, e01SceneMs);
     if (!backend->SubmitFrame(error))
     {
-        ReportFailure("End", error);
-        deviceState = dsLost;
+        const bool retry = backend->LastFrameSubmitWasRetry();
+        scene.DiscardUnsubmittedFrame();
+        backend->DiscardFrame();
+        if (retry)
+        {
+            Msg("* METAL_FRAME_SUBMIT_RETRY frame=%u reason=%s", Device.dwFrame, error.c_str());
+            deviceState = dsOK;
+        }
+        else
+        {
+            ReportFailure("End", error);
+            deviceState = dsLost;
+        }
     }
     else
     {
+        scene.OnFrameSubmitted();
         deviceState = dsOK;
     }
     frameActive = false;
@@ -1175,19 +1743,38 @@ void MetalRenderDeviceRender::SetCacheXform(Fmatrix& view, Fmatrix& projection)
         Device.vCameraPosition.y,
         Device.vCameraPosition.z,
     };
+    viewState.engineFrame = Device.dwFrame;
     viewState.valid = true;
 }
 void MetalRenderDeviceRender::SetCacheXform_prev(Fmatrix& view, Fmatrix& projection)
 {
     static_assert(sizeof(Fmatrix) == sizeof(float) * 16,
         "engine Metal scene requires a packed previous float4x4 Fmatrix");
+    const auto isZero = [](const Fmatrix& m) {
+        const float* f = reinterpret_cast<const float*>(&m);
+        for (int i = 0; i < 16; ++i)
+            if (f[i] != 0.0f) return false;
+        return true;
+    };
+    if (Device.dwFrame <= 1 || isZero(view) || isZero(projection))
+    {
+        viewState.previousView = viewState.view;
+        viewState.previousProjection = viewState.projection;
+        viewState.previousFrame = Device.dwFrame;
+        viewState.previousValid = false;
+        viewState.cameraCut = true;
+        return;
+    }
     std::memcpy(viewState.previousView.data(), &view, sizeof(Fmatrix));
     std::memcpy(viewState.previousProjection.data(), &projection, sizeof(Fmatrix));
+    viewState.previousFrame = Device.dwFrame > 0 ? Device.dwFrame - 1 : 0;
     viewState.previousValid = true;
+    viewState.cameraCut = false;
 }
 
 void MetalRenderDeviceRender::OnAssetsChanged()
 {
+    scene.InvalidateHistory();
     if (backend && !frameActive)
         backend->ResizeDrawable();
 }

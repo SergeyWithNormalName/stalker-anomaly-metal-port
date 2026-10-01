@@ -1,0 +1,11 @@
+# Prepared-motion wind-helper experiment
+
+This is a scratch-only refactor of the CPU Flora wind-envelope helper. It does not touch the renderer, production headers, build tree, or game. The original helper remains the comparison oracle in `../FloraWindEnvelope.h`.
+
+The proposed frame API owns one immutable `Motion`, validates its 276 scalar inputs once (20 wind/setup/animation floats and 256 current/previous bender floats), then caches the four shared scalars `speed`, `wSpeed`, `tWaveAbs`, and `trunkZ`. Each per-visual call still validates that Rest and preserves error precedence: `motion.valid`, Rest validity, then the first cached motion error. The compatibility overload calls prepare-then-compute; a frame loop must explicitly prepare once outside its Rest loop to get the saving.
+
+The per-rest `hFactor`, trunk bound, leaf bound, current/previous bender loops, float-denominator normalization logic, domain guards, outward rounding, overflow handling, and result/failure strings are unchanged in this draft. `PreparedMotion` owns the Motion copy, so it cannot retain a dangling pointer or observe later mutation. Production could use the same namespace/types by adding this overload in-place; the separate namespace here exists only so the probe can compare old and proposed implementations in one process.
+
+`prepared_motion_equivalence.cpp` compares every Bound field bit-for-bit, including failure reason, against the existing helper for all 5,303 bounded real-rest rows and both old/active frame-700 motion fixtures. It also checks synthetic leaf/trunk, current/previous bender, normalize/domain, invalid-rest/motion precedence, nonfinite-motion reason ordering, extreme-H, and outward-overflow cases. The 13 real rest rows already classified unknown are skipped by both helpers and remain fail-open in the caller.
+
+The bounded CPU-only microbenchmark uses the active motion fixture and a preconverted Rest array. It excludes CSV parsing, Rest conversion, and one-time `prepareMotion`; the 10,606-row case repeats the 5,303-row fixture twice to test helper scaling, not to claim a captured 10,606-visual population. Three warmups and 50 measured samples are used. This is not an engine frame, GPU, or FPS benchmark.

@@ -3,6 +3,7 @@
 
 #include "xr_input.h"
 #include "IInputReceiver.h"
+#include "xr_gamepad.h"
 #include "XR_IOConsole.h"
 //#include "../include/editor/ide.hpp"
 
@@ -279,6 +280,16 @@ CInput::~CInput(void)
 
 	_SHOW_REF("Input: ", pDI);
 	_RELEASE(pDI);
+
+	// The gamepad manager owns the platform backend, which in turn owns native
+	// objects (notification observers, a haptic engine). No frame can run after
+	// this, because the constructor's seqFrame registration has already been
+	// removed, so this is a safe place to let all of it go.
+	if (pGamepad)
+	{
+		xr_delete(pGamepad);
+		pGamepad = NULL;
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -396,7 +407,11 @@ void CInput::KeyUpdate()
 #ifndef _EDITOR
 	bool b_alt_tab = false;
 
-	if (!b_altF4 && KBState[DIK_F4] && (KBState[DIK_RMENU] || KBState[DIK_LMENU]))
+	if (!b_altF4 && ((KBState[DIK_F4] && (KBState[DIK_RMENU] || KBState[DIK_LMENU]))
+#if defined(XR_PLATFORM_APPLE)
+	                 || (KBState[DIK_Q] && (KBState[DIK_LWIN] || KBState[DIK_RWIN]))
+#endif
+	))
 	{
 		b_altF4 = TRUE;
 		Engine.Event.Defer("KERNEL:disconnect");
@@ -445,7 +460,11 @@ void CInput::KeyUpdate()
 			{
 				cbStack.back()->IR_OnKeyboardRelease(key);
 #ifndef _EDITOR
-				if (key == DIK_TAB && (iGetAsyncKeyState(DIK_RMENU) || iGetAsyncKeyState(DIK_LMENU)))
+				if (key == DIK_TAB && (iGetAsyncKeyState(DIK_RMENU) || iGetAsyncKeyState(DIK_LMENU)
+#if defined(XR_PLATFORM_APPLE)
+					|| iGetAsyncKeyState(DIK_LWIN) || iGetAsyncKeyState(DIK_RWIN)
+#endif
+				))
 					b_alt_tab = true;
 #endif
 			}
@@ -909,6 +928,12 @@ void CInput::OnAppDeactivate(void)
 #if defined(XR_PLATFORM_APPLE)
 	SetRelativeMouseMode(false);
 #endif
+	// Losing focus must not leave the actor running or the trigger held. This
+	// runs before the receivers are told about the deactivation so the release
+	// edges land on a receiver that is still listening.
+	if (pGamepad)
+		pGamepad->OnFocusLost();
+
 	if (CurrentIR())
 		CurrentIR()->IR_OnDeactivate();
 
@@ -922,6 +947,9 @@ void CInput::OnAppDeactivate(void)
 
 void CInput::DeactivateSoft()
 {
+	if (pGamepad)
+		pGamepad->OnFocusLost();
+
 	if (CurrentIR())
 		CurrentIR()->IR_OnDeactivate();
 
@@ -1008,6 +1036,7 @@ void CInput::OnFrame(void)
 {
 	PROF_EVENT("CInput::OnFrame");
 	RDEVICE.Statistic->Input.Begin();
+	const u32 prevCurTime = dwCurTime;
 	dwCurTime = RDEVICE.TimerAsync_MMT();
 #if defined(XR_PLATFORM_APPLE)
 	KeyUpdate();
@@ -1016,7 +1045,29 @@ void CInput::OnFrame(void)
 	if (pKeyboard) KeyUpdate();
 	if (pMouse) MouseUpdate();
 #endif
+	GamepadUpdate(prevCurTime);
 	RDEVICE.Statistic->Input.End();
+}
+
+// Gamepad input is applied here, on the engine thread and inside the same
+// frame slot that drains the keyboard and the mouse, so the receivers, the UI
+// and the scripting callbacks are all in their normal state when it runs.
+void CInput::GamepadUpdate(u32 prevTimeMs)
+{
+	CGamepadManager* gp = Gamepad();
+
+	float dtMs = 16.0f;
+	if (prevTimeMs && dwCurTime > prevTimeMs)
+	{
+		// TimerAsync_MMT is a millisecond timer and can wrap; a huge delta means
+		// exactly that, so fall back to a nominal frame rather than stalling
+		// every time based decision in the gamepad layer.
+		const u32 delta = dwCurTime - prevTimeMs;
+		if (delta < 500)
+			dtMs = float(delta);
+	}
+
+	gp->OnFrame(dtMs);
 }
 
 IInputReceiver* CInput::CurrentIR()

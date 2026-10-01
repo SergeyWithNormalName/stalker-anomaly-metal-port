@@ -1,13 +1,20 @@
 #pragma once
+#include "R4SunCascade.h"
+#include "R4SunShadowValidation.h"
+#include "R4LocalShadowBatchValidation.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "DisplayCapabilities.h"
 #include "IR4Pipeline.h"
+#include "R4StaticMotionValidation.h"
+#include "R4TemporalTextureValidation.h"
 #include "../xrRender/MetalUICapture.h"
 
 struct SDL_Window;
@@ -37,6 +44,54 @@ struct R4SaveThumbnailSnapshot
     static constexpr std::uint32_t Height = 128;
     std::uint64_t frameSerial = 0;
     std::vector<std::uint8_t> bgraPixels;
+};
+
+// A unique, immutable range in the acquired frame context. The backend owns
+// the native storage until that context's command buffer completes.
+struct R4FrameBufferSlice
+{
+    std::shared_ptr<IR4Buffer> buffer;
+    std::size_t offset = 0;
+    std::size_t size = 0;
+    // Unique backend acquisition that created this immutable upload range.
+    // Zero denotes a slice with no native acquisition proof.
+    std::uint64_t acquireEpoch = 0;
+};
+
+// Narrow native skin dispatch description. The canonical input is immutable
+// 88-byte scalar-array records decoded and validated by the caller. Its bone
+// indices must be below boneCount; maxReferencedBoneIndex is trusted metadata
+// only after validating every canonical record. Output is exactly the
+// existing 36-byte SKIN_0 stream. The canonical buffer must outlive the
+// acquired frame and must not be an arena upload slice. The backend validates every resource span
+// and the full job batch before it encodes any writes.
+struct R4ComputeSkinOracleRequest
+{
+    std::string stableKey;
+    std::vector<std::uint8_t> expectedBytes;
+    std::uint64_t poseHash = 0u;
+    std::uint64_t outputWriteSerial = 0u;
+    std::uint64_t prewarmEpoch = 0u;
+    std::uint32_t engineFrame = 0u;
+};
+
+struct R4ComputeSkinJob
+{
+    std::shared_ptr<IR4Buffer> canonicalInput;
+    std::size_t inputOffset = 0;
+    std::size_t inputSize = 0;
+    R4FrameBufferSlice bones;
+    std::shared_ptr<IR4Buffer> output;
+    std::size_t outputOffset = 0;
+    std::size_t outputSize = 0;
+    std::uint32_t vertexCount = 0;
+    std::uint32_t influenceCount = 0;
+    std::uint32_t boneCount = 0;
+    std::uint32_t maxReferencedBoneIndex = 0;
+    // Optional, default-off diagnostic request. The backend owns the request
+    // through command-buffer completion and may skip it when its per-frame
+    // readback cap is exhausted. This never changes compute dispatch semantics.
+    std::shared_ptr<const R4ComputeSkinOracleRequest> oracle;
 };
 
 // Value-only gameplay state captured after the actor update and before the
@@ -119,6 +174,30 @@ struct R4ScissorRect
     std::uint32_t height = 0;
 };
 
+enum class R4WholeLightVisibilityGroupKind : std::uint8_t
+{
+    SingleRecord,
+    OmniParent,
+};
+
+// Metadata for one actual local-light accumulation draw. The native backend
+// may attach an asynchronous depth/stencil visibility count to this draw.
+// Results describe deferred receiver samples only and never grant culling.
+struct R4WholeLightVisibilitySample
+{
+    std::uint32_t engineFrame = 0u;
+    // Optional CPU-prediction provenance. Zero preserves GPU-only observations.
+    // Nonzero values identify one CPU observation scope within the acquired frame.
+    std::uint64_t cpuObservationScopeId = 0u;
+    std::int32_t batchId = -1;
+    std::uint64_t lightId = 0u;
+    std::uint64_t parentLightId = 0u;
+    std::uint32_t face = 0u;
+    R4WholeLightVisibilityGroupKind groupKind =
+        R4WholeLightVisibilityGroupKind::SingleRecord;
+    std::uint8_t expectedFaceCount = 1u;
+};
+
 struct R4RenderPassDesc
 {
     const char* label = nullptr;
@@ -130,6 +209,9 @@ struct R4RenderPassDesc
     R4Viewport viewport;
     bool hasScissor = false;
     R4ScissorRect scissor;
+    // Enables a bounded, backend-owned visibility-result buffer for this pass.
+    // Default false keeps every existing pass on its current path.
+    bool enableVisibilityResultCounts = false;
 };
 
 enum class R4ShaderStage
@@ -206,11 +288,48 @@ struct R4EnvironmentSnapshot
     // environment sun. Its direction is world-space; the scene derives the
     // view-space dynamic-light direction from its current view matrix.
     std::array<float, 3> adaptedSunColor{};
+    float adaptedSunSpecular=0.5f;
+    std::array<float,4> ssfxFloraFixes1{};
+    std::array<float,4> ssfxFloraFixes2{};
+    std::array<float,4> ssfxLightSetup1{};
     std::array<float, 3> adaptedSunDirection{};
+    std::array<float, 3> adaptedSunPosition{};
+    // Source R4 volumetric controls. These are copied on the engine update
+    // thread so the Metal scene does not infer active modes from shader names.
+    bool ssfxVolumetricAvailable = false;
+    std::array<float, 4> ssfxVolumetric{1.0f, 1.0f, 3.0f, 1.0f};
+    bool localVolumetricEnabled = false;
+    bool sunShaftsEnabled = false;
+    std::uint32_t sunShaftsMode = 0;
+    float sunShaftsIntensity = 0.0f;
+    float sunShaftsFarRange = 100.0f;
+    std::uint32_t sunShaftsQuality = 1;
+    std::uint32_t volumetricResolutionDivisor = 8;
+    std::int32_t volumetricMode = 0;
+    std::int32_t volumetricGlossMethod = 0;
+    float volumetricGlossMinimum = 0.0f;
+    float volumetricGlossFactor = 0.0f;
+    std::array<float, 3> volumetricGlossMinMax{};
+    std::array<float, 4> ssfxShadowBias{0.0f,0.03f,0.0f,0.0f};
+    std::array<float, 3> ssfxShadowCascades{20.0f, 60.0f, 160.0f};
+    std::array<float, 4> ssfxGrassShadows{};
+    std::array<float, 2> sunDepthScale{1.0f, 1.0f};
+    std::array<float, 2> sunDepthBias{-0.00001f, -0.00002f};
+    float sunTsmBias = -0.01f;
+    bool grassShadows = false;
+    float detailFadeDistance = 47.5f;
+    bool sunZCulling = false;
+    bool sunResetLastCascade = false;
+    R4SunCascadeSet sunCascades;
     std::array<float, 3> fogColor{};
     float fogDensity = 0.0f;
     float fogNear = 0.0f;
     float fogFar = 0.0f;
+    // Active-profile SSFX fog-scattering presence and live console controls.
+    // The Metal leaf consumes these only when the source R4 feature gate is on.
+    bool ssfxFogScatteringAvailable = false;
+    std::array<float, 4> ssfxFog{};
+    float ssfxFogScattering = 0.0f;
     float globalTime = 0.0f;
     // Exact live SSFX water controls captured beside the environment mixer.
     // These are values only: the Metal water subsystem never borrows legacy
@@ -219,12 +338,25 @@ struct R4EnvironmentSnapshot
     std::array<float, 4> ssfxWaterSetup1{};
     std::array<float, 4> ssfxWaterSetup2{};
     std::array<float, 3> ssfxWaterQuality{};
+    // Exact live general SSFX SSR controls and the R4 source-presence gate.
+    // The admitted converted bundle currently supports quality zero only.
+    bool ssfxSsrAvailable = false;
+    std::uint32_t ssfxSsrQuality = 0u;
+    std::array<float, 4> ssfxSsr{};
+    std::array<float, 4> ssfxSsr2{};
+    std::array<float, 4> ssfxIsUnderground{};
     // Exact R4 SSFX AO controls. The production Metal pass consumes them
     // before combine_1; it does not recreate console policy in the backend.
+    bool ssfxAoAvailable = false;
+    bool ssfxIlAvailable = false;
     std::array<float, 4> ssfxAo{};
     std::array<float, 4> ssfxAoSetup1{};
     std::array<float, 4> ssfxIl{};
     std::array<float, 4> ssfxIlSetup1{};
+    // Values from the exact R4 bloom binder, including optional weather presets.
+    std::array<float, 4> ssfxBloom1{};
+    std::array<float, 4> ssfxBloom2{};
+    std::array<float, 4> maskControl{};
     float windAnimation = 0.0f;
     float windVelocity = 0.0f;
     float rainDensity = 0.0f;
@@ -245,6 +377,7 @@ struct R4EngineWorldRenderable
     std::array<float, 4> bounds{};
     std::uint32_t visualType = 0;
     std::uint16_t objectId = 0xffffu;
+    bool castsShadow = true;
 	// Resolved legacy L_hotness: x is the HeatVision scalar, y retains legacy
 	// transparency, z/w are zero. Capture already applies the texture hot gate.
 	std::array<float, 4> hotness{};
@@ -332,6 +465,8 @@ struct R4EngineHudRenderable
 	// Explicit opaque geometry subset. Empty is deliberately not a whole-asset
 	// fallback: unsupported CPU-only aggregate leaves must stay unsubmitted.
 	std::vector<std::uint32_t> eligibleGeometryIndices;
+	std::vector<std::uint32_t> emissiveGeometryIndices;
+	std::vector<SelectedShaderFlags> geometryShaderFlags;
 	// Immutable 3DSS roles, deliberately separate from opaque geometry.
 	std::vector<ScopeLeaf> scopeLeaves;
 };
@@ -396,6 +531,8 @@ struct R4EngineLocalLight
 	// capture time from the source light plus OmniFace ordinal, never from
 	// vector order, so shadow records remain coherent after culling/reordering.
 	std::uint64_t lightId = 0;
+    // Explicit source parent for atomic six-face atlas batching.
+    std::uint64_t parentLightId = 0;
     R4EngineLocalLightType type = R4EngineLocalLightType::Point;
     std::array<float, 3> position{};
     std::array<float, 3> direction{};
@@ -410,9 +547,24 @@ struct R4EngineLocalLight
     bool active = false;
     bool staticLight = false;
     bool shadowed = false;
+    bool decorative = false;
+    float cameraDistance = 0.0f;
 	bool hudMode = false;
 	std::uint8_t omniFace = 0xff;
 	std::string projectorTexture;
+    // Raw values consumed by the source R4 spot-volumetric formulas. `color`
+    // above remains the existing local-light value (already multiplied by
+    // LOD); rawColor is separate to avoid applying LOD twice in that pass.
+    bool volumetricEnabled = false;
+    float volumetricVisibilityDistance = 0.0f;
+    float volumetricQuality = 1.0f;
+    float volumetricIntensity = 1.0f;
+    float volumetricDistance = 1.0f;
+    float volumetricLod = 1.0f;
+    bool volumetricPlayerLight = false;
+    std::array<float, 3> rawColor{};
+    std::array<float, 3> volumetricSphereCenter{};
+    float volumetricSphereRadius = 0.0f;
 };
 
 // Canonical one-frame value snapshot shared by all Direct Metal lighting
@@ -439,9 +591,13 @@ public:
     // silently multiplying the scene workload by the backing scale.
     virtual bool Initialize(SDL_Window* window, std::uint32_t preferredWidth,
         std::uint32_t preferredHeight, std::string& error) = 0;
-    virtual void ResizeDrawable() = 0;
+    virtual void ResizeDrawable(std::uint32_t width = 0, std::uint32_t height = 0) = 0;
 
     virtual R4FrameAcquireResult BeginFrame(std::string& error) = 0;
+    // E01 diagnostic metadata. No effect unless XRAY_METAL_E01_FRAMES is set.
+    virtual void SetE01FrameTiming(std::uint32_t engineFrame,
+        std::uint32_t cameraFrame, double sceneMs) = 0;
+    virtual void AddE01CpuStage(const char* stage, double milliseconds) = 0;
     virtual bool BeginRenderPass(const R4RenderPassDesc& descriptor, std::string& error) = 0;
     bool BeginRenderPass(const R4ClearColor& clearColor, std::string& error)
     {
@@ -450,12 +606,46 @@ public:
         return BeginRenderPass(descriptor, error);
     }
     virtual bool EndRenderPass(std::string& error) = 0;
+    // Change only raster region inside a pass. Attachments, clears and resource
+    // ownership remain unchanged; used for disjoint local-shadow atlas tiles.
+    virtual bool SetActiveRenderRegion(const R4Viewport&, const R4ScissorRect&, std::string& error)
+    { error = "active render region is unsupported by this backend"; return false; }
+    // Opt-in draw attribution. Native backends restart the current pass with
+    // Load/Store attachments; callers must bind all draw state afterwards.
+    virtual bool SplitActivePassForDiagnostics(const std::string&, std::string&) { return true; }
     // Encodes a same-format, full-extent mip-0 copy between scene-owned 2D
     // textures. It is intentionally outside IR4Resources: copies are ordered
     // on the active frame command buffer between render passes.
     virtual bool CopyTexture2D(const std::shared_ptr<IR4Texture>& source,
         const std::shared_ptr<IR4Texture>& destination, std::string& error) = 0;
+    // Copies bytes once into a fresh range. Use 256-byte alignment for MSC
+    // constants and at least 16 bytes for vertex/instance streams.
+    virtual bool UploadFrameData(const void* data, std::size_t size,
+        std::size_t alignment, R4FrameBufferSlice& slice, std::string& error) = 0;
+    // Unsupported by default so other backends retain their CPU fallback.
+    // Contract for every implementation: a false return means that no compute
+    // skin output write was encoded. Validate/preallocate before the first
+    // dispatch; after dispatch starts, return true and let asynchronous GPU
+    // command-buffer failures follow the backend's existing fatal path.
+    virtual bool EncodeComputeSkinJobs(const std::vector<R4ComputeSkinJob>&,
+        std::string& error)
+    { error = "compute skinning is unsupported by this backend"; return false; }
     virtual bool SubmitFrame(std::string& error) = 0;
+    // A transient drawable loss at late submit discards the unsubmitted frame.
+    // Retry preserves device readiness; no history or serial was committed.
+    // Cleared by the next BeginFrame/SubmitFrame. Other failures stay fatal.
+    virtual bool LastFrameSubmitWasRetry() const { return false; }
+    // Discard an acquired, unsubmitted command buffer, including partial
+    // encoders. No GPU writes or temporal producer histories are committed.
+    virtual void DiscardFrame() = 0;
+    virtual bool ValidateSunShadowCascade(const R4SunShadowValidationDesc&, std::string&) = 0;
+    virtual bool ValidateLocalShadowBatch(const R4LocalShadowBatchValidationDesc&,
+        const std::shared_ptr<IR4Texture>&, const std::shared_ptr<IR4Texture>&,
+        const std::shared_ptr<IR4Texture>&, const std::shared_ptr<IR4Texture>&, std::string& error)
+    { error="local shadow batch validation is unsupported by this backend"; return false; }
+    virtual bool ValidateTemporalTextures(const R4TemporalTextureValidationDesc&, std::string&) = 0;
+    virtual bool ValidateStaticMotionVectors(const R4StaticMotionValidationDesc& descriptor,
+        std::string& error) = 0;
     virtual bool CopyLatestCompletedSaveThumbnail(R4SaveThumbnailSnapshot& snapshot) const = 0;
 
     // Scene-owned callbacks may issue bounded draw/bind commands into the
@@ -490,6 +680,14 @@ public:
         std::string& error) = 0;
     virtual bool SetStencilReference(std::uint32_t reference, std::string& error) = 0;
     virtual bool DrawIndexed(const R4IndexedDrawDesc& descriptor, std::string& error) = 0;
+    // Draws normally and optionally records a depth/stencil visibility count.
+    // Unsupported backends preserve output while reporting no receipt.
+    virtual bool DrawIndexedWithVisibility(const R4IndexedDrawDesc& descriptor,
+        const R4WholeLightVisibilitySample&, bool& resultEncoded, std::string& error)
+    {
+        resultEncoded = false;
+        return DrawIndexed(descriptor, error);
+    }
     virtual bool SubmitEngineWorldRenderables(
 		const std::vector<R4EngineWorldRenderable>& renderables,
 		std::uint32_t engineFrame,
@@ -527,6 +725,27 @@ public:
     // being encoded. Per-frame mutable resources must key off this value,
     // never an unrelated engine tick modulo the in-flight count.
     virtual std::uint32_t ActiveFrameContextIndex() const { return 0u; }
+    virtual const DisplayCapabilities& GetDisplayCapabilities() const = 0;
 };
 
 std::unique_ptr<IR4Backend> CreateMetalR4Backend();
+
+// E02 GPU ownership probe. The old-path mode intentionally returns false when
+// the pre-submit Shared-buffer overwrite is reproduced.
+bool RunMetalR4FrameUploadGpuProbe(bool oldPath, std::string& error);
+bool RunMetalR4ComputeSkinBackendGpuProbe(std::string& error);
+bool RunMetalR4WholeLightVisibilityGpuProbe(std::string& error);
+// Small offscreen regression for abort/replay ownership and bounded recovery.
+bool RunMetalR4PrivateUploadRecoveryProbe(std::string& error);
+
+// E05 production-MSC local-light rollover probe. The shader directory must
+// contain the converted R4 local-light bundle; image/report artifacts are
+// written below artifactDirectory.
+bool RunMetalR4LocalLightRolloverGpuProbe(
+    const std::string& shaderDirectory,
+    const std::string& artifactDirectory,
+    std::size_t lightCount,
+    std::string& error);
+
+// E04 CPU/GPU screen-space reprojection and motion vector accuracy probe (gate <= 0.5px).
+bool RunMetalR4ReprojectionProbe(std::string& error);

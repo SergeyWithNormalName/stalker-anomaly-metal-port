@@ -6,3 +6,4 @@ add_module(XRay.Sound.Target
   SoundRender_Target.h
   SoundRender_TargetA.h
 )
+

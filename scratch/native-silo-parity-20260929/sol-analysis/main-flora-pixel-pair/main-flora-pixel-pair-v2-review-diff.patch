@@ -1,0 +1,104 @@
+--- a/v1/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/v2/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -22,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cerrno>
+ #include <chrono>
+ #include <cctype>
+ #include <cmath>
+@@ -4426,25 +4427,28 @@
+     const char* frameText = std::getenv("XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_FRAME");
+     if (!directory || !*directory || !frameText || !prepare || !draw || !view.valid)
+         return true;
++    if (!*frameText || !std::all_of(frameText, frameText + std::strlen(frameText),
++            [](unsigned char ch) { return ch >= '0' && ch <= '9'; }))
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=frame reason=frame-must-be-decimal-uint32\n");
++        return true;
++    }
+     char* frameEnd = nullptr;
++    errno = 0;
+     const unsigned long requestedFrame = std::strtoul(frameText, &frameEnd, 10);
+-    if (!frameEnd || *frameEnd || requestedFrame != view.engineFrame)
++    if (errno == ERANGE || !frameEnd || *frameEnd || requestedFrame > UINT32_MAX ||
++        requestedFrame != view.engineFrame)
+         return true;
+     if (!prepare || !*prepare || !draw || !*draw)
+         return true;
+ 
+-    static std::mutex targetsMutex;
+-    static std::unordered_map<IR4Backend*, MainFloraPixelPairTargets> targetMap;
+-    MainFloraPixelPairTargets* targets = nullptr;
+-    {
+-        std::lock_guard<std::mutex> lock(targetsMutex);
+-        targets = &targetMap[&backend];
+-        if (!ensureMainFloraPixelPairTargets(backend, scene, *targets, error))
+-        {
+-            std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=targets error=%s\n", error.c_str());
+-            error.clear();
+-            return true;
+-        }
++    MainFloraPixelPairTargets localTargets;
++    MainFloraPixelPairTargets* targets = &localTargets;
++    if (!ensureMainFloraPixelPairTargets(backend, scene, *targets, error))
++    {
++        std::fprintf(stderr, "METAL_FLORA_MAIN_PIXEL_PAIR_REJECT phase=targets error=%s\n", error.c_str());
++        error.clear();
++        return true;
+     }
+     R4FloraViewState frozenFloraView;
+     if (!(*prepare)(view, world, frozenFloraView, error) || !frozenFloraView.valid)
+--- a/v1/src/Layers/xrRenderMetal/MetalR4MotionValidation.mm
++++ b/v2/src/Layers/xrRenderMetal/MetalR4MotionValidation.mm
+@@ -1070,7 +1070,7 @@
+     {
+         id<MTLBuffer> readback;
+         NSUInteger width = 0u, height = 0u, depthRow = 0u, stencilRow = 0u;
+-        NSUInteger depthPlane = 0u, stencilPlane = 0u, oneTextureBytes = 0u;
++        NSUInteger depthPlane = 0u, stencilPlane = 0u, oneTextureBytes = 0u, readbackByteCount = 0u;
+         std::uint32_t frame = 0u;
+         std::string phase, outputDirectory;
+         bool expectEqual = false, expectDifferent = false;
+@@ -1079,15 +1079,17 @@
+     context->readback = readback; context->width = width; context->height = height;
+     context->depthRow = depthRow; context->stencilRow = stencilRow;
+     context->depthPlane = depthPlane; context->stencilPlane = stencilPlane;
+-    context->oneTextureBytes = oneTextureBytes; context->frame = descriptor.engineFrame;
++    context->oneTextureBytes = oneTextureBytes; context->readbackByteCount = totalBytes;
++    context->frame = descriptor.engineFrame;
+     context->phase = descriptor.phase; context->outputDirectory = descriptor.outputDirectory;
+     context->expectEqual = descriptor.expectEqual; context->expectDifferent = descriptor.expectDifferent;
+     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+         const bool commandSucceeded = completed.status == MTLCommandBufferStatusCompleted;
+         const auto* bytes = static_cast<const std::uint8_t*>(context->readback.contents);
++        const bool readbackAvailable = bytes != nullptr;
+         std::uint64_t depthMismatchPixels = 0u, depthMismatchBytes = 0u;
+         std::uint64_t stencilMismatchPixels = 0u, stencilMismatchBytes = 0u;
+-        if (commandSucceeded && bytes)
++        if (commandSucceeded && readbackAvailable)
+         {
+             for (NSUInteger y = 0u; y < context->height; ++y)
+             {
+@@ -1109,7 +1111,8 @@
+             }
+         }
+         const bool hasDifference = depthMismatchBytes != 0u || stencilMismatchBytes != 0u;
+-        const bool passed = commandSucceeded && (!context->expectEqual || !hasDifference) &&
++        const bool passed = commandSucceeded && readbackAvailable &&
++            (!context->expectEqual || !hasDifference) &&
+             (!context->expectDifferent || hasDifference);
+         const std::filesystem::path path = std::filesystem::path(context->outputDirectory) /
+             ("r4_depth_stencil_pair_" + safeFilenamePart(context->phase) + "_frame_" +
+@@ -1122,6 +1125,10 @@
+         {
+             report << "{\n  \"schema\": \"r4-depth-stencil-pair/v1\",\n"
+                 << "  \"frame\": " << context->frame << ",\n"
++                << "  \"width\": " << context->width << ",\n"
++                << "  \"height\": " << context->height << ",\n"
++                << "  \"readback_byte_count\": " << context->readbackByteCount << ",\n"
++                << "  \"readback_available\": " << (readbackAvailable ? "true" : "false") << ",\n"
+                 << "  \"phase\": \"" << jsonEscape(context->phase) << "\",\n"
+                 << "  \"command_completed\": " << (commandSucceeded ? "true" : "false") << ",\n"
+                 << "  \"expect_equal\": " << (context->expectEqual ? "true" : "false") << ",\n"

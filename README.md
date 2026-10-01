@@ -1,3 +1,5 @@
+> Fresh Direct Metal source snapshot: see [CLOUD_HANDOFF.md](CLOUD_HANDOFF.md) for the frozen baseline, experiment outcomes, exclusions and pending Mac gates.
+
 # Unofficial STALKER Anomaly Native Metal Port
 
 Experimental source-only work on an Apple-platform / Metal backend for the

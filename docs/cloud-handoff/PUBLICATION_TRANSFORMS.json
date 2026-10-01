@@ -1,0 +1,206 @@
+[
+  {
+    "path": "DIRECT_METAL_RELEASE_PLAN.md",
+    "frozen_sha256": "5e09f4b8f6880b9c6051f2ac90e552d95a949f76115bd8e17bd6e0bba2ee2b18",
+    "published_sha256": "d71241cf23ada1f7470393607c5fa1be1efc86c57482870873a6c9c61491d2d2",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "DIRECT_METAL_REMAINING_WORK.md",
+    "frozen_sha256": "6481de6d9e51e74d9aefc04dfd271ac3230e3a51f5aa91eb80ac86be46b0fc62",
+    "published_sha256": "ba4ec0acfa5bc3eeaaa7a06f8b446ae2a8689bf5a260f0d3d2c770e55ad62e36",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/diagnostics/2026-09-27-cordon-watchdog-evidence.md",
+    "frozen_sha256": "1201565ab488a4c2f968d130c00179cabf17d1c9dca0e30e42df0f84b8bf15ca",
+    "published_sha256": "f1fe9c33f9d3c17d9444ec54d8ecdb51a5ddb2727b34e2f08c14683d69e597c9",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/direct-metal-release/CPU_HOM_LIGHT_DIAGNOSTIC_2026-09-28.md",
+    "frozen_sha256": "53fb880741f282935ad9acb63fe46b6e4e2d762db26d9d7dcb4a26af87a7dbf9",
+    "published_sha256": "31deead8edb779a7c9b890a0e352a5fd3dbdd0b03e40f17172630bc552eb4568",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/direct-metal-release/E02_E06_AUDIT_2026-09-27.md",
+    "frozen_sha256": "7f392ebe8b81052e02847617dda7633b950ecded64ffcdd2cafe7decf84ac899",
+    "published_sha256": "ae3f5fca35132bed94f77dd3604e30a35d3f96be63d25be8d1d1a5db26077378",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/direct-metal-release/GAMEPLAY_RESCUE_HANDOFF_2026-09-29.md",
+    "frozen_sha256": "c9b5de906478c06bc59f95a9c57f69995377407c24f7f99fc2aa7f50a7086bc5",
+    "published_sha256": "e794ea663059a2ebcf4b523c1d1550d63b6c1f90b36aad33e312d6ac8c8c8400",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/direct-metal-release/WINDOWS_SILO_METAL_FRAME_BUDGET_2026-09-29.md",
+    "frozen_sha256": "0c07d5374e52a891a34422f534831f6b2cf01e0220c40b5a54398458e9164ec3",
+    "published_sha256": "09fafae929a960a0656364a20a75145ecab08aaffb1b613a02b888caa556e74b",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "docs/macos-app-bundle.md",
+    "frozen_sha256": "b32f20bf6142b74704b3d0a792a24eddd33c5e0b2f6f54dda1735faeca1c05d1",
+    "published_sha256": "7d7b530df98226dfac248ccfe6497de3647359ff97b8a6c5eb6d9199f064112b",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "run-gamma-metal.command",
+    "frozen_sha256": "0a06091e9a0e753bb96a51f9f5adeefe75552a05831f909e889c25b4eb9fb21a",
+    "published_sha256": "cfceef75c9ad494e0213dab80035d5cbadbd4a707681c1712cc1bf77e71d6bdc",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/active-occlusion-stage/v9r1-offline-parser-review/v9r1-offline-result.md",
+    "frozen_sha256": "91b53786152fdbdcffb56e180d4116b1361b41d43a18a5a2936c7a0bfcccc621",
+    "published_sha256": "54d2ae2f29f2864eda7bc02a07526f13b66ac5f9c9189099bd39db3d8b2ef967",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/change-team-crash-triage.md",
+    "frozen_sha256": "84b97a33d62f4c0bc55dc387f7d8ba922d1aff212a35c2b55e71a07124f97141",
+    "published_sha256": "6dbeab1a67c59b7b244b21c75a56350bc9eb35767d4f947d062c05036323a1f0",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/runs/v7-motion-combined-color-01/output/motion-color-result.md",
+    "frozen_sha256": "148d1ef50fe98f153c11f1ef278347d09fcfa5372f35a736721ca3f1338e7943",
+    "published_sha256": "a424a47c8842d93864ea94bd4adf929a2bff4e17b31a11d073683d8f7ff0253e",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/runs/v7-performance-ab-result.md",
+    "frozen_sha256": "6bd06ee56b23c55ccfc13946c2ac038ec1bd7a9024f3b11c7133717538025339",
+    "published_sha256": "7b4c501292e4e7f0be337c09303dca3224cfa3d1380145dad71bf52a59874bb8",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/runs/v7-profile-combined-01/output/diagnostic-profile-result.md",
+    "frozen_sha256": "ca071e6b4e50190050f59dcf52cad285a994c98a5a2e53dd69a53e49cdfa9987",
+    "published_sha256": "9d50dbbcbc6f89d7e022e96d6bd544221f880ca81cba80ef93ca5017c34cfc5b",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/validation-plan.md",
+    "frozen_sha256": "3ebeb4de2b6bdfe82a8744ccba08e37299117d4498725d4290ebede5bc2d767b",
+    "published_sha256": "9c7fd5678ad63f12069681c7b5fd78a11a5056eec1a161149303b60ad4f2f1e5",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/gameplay-rescue-20260929/whole-light-visibility-stage/active-geometry-occlusion-feasibility.md",
+    "frozen_sha256": "9173ae69c11f55b4595233f0ee83bff38242cdcefbfba10a9b066aa458285d35",
+    "published_sha256": "ae46bc2dc1b74ae6583d377eff9bcf089b2dec1584ce6972d01e280cd468ad56",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/luna-harness/compatibility/2026-09-29-empty-guard-patch-feasibility.md",
+    "frozen_sha256": "2a071ee636da2732f94540f9e1a6cf04452c21dc7b83a4b2e9d0d06e048b5f2b",
+    "published_sha256": "3d1cda1fb96c53912b7506875441273c804f6ff66ddec379d8df10da3f984b86",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/luna-harness/compatibility/2026-09-29-private-guard-master-runner-minimum.md",
+    "frozen_sha256": "2f33251fec6217e1b05c8ba5279cf96ba80135a0977dda92c5c2ad013d08964a",
+    "published_sha256": "c063d6028c36937f7a5591641822c26218d4cf7235dd791c1882d45ca32697da",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/PROBE_COMMANDS.md",
+    "frozen_sha256": "7f78c4ae5647d537e31887b5fe38964ee78b5fc726387dccf280b5452c3dfe7b",
+    "published_sha256": "97874240f856e29fadf1f9d6673bebd45ea4e2891cee42e6986788d243207b4b",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/flora-shadow-order/FLORA_SHADOW_ORDER_REVIEW.md",
+    "frozen_sha256": "4f640778f5e38f37566340971f3f201237a3227e1b70b598a087c56edea82445",
+    "published_sha256": "373403b519704e0f6edb10fb13328c3ac49fb178767f3da78f1cc4a1d8cbed62",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/mo2-reference-preparation/AXR_MAIN_SOURCE_REVIEW_V2.md",
+    "frozen_sha256": "8f6bb4988398214dc3f7d80f9d353ba6eb4f2807de5d65a6ed8ea08fb93bb572",
+    "published_sha256": "61ce9c1408b2f764377799c15526e4872592598ee88f3ef5aac501fe1115c143",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/mo2-reference-preparation/CONTROLLED_SAVE_RUNNER_V3_REVIEW.md",
+    "frozen_sha256": "f7db571e919105e04f301beb7e869aa931c33da8c35df236d57dc752ea4e215e",
+    "published_sha256": "0b0945520686e4f5d7db19b32971e89fe5a1acfb148e4f08e65c0fa8fe8ec970",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/mo2-reference-preparation/PLAN.md",
+    "frozen_sha256": "1bcc279bd31469530a93e960a5254f38e9b2d97fe98230ba5fb9b72c258886eb",
+    "published_sha256": "6bbb807f7a8d21749695d24d710dd58f27dd8ad611a73aa9ab04a633ad5ab240",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/mo2-reference-preparation/clone-path-length-audit.md",
+    "frozen_sha256": "1ccfc861ed5b486015e43b8e856e26e3b61c74e319f604ff2e0fe0a703918330",
+    "published_sha256": "28d6ec4d840cce90f50146c47cc9bac6bb09a330bdce435a8c90a8ad69be1b58",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/mo2-reference-preparation/preflight-path-audit/REPORT.md",
+    "frozen_sha256": "8ec4e56a45e1e24e3f4b2491d73070fb9ff7bc40102a2b96a8fb90ca5f22289a",
+    "published_sha256": "7d7a30bd29c29b59f8e2b9f828f907962b67271aeaf8d2af95b0632baefa47e8",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/omni-face-parity-audit/REVIEW.md",
+    "frozen_sha256": "124852703192ebc42599a8985c016a113d12f89951d222136cdde6266f887c46",
+    "published_sha256": "a804cf2c48abd07ee275296ad175281506c54a3fbfb6d5a4637286051ae04726",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/parent-sphere-admission/REVIEW.md",
+    "frozen_sha256": "ad987932a049a024783b42b0e6ab3b3403bbbef807f16fedc44befb294a9c7c7",
+    "published_sha256": "7e8f74b8883bab5fec93f9a5242e8d2a98e7cc6a06b22809e52d2b7d12bce032",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/r1-static-policy/REVIEW.md",
+    "frozen_sha256": "c65f2787027738c9528fd936668be413c138acafa27a772ba6ea8abef77b8a9f",
+    "published_sha256": "c5a7a74f97b1f312374ffa33d92cadbcd1513731dffd2f935e232d731564e44e",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/ssa-source-rule/wind-bounds/texture-receipt.md",
+    "frozen_sha256": "c356a51f0e324a2fa19ce3ab201bd427e8dc72f2d9bf9667f902c3108c41fa0d",
+    "published_sha256": "7a2ffdb4b93d4b697c7df3478a4eff19307ff8cf051997f17237f39e5fa5e9bd",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/static-shadow-adjacent-pso/REVIEW.md",
+    "frozen_sha256": "51940445857787130a1a638b743e97bc5f7dd73766b95f6f22b42c738cb8aeda",
+    "published_sha256": "1742c0a78a8be6cdfaa2e4d7ca811fec4da22921db5baa36fe601fa7fa681203",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "scratch/native-silo-parity-20260929/sol-analysis/windows-ssa-controls/avx-reference-screen/RESULT.md",
+    "frozen_sha256": "f64aca698e5b4210e26fe308975dee1f1520c9ac55590deb2e469fdfd6608cea",
+    "published_sha256": "cf2cec1cdd5effc1042f275390ea71b04b1c0b60ce2cfb51436db1c2f6f4b71c",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "script/build_and_run.sh",
+    "frozen_sha256": "76f23ca4c26e9cb0fa19d1ce38b8d8517738f3a1c292815a17335ef75c051441",
+    "published_sha256": "10388972b5652fdc5d647580fa498a518a3316de1fc1e9ae6cc7974ca677a112",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "script/e00_compile_scope_dxbc.sh",
+    "frozen_sha256": "59998d8a5ec391934b9febf416c1a90b8b243ac0ab7d76090bfcaffc1d620673",
+    "published_sha256": "f2e46c077a8551ca4ee3cbe1e0f76b49def56f8959b46fad1a8d3f72869f0da8",
+    "reason": "private path redaction or portable launcher defaults"
+  },
+  {
+    "path": "script/test_analyze_metal_light_hom.py",
+    "frozen_sha256": "bfce023507176e30a8598216d519b55508a16df7a67a86d793417862b277f6cc",
+    "published_sha256": "8388700dad72ef2e3cc7a103755c1e9bcf5d2105b88e10b4b0c2a0332660c515",
+    "reason": "private path redaction or portable launcher defaults"
+  }
+]

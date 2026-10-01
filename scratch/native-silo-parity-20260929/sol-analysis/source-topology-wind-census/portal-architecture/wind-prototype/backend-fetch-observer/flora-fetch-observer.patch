@@ -1,0 +1,516 @@
+--- base-MetalR4Backend.mm
++++ MetalR4Backend.fetch-observer.draft.mm
+@@ -3,6 +3,7 @@
+ #import <AppKit/AppKit.h>
+ #include <SDL.h>
+ #include <SDL_metal.h>
++#include <CommonCrypto/CommonDigest.h>
+ 
+ extern "C" void MacOS_ActivateAppWindow(void* sdlWindow)
+ {
+@@ -860,6 +861,30 @@
+     for (std::uint8_t mask : descriptor.colorWriteMasks)
+         key << "|w" << static_cast<unsigned>(mask);
+     return key.str();
++}
++
++std::string floraFetchPointerUid(const void* pointer)
++{
++    std::ostringstream value;
++    value << "0x" << std::hex << reinterpret_cast<std::uintptr_t>(pointer);
++    return value.str();
++}
++
++bool floraFetchSha256(const void* bytes, const std::size_t size, std::string& output)
++{
++    if (!bytes || size == 0u || size > std::numeric_limits<CC_LONG>::max())
++        return false;
++    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
++    if (!CC_SHA256(bytes, static_cast<CC_LONG>(size), digest.data()))
++        return false;
++    static constexpr char Hex[] = "0123456789abcdef";
++    output.clear(); output.reserve(digest.size() * 2u);
++    for (const unsigned char byte : digest)
++    {
++        output.push_back(Hex[byte >> 4u]);
++        output.push_back(Hex[byte & 0x0fu]);
++    }
++    return true;
+ }
+ 
+ class MetalBuffer final : public IR4Buffer
+@@ -877,6 +902,7 @@
+     std::size_t Size() const override { return m_descriptor.size; }
+     std::size_t AllocationSize() const override { return m_allocationSize; }
+     R4ResourceStorage Storage() const override { return m_descriptor.storage; }
++    R4BufferUsage Usage() const { return m_descriptor.usage; }
+     id<MTLBuffer> Native() const { return m_version->buffer; }
+     bool IsFrameUpload() const { return m_frameUpload; }
+     std::shared_ptr<void> VersionHandle() const { return m_version; }
+@@ -1105,9 +1131,16 @@
+         id<MTLDepthStencilState> depthState,
+         bool usesMsc,
+         R4CullMode cullMode,
+-        R4Winding frontFace)
++        R4Winding frontFace,
++        const R4GraphicsPipelineDesc& sourceDescriptor,
++        const bool retainObserverMetadata)
+         : m_pipeline(pipeline), m_depthState(depthState), m_usesMsc(usesMsc),
+-          m_cullMode(cullMode), m_frontFace(frontFace)
++          m_cullMode(cullMode), m_frontFace(frontFace),
++          m_shaderKey(retainObserverMetadata && sourceDescriptor.shaderKey ? sourceDescriptor.shaderKey : ""),
++          m_label(retainObserverMetadata && sourceDescriptor.label ? sourceDescriptor.label : ""),
++          m_vertexMetallibPath(retainObserverMetadata && sourceDescriptor.vertexMetallibPath ? sourceDescriptor.vertexMetallibPath : ""),
++          m_vertexAttributes(retainObserverMetadata ? sourceDescriptor.vertexAttributes : std::vector<R4VertexAttributeDesc>{}),
++          m_vertexLayouts(retainObserverMetadata ? sourceDescriptor.vertexLayouts : std::vector<R4VertexBufferLayoutDesc>{})
+     {
+     }
+ 
+@@ -1116,6 +1149,31 @@
+     bool UsesMsc() const { return m_usesMsc; }
+     R4CullMode CullMode() const { return m_cullMode; }
+     R4Winding FrontFace() const { return m_frontFace; }
++    bool IsFloraMainGBuffer() const
++    {
++        return m_usesMsc &&
++            ((m_shaderKey == "r4-flora-leaf-wave-msc-v1" && m_label == "R4 flora leaf_wave MSC G-buffer") ||
++             (m_shaderKey == "r4-flora-trunk-wave-msc-v1" && m_label == "R4 flora trunk_wave MSC G-buffer"));
++    }
++    bool HasExpectedFloraPositionFetch() const
++    {
++        const auto attribute = std::find_if(m_vertexAttributes.begin(), m_vertexAttributes.end(),
++            [](const R4VertexAttributeDesc& item) {
++                return item.attributeIndex == 11u && item.bufferIndex == 6u && item.offset == 0u &&
++                    item.format == R4VertexFormat::Float4;
++            });
++        const auto layout = std::find_if(m_vertexLayouts.begin(), m_vertexLayouts.end(),
++            [](const R4VertexBufferLayoutDesc& item) { return item.bufferIndex == 6u && item.stride == 72u; });
++        return attribute != m_vertexAttributes.end() && layout != m_vertexLayouts.end();
++    }
++    const std::string& ShaderKey() const { return m_shaderKey; }
++    const std::string& Label() const { return m_label; }
++    const std::string& VertexMetallibPath() const { return m_vertexMetallibPath; }
++    std::string NativeLabel() const
++    {
++        NSString* label = m_pipeline.label;
++        return label.UTF8String ? std::string(label.UTF8String) : std::string();
++    }
+ 
+ private:
+     id<MTLRenderPipelineState> m_pipeline;
+@@ -1123,6 +1181,11 @@
+     bool m_usesMsc;
+     R4CullMode m_cullMode;
+     R4Winding m_frontFace;
++    std::string m_shaderKey;
++    std::string m_label;
++    std::string m_vertexMetallibPath;
++    std::vector<R4VertexAttributeDesc> m_vertexAttributes;
++    std::vector<R4VertexBufferLayoutDesc> m_vertexLayouts;
+ };
+ 
+ class MetalR4Backend final : public IR4Backend, public IR4Resources
+@@ -1477,9 +1540,16 @@
+     void SetE01FrameTiming(const std::uint32_t engineFrame,
+         const std::uint32_t cameraFrame, const double sceneMs) override
+     {
+-        if (!m_e01Frames || !m_frameActive)
++        if (!m_frameActive)
+             return;
+         FrameContext& context = m_frames[m_activeFrameIndex];
++        if (m_floraFetchObserverEnabled)
++        {
++            context.e01EngineFrame = engineFrame;
++            context.e01CameraFrame = cameraFrame;
++        }
++        if (!m_e01Frames)
++            return;
+         context.e01EngineFrame = engineFrame;
+         context.e01CameraFrame = cameraFrame;
+         context.e01SceneMs = sceneMs;
+@@ -1740,6 +1810,17 @@
+         context.activePass = pass;
+         context.activePassLabel = pass.label ? pass.label : "R4 Metal render pass";
+         context.activePass.label = nullptr;
++        if (m_floraFetchObserverEnabled && !m_floraFetchObserverConsumed &&
++            !context.floraFetchObserverAttempted && context.e01EngineFrame == 700u &&
++            context.activePassLabel == "R4 engine scene G-buffer")
++        {
++            context.floraFetchObserverPass = true;
++            context.floraFetchObserverIncomplete = false;
++            context.floraFetchVertexBindings = {};
++            context.floraFetchPipeline.reset();
++            context.floraFetchVertexHashes.clear();
++            context.floraFetchDrawRecords.clear();
++        }
+         return true;
+     }
+ 
+@@ -1751,6 +1832,8 @@
+             return false;
+         }
+         FrameContext& context = m_frames[m_activeFrameIndex];
++        if (context.floraFetchObserverPass && context.e01EngineFrame == 700u)
++            context.floraFetchObserverIncomplete = true;
+         R4RenderPassDesc pass = context.activePass;
+         // Original clears ran once. Preserve every attachment across splits.
+         pass.drawableColor.loadAction = R4LoadAction::Load;
+@@ -1766,6 +1849,9 @@
+         pass.depthStencilAttachment.stencilStoreAction = R4StoreAction::Store;
+         [context.encoder popDebugGroup];
+         [context.encoder endEncoding];
++        if (context.floraFetchObserverPass && context.e01EngineFrame == 700u &&
++            (context.activePassLabel == "R4 engine scene G-buffer" || context.floraFetchObserverIncomplete))
++            writeFloraFetchReceipt(context, context.floraFetchObserverIncomplete ? "incomplete" : "complete");
+         if (context.e08CurrentPassProfiled)
+         {
+             context.e08PassCpuRecords.back() = {
+@@ -1836,6 +1922,9 @@
+ 
+         [context.encoder popDebugGroup];
+         [context.encoder endEncoding];
++        if (context.floraFetchObserverPass && context.e01EngineFrame == 700u &&
++            context.activePassLabel == "R4 engine scene G-buffer")
++            writeFloraFetchReceipt(context, "complete");
+         if (context.e08CurrentPassProfiled)
+         {
+             context.e08PassCpuRecords.back() = {
+@@ -2780,7 +2869,8 @@
+         }
+ 
+         std::shared_ptr<IR4GraphicsPipeline> pipeline = std::make_shared<MetalGraphicsPipeline>(
+-            nativePipeline, depthState, usesMsc, descriptor.cullMode, descriptor.frontFace);
++            nativePipeline, depthState, usesMsc, descriptor.cullMode, descriptor.frontFace,
++            descriptor, m_floraFetchObserverEnabled);
+         m_pipelineCache.emplace(key, pipeline);
+         return pipeline;
+     }
+@@ -2805,6 +2895,8 @@
+         [context->encoder setCullMode:metalCullMode(metalPipeline->CullMode())];
+         [context->encoder setFrontFacingWinding:metalWinding(metalPipeline->FrontFace())];
+         context->mscPipelineBound = metalPipeline->UsesMsc();
++        if (m_floraFetchObserverEnabled && context->floraFetchObserverPass && context->e01EngineFrame == 700u)
++            context->floraFetchPipeline = metalPipeline->IsFloraMainGBuffer() ? metalPipeline : nullptr;
+         retainFrameResource(*context, pipeline);
+         if (m_e01Frames)
+             ++context->e01PsoBinds;
+@@ -2826,9 +2918,26 @@
+             return false;
+         }
+         E08ScopedCpu e08Cpu(context->e08Profile, context->e08CpuMs[4]);
+-        [context->encoder setVertexBuffer:metalBuffer->Native() offset:offset atIndex:index];
++        // Capture and bind the same immutable native version; offset and slot
++        // are the original call values and remain unchanged.
++        const id<MTLBuffer> native = metalBuffer->Native();
++        const std::shared_ptr<void> version = metalBuffer->VersionHandle();
++        [context->encoder setVertexBuffer:native offset:offset atIndex:index];
+         retainFrameResource(*context, buffer);
+-        retainFrameResource(*context, metalBuffer->VersionHandle());
++        retainFrameResource(*context, version);
++        if (m_floraFetchObserverEnabled && context->floraFetchObserverPass &&
++            context->e01EngineFrame == 700u && index == 6u)
++        {
++            auto& observed = context->floraFetchVertexBindings[index];
++            observed.native = native;
++            observed.version = version;
++            observed.resourceUid = metalBuffer.get();
++            observed.size = metalBuffer->Size();
++            observed.offset = offset;
++            observed.storage = metalBuffer->Storage();
++            observed.usage = metalBuffer->Usage();
++            observed.frameUpload = metalBuffer->IsFrameUpload();
++        }
+         return true;
+     }
+ 
+@@ -3099,6 +3208,10 @@
+             return false;
+         }
+         E08ScopedCpu e08Cpu(context->e08Profile, context->e08CpuMs[5]);
++        // Snapshot the exact index-buffer native version passed to the draw.
++        // This does not change any draw arguments or encoder state.
++        const id<MTLBuffer> indexNative = indexBuffer->Native();
++        const std::shared_ptr<void> indexVersion = indexBuffer->VersionHandle();
+         const MTLIndexType indexType = descriptor.indexType == R4IndexType::UInt16 ?
+             MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+ #if XRAY_METAL_HAS_MSC_RUNTIME
+@@ -3109,7 +3222,7 @@
+                 MTLPrimitiveTypeTriangle,
+                 descriptor.indexCount,
+                 indexType,
+-                indexBuffer->Native(),
++                indexNative,
+                 descriptor.indexBufferOffset,
+                 descriptor.instanceCount,
+                 descriptor.baseVertex,
+@@ -3121,14 +3234,15 @@
+             [context->encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                         indexCount:descriptor.indexCount
+                                          indexType:indexType
+-                                       indexBuffer:indexBuffer->Native()
++                                       indexBuffer:indexNative
+                                  indexBufferOffset:descriptor.indexBufferOffset
+                                      instanceCount:descriptor.instanceCount
+                                         baseVertex:descriptor.baseVertex
+                                       baseInstance:0];
+         }
+         retainFrameResource(*context, descriptor.indexBuffer);
+-        retainFrameResource(*context, indexBuffer->VersionHandle());
++        retainFrameResource(*context, indexVersion);
++        observeFloraMainDraw(*context, descriptor, indexBuffer, indexNative, indexVersion);
+         if (m_e01Frames || context->e08Profile)
+             ++context->e01IndexedDraws;
+         return true;
+@@ -4400,6 +4514,18 @@
+         std::function<bool(id<MTLCommandBuffer>, std::string&)> encode;
+     };
+ 
++    struct FloraFetchVertexBinding
++    {
++        id<MTLBuffer> native = nil;
++        std::shared_ptr<void> version;
++        const void* resourceUid = nullptr;
++        std::size_t size = 0u;
++        std::size_t offset = 0u;
++        R4ResourceStorage storage = R4ResourceStorage::Private;
++        R4BufferUsage usage = R4BufferUsage::Generic;
++        bool frameUpload = false;
++    };
++
+     static void prunePrivateUploads(std::vector<PrivateUploadOperation>& uploads)
+     {
+         struct Key
+@@ -4483,8 +4609,185 @@
+         std::uint32_t e01TextureAllocations = 0;
+         std::uint32_t e01IndexedDraws = 0;
+         std::uint32_t e01PsoBinds = 0;
++        bool floraFetchObserverPass = false;
++        bool floraFetchObserverAttempted = false;
++        bool floraFetchObserverIncomplete = false;
++        std::array<FloraFetchVertexBinding, 31> floraFetchVertexBindings{};
++        std::shared_ptr<MetalGraphicsPipeline> floraFetchPipeline;
++        std::unordered_map<const void*, std::string> floraFetchVertexHashes;
++        std::vector<std::string> floraFetchDrawRecords;
+     };
++
++    static void clearFloraFetchObserverState(FrameContext& context)
++    {
++        context.floraFetchObserverPass = false;
++        context.floraFetchVertexBindings = {};
++        context.floraFetchPipeline.reset();
++        context.floraFetchVertexHashes.clear();
++        context.floraFetchDrawRecords.clear();
++    }
+ 
++    void writeFloraFetchReceipt(FrameContext& context, const char* completion)
++    {
++        if (!m_floraFetchObserverEnabled || m_floraFetchObserverPath.empty() ||
++            context.floraFetchObserverAttempted)
++            return;
++        context.floraFetchObserverAttempted = true;
++        context.floraFetchObserverPass = false;
++        const std::string temporary = m_floraFetchObserverPath + ".tmp";
++        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
++        if (!output)
++        {
++            std::fprintf(stderr, "METAL_FLORA_FETCH_OBSERVER unavailable=file_open_failed\n");
++            m_floraFetchObserverConsumed = true;
++            clearFloraFetchObserverState(context);
++            return;
++        }
++        output << "schema\tflora-main-vertex-fetch-observer/v1\n"
++            << "engine_frame\t" << context.e01EngineFrame << "\n"
++            << "pass\tR4 engine scene G-buffer\n"
++            << "pass_complete\t" << (completion && std::strcmp(completion, "complete") == 0 ? 1 : 0) << "\n"
++            << "draw_records\t" << context.floraFetchDrawRecords.size() << "\n"
++            << "resource_uid_scope\tprocess-local pointer identity; hash binds content to this run\n"
++            << "draw_fields\tordinal visual_id_availability pso_uid pso_label pso_native_label pso_native_label_match shader_key vertex_metallib_path position_descriptor vertex_buffer_object_uid vertex_native_uid vertex_version_uid vertex_native_length vertex_size vertex_binding_offset vertex_contents_sha256 index_buffer_object_uid index_native_uid index_version_uid index_native_length index_contents_sha256 index_offset index_count index_type base_vertex instance_count checked_indices w_one_count w_check reason\n";
++        for (const std::string& record : context.floraFetchDrawRecords)
++            output << record << '\n';
++        output.close();
++        if (!output || std::rename(temporary.c_str(), m_floraFetchObserverPath.c_str()) != 0)
++        {
++            std::remove(temporary.c_str());
++            std::fprintf(stderr, "METAL_FLORA_FETCH_OBSERVER unavailable=file_write_or_rename_failed\n");
++        }
++        else
++            std::fprintf(stderr, "METAL_FLORA_FETCH_OBSERVER frame=%u records=%zu complete=%u path=%s\n",
++                context.e01EngineFrame, context.floraFetchDrawRecords.size(),
++                completion && std::strcmp(completion, "complete") == 0 ? 1u : 0u,
++                m_floraFetchObserverPath.c_str());
++        m_floraFetchObserverConsumed = true;
++        clearFloraFetchObserverState(context);
++    }
++
++    void observeFloraMainDraw(FrameContext& context, const R4IndexedDrawDesc& descriptor,
++        const std::shared_ptr<MetalBuffer>& indexBuffer, id<MTLBuffer> indexNative,
++        const std::shared_ptr<void>& indexVersion)
++    {
++        if (!m_floraFetchObserverEnabled || !context.floraFetchObserverPass ||
++            context.e01EngineFrame != 700u || !context.floraFetchPipeline ||
++            !context.floraFetchPipeline->IsFloraMainGBuffer() ||
++            context.activePassLabel != "R4 engine scene G-buffer")
++            return;
++
++        const std::size_t ordinal = context.floraFetchDrawRecords.size();
++        const FloraFetchVertexBinding& vertex = context.floraFetchVertexBindings[6u];
++        const std::string nativePsoLabel = context.floraFetchPipeline->NativeLabel();
++        const bool nativePsoLabelOk = nativePsoLabel == context.floraFetchPipeline->Label();
++        const std::size_t indexSize = descriptor.indexType == R4IndexType::UInt16 ? 2u : 4u;
++        const std::size_t indexBytes = static_cast<std::size_t>(descriptor.indexCount) * indexSize;
++        std::string vertexHash, indexHash;
++        std::string reason;
++        bool descriptorOk = context.floraFetchPipeline->HasExpectedFloraPositionFetch();
++        bool vertexOk = vertex.native && vertex.version && vertex.storage == R4ResourceStorage::Shared &&
++            vertex.usage == R4BufferUsage::Vertex && !vertex.frameUpload &&
++            vertex.native.storageMode == MTLStorageModeShared && vertex.native.contents &&
++            vertex.offset <= vertex.size &&
++            vertex.size <= vertex.native.length && vertex.offset <= vertex.native.length;
++        bool indexOk = indexNative && indexVersion && indexBuffer &&
++            indexBuffer->Storage() == R4ResourceStorage::Shared && !indexBuffer->IsFrameUpload() &&
++            indexBuffer->Usage() == R4BufferUsage::Index &&
++            indexNative.storageMode == MTLStorageModeShared && indexNative.contents &&
++            descriptor.indexBufferOffset <= indexBuffer->Size() &&
++            indexBytes <= indexBuffer->Size() - descriptor.indexBufferOffset &&
++            descriptor.indexBufferOffset <= indexNative.length && indexBytes <= indexNative.length - descriptor.indexBufferOffset;
++        if (descriptor.instanceCount != 1u && reason.empty())
++            reason = "unexpected_instance_count";
++
++        const void* vertexVersionUid = vertex.version.get();
++        if (vertexOk)
++        {
++            const auto found = context.floraFetchVertexHashes.find(vertexVersionUid);
++            if (found != context.floraFetchVertexHashes.end())
++                vertexHash = found->second;
++            else if (floraFetchSha256(vertex.native.contents, vertex.size, vertexHash))
++                context.floraFetchVertexHashes.emplace(vertexVersionUid, vertexHash);
++            else
++                vertexOk = false;
++        }
++        if (indexOk && !floraFetchSha256(
++                static_cast<const std::uint8_t*>(indexNative.contents) + descriptor.indexBufferOffset,
++                indexBytes, indexHash))
++            indexOk = false;
++
++        std::uint32_t checked = 0u, wOne = 0u, wMismatch = 0u;
++        if (descriptorOk && vertexOk && indexOk && descriptor.instanceCount == 1u)
++        {
++            const auto* indexData = static_cast<const std::uint8_t*>(indexNative.contents) + descriptor.indexBufferOffset;
++            const auto* vertexData = static_cast<const std::uint8_t*>(vertex.native.contents);
++            for (std::uint32_t i = 0u; i < descriptor.indexCount; ++i)
++            {
++                std::uint32_t rawIndex = 0u;
++                if (descriptor.indexType == R4IndexType::UInt16)
++                {
++                    std::uint16_t small = 0u;
++                    std::memcpy(&small, indexData + static_cast<std::size_t>(i) * indexSize, sizeof(small));
++                    rawIndex = small;
++                }
++                else
++                    std::memcpy(&rawIndex, indexData + static_cast<std::size_t>(i) * indexSize, sizeof(rawIndex));
++                const std::int64_t vertexIndex = static_cast<std::int64_t>(rawIndex) + descriptor.baseVertex;
++                if (vertexIndex < 0 || vertex.offset > std::numeric_limits<std::size_t>::max() - 16u ||
++                    static_cast<std::uint64_t>(vertexIndex) >
++                    (std::numeric_limits<std::size_t>::max() - vertex.offset - 16u) / 72u)
++                {
++                    reason = "indexed_vertex_range_overflow";
++                    break;
++                }
++                const std::size_t positionOffset = vertex.offset + static_cast<std::size_t>(vertexIndex) * 72u;
++                if (positionOffset > vertex.size || 16u > vertex.size - positionOffset ||
++                    positionOffset > vertex.native.length || 16u > vertex.native.length - positionOffset)
++                {
++                    reason = "indexed_vertex_out_of_buffer_range";
++                    break;
++                }
++                std::uint32_t wBits = 0u;
++                std::memcpy(&wBits, vertexData + positionOffset + 12u, sizeof(wBits));
++                ++checked;
++                if (wBits == 0x3f800000u) ++wOne; else ++wMismatch;
++            }
++        }
++        if (wMismatch != 0u)
++            reason = "position_w_not_exact_one";
++        if (reason.empty())
++        {
++            if (!nativePsoLabelOk) reason = "native_pso_label_mismatch_or_unavailable";
++            else if (!descriptorOk) reason = "main_pipeline_vertex_descriptor_mismatch";
++            else if (!vertexOk) reason = "vertex_buffer_not_readable_shared_immutable_or_hashable";
++            else if (!indexOk) reason = "index_buffer_not_readable_shared_immutable_or_hashable";
++            else if (checked != descriptor.indexCount) reason = "indexed_vertex_check_incomplete";
++            else if (wMismatch != 0u) reason = "position_w_not_exact_one";
++            else reason = "ok";
++        }
++        const bool wPass = reason == "ok";
++        std::ostringstream record;
++        record << ordinal << "\tno_visual_id_in_backend_draw_contract\t"
++            << floraFetchPointerUid((__bridge const void*)context.floraFetchPipeline->Native())
++            << '\t' << context.floraFetchPipeline->Label() << '\t' << nativePsoLabel << '\t'
++            << (nativePsoLabelOk ? 1 : 0) << '\t' << context.floraFetchPipeline->ShaderKey()
++            << '\t' << context.floraFetchPipeline->VertexMetallibPath()
++            << '\t' << (descriptorOk ? "attr11_Float4_buf6_offset0_stride72" : "descriptor_mismatch")
++            << '\t' << floraFetchPointerUid(vertex.resourceUid) << '\t'
++            << floraFetchPointerUid((__bridge const void*)vertex.native) << '\t'
++            << floraFetchPointerUid(vertexVersionUid) << '\t' << (vertex.native ? vertex.native.length : 0u)
++            << '\t' << vertex.size << '\t' << vertex.offset << '\t' << (vertexHash.empty() ? "unknown" : vertexHash)
++            << '\t' << floraFetchPointerUid(indexBuffer.get()) << '\t'
++            << floraFetchPointerUid((__bridge const void*)indexNative) << '\t'
++            << floraFetchPointerUid(indexVersion.get()) << '\t' << (indexNative ? indexNative.length : 0u)
++            << '\t' << (indexHash.empty() ? "unknown" : indexHash) << '\t' << descriptor.indexBufferOffset
++            << '\t' << descriptor.indexCount << '\t' << (descriptor.indexType == R4IndexType::UInt16 ? "u16" : "u32")
++            << '\t' << descriptor.baseVertex << '\t' << descriptor.instanceCount << '\t' << checked << '\t'
++            << wOne << '\t' << (wPass ? "pass" : (wMismatch ? "mismatch" : "unknown")) << '\t' << reason;
++        context.floraFetchDrawRecords.push_back(record.str());
++    }
++
+     bool beginAcquiredContext(FrameContext& context, std::string& error)
+     {
+         if (m_nextFrameAcquireEpoch == std::numeric_limits<std::uint64_t>::max())
+@@ -4495,6 +4798,18 @@
+         const std::uint64_t epoch = ++m_nextFrameAcquireEpoch;
+         context.uploadArena.BeginAcquisition(epoch, m_computeSkinEnabled);
+         context.acquireEpoch = epoch;
++        if (m_floraFetchObserverEnabled)
++        {
++            context.e01EngineFrame = 0u;
++            context.e01CameraFrame = 0u;
++            context.floraFetchObserverPass = false;
++            context.floraFetchObserverAttempted = false;
++            context.floraFetchObserverIncomplete = false;
++            context.floraFetchVertexBindings = {};
++            context.floraFetchPipeline.reset();
++            context.floraFetchVertexHashes.clear();
++            context.floraFetchDrawRecords.clear();
++        }
+         context.visibilityRecords.clear();
+         context.visibilityLedgerOverflow = false;
+         context.visibilityBufferReset = false;
+@@ -4821,6 +5136,9 @@
+         context.retainedOwners.clear();
+         context.indirectReads.clear();
+         context.computeSkinOracleReceipt.reset();
++        clearFloraFetchObserverState(context);
++        context.floraFetchObserverAttempted = false;
++        context.floraFetchObserverIncomplete = false;
+         context.visibilityRecords.clear();
+         context.visibilityBufferReset = false;
+         context.visibilityAdmissionResolved = false;
+@@ -4875,7 +5193,18 @@
+     bool m_wholeLightVisibilityEnabled = [] {
+         const char* value = std::getenv("XRAY_METAL_WHOLE_LIGHT_VISIBILITY");
+         return value && std::strcmp(value, "1") == 0;
++    }();
++    std::string m_floraFetchObserverPath = [] {
++        const char* value = std::getenv("XRAY_METAL_FLORA_FETCH_FILE");
++        return value ? std::string(value) : std::string();
+     }();
++    bool m_floraFetchObserverEnabled = [] {
++        const char* enabled = std::getenv("XRAY_METAL_FLORA_FETCH_OBSERVER");
++        const char* path = std::getenv("XRAY_METAL_FLORA_FETCH_FILE");
++        return enabled && std::strcmp(enabled, "1") == 0 && path && path[0] != '\0' &&
++            std::filesystem::path(path).is_absolute();
++    }();
++    bool m_floraFetchObserverConsumed = false;
+     std::uint32_t m_wholeLightVisibilitySelectedAcquisitions = 0u;
+     bool m_wholeLightVisibilityCapNoticeEmitted = false;
+     bool m_computeSkinOracleEnabled = [] {

@@ -2,6 +2,7 @@
 
 #include "MetalR4EngineFs.h"
 #include "R4LocalLightFoundation.h"
+#include "R4LightMarker.h"
 #if defined(STATIC_RENDERER_R4)
 #include "../xrRenderPC_R4/stdafx.h"
 #endif
@@ -204,19 +205,68 @@ void buildSpherePart(std::vector<float>& vertices, std::vector<std::uint16_t>& i
 }
 } // namespace
 
+void BuildMetalR4LocalLightCameraViewProjection(
+    const std::array<float, 16>& view,
+    const std::array<float, 16>& projection,
+    std::array<float, 16>& viewProjection)
+{
+    Matrix4 viewMatrix{};
+    Matrix4 projectionMatrix{};
+    std::memcpy(viewMatrix.e, view.data(), sizeof(viewMatrix.e));
+    std::memcpy(projectionMatrix.e, projection.data(), sizeof(projectionMatrix.e));
+    const Matrix4 result = multiply(projectionMatrix, viewMatrix);
+    std::memcpy(viewProjection.data(), result.e, sizeof(result.e));
+}
+
+void BuildMetalR4LocalLightModel(const R4EngineLocalLight& light,
+    std::array<float, 16>& model, std::array<float, 4>* localPositionAbsMax)
+{
+    const Matrix4 result = localLightModel(light);
+    std::memcpy(model.data(), result.e, sizeof(result.e));
+    if (!localPositionAbsMax)
+        return;
+    *localPositionAbsMax = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (light.type == R4EngineLocalLightType::Spot)
+        *localPositionAbsMax = {0.5f, 0.5f, 1.0f, 1.0f};
+    else if (light.type == R4EngineLocalLightType::OmniFace)
+    {
+        *localPositionAbsMax = {0.0f, 0.0f, 0.0f, 1.0f};
+        for (std::size_t i = 0; i < DU_SPHERE_PART_NUMVERTEX; ++i)
+        {
+            (*localPositionAbsMax)[0] = std::max((*localPositionAbsMax)[0],
+                std::abs(du_sphere_part_vertices[i].x));
+            (*localPositionAbsMax)[1] = std::max((*localPositionAbsMax)[1],
+                std::abs(du_sphere_part_vertices[i].y));
+            (*localPositionAbsMax)[2] = std::max((*localPositionAbsMax)[2],
+                std::abs(du_sphere_part_vertices[i].z));
+        }
+    }
+}
+
+void BuildMetalR4LocalLightWorldViewProjection(
+    const std::array<float, 16>& cameraViewProjection,
+    const std::array<float, 16>& model,
+    std::array<float, 16>& worldViewProjection)
+{
+    Matrix4 camera{};
+    Matrix4 object{};
+    std::memcpy(camera.e, cameraViewProjection.data(), sizeof(camera.e));
+    std::memcpy(object.e, model.data(), sizeof(object.e));
+    const Matrix4 result = multiply(camera, object);
+    std::memcpy(worldViewProjection.data(), result.e, sizeof(result.e));
+}
+
 struct MetalR4LocalLightAdapter::Impl
 {
     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> maskFront;
     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> maskBack;
     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> accumulationUnshadowed;
     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> accumulationShadowed;
+    std::shared_ptr<IR4GraphicsPipeline> markerReset;
+    std::shared_ptr<IR4Buffer> markerResetIndices;
 	// 0 sphere(Point), 1 cone(Spot), 2 exact du_sphere_part(OmniFace).
     std::array<std::shared_ptr<IR4Buffer>, 3> vertices;
     std::array<std::shared_ptr<IR4Buffer>, 3> indices;
-    std::shared_ptr<IR4Buffer> vertexGlobals;
-    std::shared_ptr<IR4Buffer> vertexTransforms;
-    std::shared_ptr<IR4Buffer> fragmentGlobals;
-    std::shared_ptr<IR4Buffer> dynamicLight;
     std::shared_ptr<IR4Texture> whiteTexture;
     std::shared_ptr<IR4Texture> spotCookie;
 	xray::metal::R4DdsBytesProvider ddsBytesProvider;
@@ -272,6 +322,8 @@ MetalR4LocalLightAdapter::~MetalR4LocalLightAdapter() = default;
 bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& options, std::string& status)
 {
     m_ready = false; m_status.clear(); m_telemetry = {}; m_impl = std::make_unique<Impl>();
+    const char* activeOcclusion = std::getenv("XRAY_METAL_ACTIVE_OCCLUSION");
+    m_activeOcclusionTransformsRequested = activeOcclusion && std::strcmp(activeOcclusion, "1") == 0;
     if (options.shaderDirectory.empty()) { m_status = "local lights not configured"; status = m_status; return true; }
     std::string error;
     if (!xray::metal::ValidateR4LocalLightMscBundle(options.shaderDirectory, error))
@@ -339,6 +391,13 @@ bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& optio
             !m_impl->accumulationUnshadowed[kind] || !m_impl->accumulationShadowed[kind])
         { m_status = "local-light MSC pipeline unavailable: " + error; status = m_status; return true; }
     }
+    m_impl->markerReset = backend.CreateGraphicsPipeline(
+        xray::metal::R4LightMarkerResetPipelineDesc(), error);
+    const std::array<std::uint16_t, 3> resetIndices = {0u, 1u, 2u};
+    if (!m_impl->markerReset || !makeBuffer(resources, sizeof(resetIndices), R4BufferUsage::Index,
+            "R4 stencil marker reset indices", m_impl->markerResetIndices, error) ||
+        !resources.UpdateBuffer(m_impl->markerResetIndices, 0u, resetIndices.data(), sizeof(resetIndices), error))
+    { m_status = "local-light marker reset unavailable: " + error; status = m_status; return true; }
     for (std::size_t volume = 0; volume < 3u; ++volume)
     {
         std::vector<float> vertices; std::vector<std::uint16_t> indices;
@@ -353,30 +412,30 @@ bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& optio
             !resources.UpdateBuffer(m_impl->indices[volume], 0, indices.data(), indices.size() * sizeof(std::uint16_t), error))
         { m_status = error; status = m_status; return true; }
     }
-    if (!makeBuffer(resources, 224u, R4BufferUsage::Uniform, "R4 local light VS globals", m_impl->vertexGlobals, error) ||
-        !makeBuffer(resources, 256u, R4BufferUsage::Uniform, "R4 local light VS transforms", m_impl->vertexTransforms, error) ||
-        !makeBuffer(resources, 400u, R4BufferUsage::Uniform, "R4 local light PS globals", m_impl->fragmentGlobals, error) ||
-        !makeBuffer(resources, 48u, R4BufferUsage::Uniform, "R4 local light dynamic_light", m_impl->dynamicLight, error))
-    { m_status = error; status = m_status; return true; }
-    if (!options.ddsBytesProvider)
-    { m_status = "local-light spot permutation requires the engine XRFS DDS provider"; status = m_status; return true; }
-    std::filesystem::path cookiePath;
-    xray::metal::R4DdsTexture cookieDds;
-    if (!ResolveMetalR4EngineTextureDdsPath(std::filesystem::path("lights") / "lights_spot01.dds", cookiePath, error) ||
-        !xray::metal::LoadR4DdsTexture(cookiePath, options.ddsBytesProvider, cookieDds, error))
-    { m_status = "local-light default spot cookie unavailable: " + error; status = m_status; return true; }
-    cookieDds.descriptor.storage = R4ResourceStorage::Shared;
-    cookieDds.descriptor.usage = R4TextureUsage::ShaderRead;
-    cookieDds.descriptor.label = "R4 local light lights_spot01 XRFS cookie";
-    m_impl->spotCookie = resources.CreateTexture2D(cookieDds.descriptor, error);
-    if (!m_impl->spotCookie)
-    { m_status = error; status = m_status; return true; }
-    for (const xray::metal::R4DdsMipLevel& mip : cookieDds.mipLevels)
-        if (mip.dataOffset > cookieDds.bytes.size() || mip.bytesPerImage > cookieDds.bytes.size() - mip.dataOffset ||
-            !resources.UploadTexture2D(m_impl->spotCookie, mip.mipLevel, mip.arraySlice,
-                cookieDds.bytes.data() + mip.dataOffset, mip.bytesPerImage, mip.bytesPerRow,
-                mip.bytesPerImage, error))
+    if (options.defaultSpotCookie)
+        m_impl->spotCookie = options.defaultSpotCookie;
+    else
+    {
+        if (!options.ddsBytesProvider)
+        { m_status = "local-light spot permutation requires the engine XRFS DDS provider"; status = m_status; return true; }
+        std::filesystem::path cookiePath;
+        xray::metal::R4DdsTexture cookieDds;
+        if (!ResolveMetalR4EngineTextureDdsPath(std::filesystem::path("lights") / "lights_spot01.dds", cookiePath, error) ||
+            !xray::metal::LoadR4DdsTexture(cookiePath, options.ddsBytesProvider, cookieDds, error))
+        { m_status = "local-light default spot cookie unavailable: " + error; status = m_status; return true; }
+        cookieDds.descriptor.storage = R4ResourceStorage::Shared;
+        cookieDds.descriptor.usage = R4TextureUsage::ShaderRead;
+        cookieDds.descriptor.label = "R4 local light lights_spot01 XRFS cookie";
+        m_impl->spotCookie = resources.CreateTexture2D(cookieDds.descriptor, error);
+        if (!m_impl->spotCookie)
         { m_status = error; status = m_status; return true; }
+        for (const xray::metal::R4DdsMipLevel& mip : cookieDds.mipLevels)
+            if (mip.dataOffset > cookieDds.bytes.size() || mip.bytesPerImage > cookieDds.bytes.size() - mip.dataOffset ||
+                !resources.UploadTexture2D(m_impl->spotCookie, mip.mipLevel, mip.arraySlice,
+                    cookieDds.bytes.data() + mip.dataOffset, mip.bytesPerImage, mip.bytesPerRow,
+                    mip.bytesPerImage, error))
+            { m_status = error; status = m_status; return true; }
+    }
     const std::array<std::uint8_t, 4> white = {255u, 255u, 255u, 255u};
     R4Texture2DDesc whiteDesc; whiteDesc.width = 1u; whiteDesc.height = 1u; whiteDesc.format = R4PixelFormat::RGBA8Unorm;
     whiteDesc.storage = R4ResourceStorage::Shared; whiteDesc.usage = R4TextureUsage::ShaderRead; whiteDesc.label = "R4 local light identity cookie";
@@ -386,10 +445,33 @@ bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& optio
     m_ready = true; m_status = "local-light MSC adapter ready"; status = m_status; return true;
 }
 
+bool MetalR4LocalLightAdapter::ResolveProjectorTexture(IR4Backend& backend, const R4EngineLocalLight& light,
+    std::shared_ptr<IR4Texture>& texture, std::string& error)
+{
+    if (!m_ready || !m_impl) { error="local projector owner is unavailable"; return false; }
+    if (!light.projectorTexture.empty())
+    {
+        texture = loadProjectorCookie(backend, *m_impl, light.projectorTexture, error);
+        return static_cast<bool>(texture);
+    }
+    texture = light.type == R4EngineLocalLightType::Spot ? m_impl->spotCookie : m_impl->whiteTexture;
+    return static_cast<bool>(texture);
+}
+
 bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, const GBufferInputs& inputs,
     const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot, std::string& error)
 {
-    m_telemetry = {};
+    BeginFrame();
+    DrawState state;
+    std::vector<std::size_t> indices;
+    if (snapshot) for (std::size_t i=0;i<snapshot->lights.size();++i) indices.push_back(i);
+    return DrawBatchIntoActiveAccumulator(backend, inputs, view, snapshot, indices, state, error);
+}
+
+bool MetalR4LocalLightAdapter::DrawBatchIntoActiveAccumulator(IR4Backend& backend, const GBufferInputs& inputs,
+    const ViewState& view, const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
+    const std::vector<std::size_t>& lightIndices, DrawState& state, std::string& error)
+{
     if (!m_ready || !m_impl) return true;
     // The first engine-owned scene frame can precede camera publication and
     // local-light snapshot submission. This is a retryable pre-game state,
@@ -397,43 +479,57 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
     if (unavailableForDraw(view, snapshot)) { ++m_telemetry.skippedUnavailable; return true; }
     if (!inputs.position || !inputs.diffuse || !inputs.staticGlobals || !inputs.noFilterSampler || !inputs.linearSampler)
     { error = "local-light adapter is ready but owned G-buffer bindings are unavailable"; return false; }
-    Matrix4 viewMatrix; Matrix4 projection; std::memcpy(viewMatrix.e, view.view.data(), sizeof(viewMatrix.e)); std::memcpy(projection.e, view.projection.data(), sizeof(projection.e));
-    for (std::size_t lightIndex = 0; lightIndex < snapshot->lights.size(); ++lightIndex)
+    Matrix4 viewMatrix; std::memcpy(viewMatrix.e, view.view.data(), sizeof(viewMatrix.e));
+    std::array<float, 16> cameraViewProjectionBytes{};
+    BuildMetalR4LocalLightCameraViewProjection(view.view, view.projection,
+        cameraViewProjectionBytes);
+    Matrix4 cameraViewProjection{};
+    std::memcpy(cameraViewProjection.e, cameraViewProjectionBytes.data(),
+        sizeof(cameraViewProjection.e));
+    auto& lightMarker = state.marker;
+    for (const std::size_t lightIndex : lightIndices)
     {
+        if (lightIndex >= snapshot->lights.size())
+        { error = "local-light batch index exceeds captured snapshot"; return false; }
         const R4EngineLocalLight& light = snapshot->lights[lightIndex];
         ++m_telemetry.requested;
         if (!light.active) { ++m_telemetry.skippedInactive; continue; }
         if (!finite(light) || (light.type != R4EngineLocalLightType::Point && !(light.cone > 0.0f && light.cone < 3.1415927f)))
         { ++m_telemetry.skippedInvalid; continue; }
-        const xray::metal::R4LocalShadowAtlasRecord* shadowRecord = nullptr;
-        if (light.shadowed)
-        {
-            if (light.type == R4EngineLocalLightType::Point)
-            {
-                ++m_telemetry.skippedShadowed;
-                ++m_telemetry.skippedShadowedPoint;
-                continue;
-            }
-            if (!inputs.shadowAtlas || !inputs.shadowSampler || !inputs.shadowRecords)
-            { ++m_telemetry.skippedShadowed; continue; }
-            const auto record = std::find_if(inputs.shadowRecords->begin(), inputs.shadowRecords->end(),
-                [&light](const xray::metal::R4LocalShadowAtlasRecord& candidate) {
-                    return candidate.lightIdentity == light.lightId;
-                });
-            std::string shadowError;
-            if (record == inputs.shadowRecords->end() ||
-                !xray::metal::ValidateR4LocalShadowAtlasRecord(*record, snapshot->engineFrame, shadowError))
-            { ++m_telemetry.skippedShadowed; continue; }
-            shadowRecord = &*record;
-        }
-		// OMNIPART uses the omni (point) shader contract, but a distinct R4
-		// sphere-part volume.  It must never fall into the spot cone path.
         const std::size_t shaderKind = light.type == R4EngineLocalLightType::Spot ? 1u : 0u;
         const std::size_t volumeKind = light.type == R4EngineLocalLightType::Point ? 0u :
             (light.type == R4EngineLocalLightType::Spot ? 1u : 2u);
-        const Matrix4 model = localLightModel(light);
-        const Matrix4 wvp = multiply(multiply(projection, viewMatrix), model);
+        Matrix4 model{};
+        Matrix4 wvp{};
+        if (m_activeOcclusionTransformsRequested)
+        {
+            std::array<float, 16> modelBytes{};
+            BuildMetalR4LocalLightModel(light, modelBytes);
+            std::memcpy(model.e, modelBytes.data(), sizeof(model.e));
+            std::array<float, 16> wvpBytes{};
+            BuildMetalR4LocalLightWorldViewProjection(cameraViewProjectionBytes, modelBytes, wvpBytes);
+            std::memcpy(wvp.e, wvpBytes.data(), sizeof(wvp.e));
+        }
+        else
+        {
+            model = localLightModel(light);
+            wvp = multiply(cameraViewProjection, model);
+        }
         if (outsideMetalClip(light.type, wvp)) { ++m_telemetry.culled; continue; }
+        const xray::metal::R4LocalShadowAtlasRecord* shadowRecord = nullptr;
+        if (light.shadowed)
+        {
+            if (light.type == R4EngineLocalLightType::Point || !inputs.shadowAtlas ||
+                !inputs.shadowSampler || !inputs.shadowRecords)
+            { error = "shadowed local light has no batch-owned atlas bindings"; return false; }
+            const auto record = std::find_if(inputs.shadowRecords->begin(), inputs.shadowRecords->end(),
+                [&light](const auto& candidate) { return candidate.lightIdentity == light.lightId; });
+            if (record == inputs.shadowRecords->end())
+            { error = "shadowed local light is absent from the current atlas batch"; return false; }
+            if (!xray::metal::ValidateR4LocalShadowAtlasRecord(*record, snapshot->engineFrame, error))
+                return false;
+            shadowRecord = &*record;
+        }
         const Matrix4 worldView = multiply(viewMatrix, model);
 		std::shared_ptr<IR4Texture> projectorCookie = m_impl->spotCookie;
 		if (shaderKind == 1u && !light.projectorTexture.empty())
@@ -449,12 +545,7 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
 				continue;
 			}
 		}
-        // The sun owns marker 5. R4 then advances its odd marker by two for
-        // every local light; stop before the 8-bit marker would wrap.
-        if (m_telemetry.admitted > 123u)
-        { ++m_telemetry.skippedUnsupported; continue; }
-        const std::uint32_t marker = 7u + static_cast<std::uint32_t>(m_telemetry.admitted * 2u);
-        if (marker >= 255u) { ++m_telemetry.skippedUnsupported; continue; }
+        const std::uint32_t marker = lightMarker.next;
         const Matrix4 texelAdjust{{0.5f,0,0,0, 0,-0.5f,0,0, 0,0,1,0, 0.5f,0.5f,0,1}};
         const Matrix4 texgen = multiply(texelAdjust, wvp);
         std::array<std::uint8_t, 224> vsGlobals{}; std::array<std::uint8_t, 256> vsTransforms{};
@@ -467,10 +558,10 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
         // (for the spot family) shadow/lightmap transforms plus sss_id. The
         // unshadowed permutations do not consume a shadow map, but preserving
         // these live transforms avoids a zero-global ABI shortcut.
-        const Matrix4 viewProjection = multiply(projection, viewMatrix);
         const Matrix4 identity{{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
         std::memcpy(psGlobals.data(), wvp.e, sizeof(wvp.e));
-        std::memcpy(psGlobals.data() + 64u, viewProjection.e, sizeof(viewProjection.e));
+        std::memcpy(psGlobals.data() + 64u, cameraViewProjectionBytes.data(),
+            sizeof(cameraViewProjectionBytes));
         std::memcpy(psGlobals.data() + 288u,
             shadowRecord ? shadowRecord->shadowMatrix.data() : identity.e, sizeof(identity.e));
         std::memcpy(psGlobals.data() + 192u, snapshot->ssfxLightSetup1.data(),
@@ -486,11 +577,12 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
             1.0f / (0.95f * light.range * 0.95f * light.range)};
         std::array<float, 4> color = light.color; color[3] = light.specular;
         std::memcpy(dynamic.data(), color.data(), sizeof(color)); std::memcpy(dynamic.data() + 16u, viewPosition.data(), sizeof(viewPosition));
-        if (!backend.Resources().UpdateBuffer(m_impl->vertexGlobals, 0, vsGlobals.data(), vsGlobals.size(), error) ||
-            !backend.Resources().UpdateBuffer(m_impl->vertexTransforms, 0, vsTransforms.data(), vsTransforms.size(), error) ||
-            !backend.Resources().UpdateBuffer(m_impl->fragmentGlobals, 0, psGlobals.data(), psGlobals.size(), error) ||
-            !backend.Resources().UpdateBuffer(m_impl->dynamicLight, 0, dynamic.data(), dynamic.size(), error)) return false;
-        R4MscStageBindings vsBindings{R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer,0u,m_impl->vertexGlobals,0u,224u,nullptr,nullptr},{R4MscResourceType::ConstantBuffer,24u,m_impl->vertexTransforms,0u,256u,nullptr,nullptr}}};
+        R4FrameBufferSlice vertexGlobalsSlice, vertexTransformsSlice, fragmentGlobalsSlice, dynamicLightSlice;
+        if (!backend.UploadFrameData(vsGlobals.data(), vsGlobals.size(), 256u, vertexGlobalsSlice, error) ||
+            !backend.UploadFrameData(vsTransforms.data(), vsTransforms.size(), 256u, vertexTransformsSlice, error) ||
+            !backend.UploadFrameData(psGlobals.data(), psGlobals.size(), 256u, fragmentGlobalsSlice, error) ||
+            !backend.UploadFrameData(dynamic.data(), dynamic.size(), 256u, dynamicLightSlice, error)) return false;
+        R4MscStageBindings vsBindings{R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer,0u,vertexGlobalsSlice.buffer,vertexGlobalsSlice.offset,224u,nullptr,nullptr},{R4MscResourceType::ConstantBuffer,24u,vertexTransformsSlice.buffer,vertexTransformsSlice.offset,256u,nullptr,nullptr}}};
         R4MscStageBindings maskPsBindings; maskPsBindings.stage = R4ShaderStage::Fragment;
         maskPsBindings.tlabSize = shaderKind == 0u ? 144u : 216u;
         maskPsBindings.resources = {{R4MscResourceType::Texture,0u,nullptr,0u,0u,inputs.position,nullptr},{R4MscResourceType::Texture,24u,nullptr,0u,0u,inputs.diffuse,nullptr}};
@@ -502,9 +594,9 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
             maskPsBindings.resources.push_back({R4MscResourceType::Texture,72u,nullptr,0u,0u,m_impl->whiteTexture,nullptr});
         }
         const std::size_t cbOffset = shaderKind == 0u ? 48u : 96u;
-        maskPsBindings.resources.push_back({R4MscResourceType::ConstantBuffer,cbOffset,m_impl->fragmentGlobals,0u,shaderKind == 0u ? 208u : 400u,nullptr,nullptr});
+        maskPsBindings.resources.push_back({R4MscResourceType::ConstantBuffer,cbOffset,fragmentGlobalsSlice.buffer,fragmentGlobalsSlice.offset,shaderKind == 0u ? 208u : 400u,nullptr,nullptr});
         maskPsBindings.resources.push_back({R4MscResourceType::ConstantBuffer,cbOffset+24u,inputs.staticGlobals,0u,528u,nullptr,nullptr});
-        maskPsBindings.resources.push_back({R4MscResourceType::ConstantBuffer,cbOffset+48u,m_impl->dynamicLight,0u,48u,nullptr,nullptr});
+        maskPsBindings.resources.push_back({R4MscResourceType::ConstantBuffer,cbOffset+48u,dynamicLightSlice.buffer,dynamicLightSlice.offset,48u,nullptr,nullptr});
         const std::size_t samplerOffset = shaderKind == 0u ? 120u : 168u;
         maskPsBindings.resources.push_back({R4MscResourceType::Sampler,samplerOffset,nullptr,0u,0u,nullptr,inputs.noFilterSampler});
         if (shaderKind == 1u) maskPsBindings.resources.push_back({R4MscResourceType::Sampler,192u,nullptr,0u,0u,nullptr,inputs.linearSampler});
@@ -521,9 +613,9 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
                     {R4MscResourceType::Texture,24u,nullptr,0u,0u,inputs.diffuse,nullptr},
                     {R4MscResourceType::Texture,48u,nullptr,0u,0u,inputs.shadowAtlas,nullptr},
                     {R4MscResourceType::Texture,72u,nullptr,0u,0u,m_impl->whiteTexture,nullptr},
-                    {R4MscResourceType::ConstantBuffer,96u,m_impl->fragmentGlobals,0u,208u,nullptr,nullptr},
+                    {R4MscResourceType::ConstantBuffer,96u,fragmentGlobalsSlice.buffer,fragmentGlobalsSlice.offset,400u,nullptr,nullptr},
                     {R4MscResourceType::ConstantBuffer,120u,inputs.staticGlobals,0u,528u,nullptr,nullptr},
-                    {R4MscResourceType::ConstantBuffer,144u,m_impl->dynamicLight,0u,48u,nullptr,nullptr},
+                    {R4MscResourceType::ConstantBuffer,144u,dynamicLightSlice.buffer,dynamicLightSlice.offset,48u,nullptr,nullptr},
                     {R4MscResourceType::Sampler,168u,nullptr,0u,0u,nullptr,inputs.noFilterSampler},
                     {R4MscResourceType::Sampler,192u,nullptr,0u,0u,nullptr,inputs.linearSampler},
                     {R4MscResourceType::Sampler,216u,nullptr,0u,0u,nullptr,inputs.shadowSampler},
@@ -538,9 +630,9 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
                 {R4MscResourceType::Texture,48u,nullptr,0u,0u,projectorCookie,nullptr},
                 {R4MscResourceType::Texture,72u,nullptr,0u,0u,inputs.shadowAtlas,nullptr},
                 {R4MscResourceType::Texture,96u,nullptr,0u,0u,m_impl->whiteTexture,nullptr},
-                {R4MscResourceType::ConstantBuffer,120u,m_impl->fragmentGlobals,0u,400u,nullptr,nullptr},
+                {R4MscResourceType::ConstantBuffer,120u,fragmentGlobalsSlice.buffer,fragmentGlobalsSlice.offset,400u,nullptr,nullptr},
                 {R4MscResourceType::ConstantBuffer,144u,inputs.staticGlobals,0u,528u,nullptr,nullptr},
-                {R4MscResourceType::ConstantBuffer,168u,m_impl->dynamicLight,0u,48u,nullptr,nullptr},
+                {R4MscResourceType::ConstantBuffer,168u,dynamicLightSlice.buffer,dynamicLightSlice.offset,48u,nullptr,nullptr},
                 {R4MscResourceType::Sampler,192u,nullptr,0u,0u,nullptr,inputs.noFilterSampler},
                 {R4MscResourceType::Sampler,216u,nullptr,0u,0u,nullptr,inputs.linearSampler},
                 {R4MscResourceType::Sampler,240u,nullptr,0u,0u,nullptr,inputs.shadowSampler},
@@ -551,23 +643,184 @@ bool MetalR4LocalLightAdapter::DrawIntoActiveAccumulator(IR4Backend& backend, co
         draw.indexCount = volumeKind == 0u ? 540u : (volumeKind == 1u ? 96u : DU_SPHERE_PART_NUMFACES * 3u);
         draw.indexType = R4IndexType::UInt16;
         const auto bindDraw = [&](const std::shared_ptr<IR4GraphicsPipeline>& pipeline,
-            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference) {
-            return backend.BindGraphicsPipeline(pipeline,error) && backend.SetStencilReference(reference,error) && backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) && backend.BindMscResources(vsBindings,error) && backend.BindMscResources(fragmentBindings,error) && backend.DrawIndexed(draw,error);
+            const R4MscStageBindings& fragmentBindings, const std::uint32_t reference,
+            const R4WholeLightVisibilitySample* visibilitySample) {
+            if (!backend.BindGraphicsPipeline(pipeline,error) || !backend.SetStencilReference(reference,error) ||
+                !backend.BindVertexBuffer(6u,m_impl->vertices[volumeKind],0u,error) ||
+                !backend.BindMscResources(vsBindings,error) || !backend.BindMscResources(fragmentBindings,error))
+                return false;
+            if (!visibilitySample) return backend.DrawIndexed(draw,error);
+            bool resultEncoded = false;
+            // The observer is only attached to this final accumulation draw;
+            // query unavailability does not alter the ordinary draw result.
+            return backend.DrawIndexedWithVisibility(draw,*visibilitySample,resultEncoded,error);
         };
-        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker) ||
-            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u) ||
-            !bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
-                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker)) return false;
+        if (!bindDraw(m_impl->maskFront[shaderKind], maskPsBindings, marker, nullptr) ||
+            !bindDraw(m_impl->maskBack[shaderKind], maskPsBindings, 1u, nullptr)) return false;
+        const R4WholeLightVisibilitySample* visibilitySample = nullptr;
+        if (shadowRecord && state.activeVisibilityBatch >= 0)
+        {
+            const auto found = std::find_if(state.visibilitySamples.begin(), state.visibilitySamples.end(),
+                [&](const auto& sample) {
+                    return sample.engineFrame == snapshot->engineFrame &&
+                        sample.batchId == state.activeVisibilityBatch &&
+                        sample.lightId == light.lightId && sample.parentLightId == light.parentLightId &&
+                        sample.face == (light.type == R4EngineLocalLightType::OmniFace ? light.omniFace : 0u) &&
+                        sample.expectedFaceCount == (light.type == R4EngineLocalLightType::OmniFace ? 6u : 1u) &&
+                        sample.groupKind == (light.type == R4EngineLocalLightType::OmniFace ?
+                            R4WholeLightVisibilityGroupKind::OmniParent : R4WholeLightVisibilityGroupKind::SingleRecord);
+                });
+            if (found != state.visibilitySamples.end()) visibilitySample = &*found;
+        }
+        if (!bindDraw(shadowRecord ? m_impl->accumulationShadowed[shaderKind] :
+                m_impl->accumulationUnshadowed[shaderKind], psBindings, marker, visibilitySample)) return false;
         ++m_telemetry.admitted; ++m_telemetry.submitted;
+        lightMarker.Increment();
+        // Match non-MSAA Windows increment_light_marker/reset_light_marker.
+        // Clear immediately on increment past 255, even for the last light.
+        // Never reuse an odd marker until the fullscreen draw has cleared
+        // bits 1..7. Bit 0 (geometry), depth and accumulated color survive.
+        // Keep the same encoder/attachments; an attachment stencil clear
+        // would erase the geometry mask. Failed reset aborts this frame.
+        if (lightMarker.NeedsReset())
+        {
+            R4IndexedDrawDesc resetDraw;
+            resetDraw.indexBuffer = m_impl->markerResetIndices;
+            resetDraw.indexCount = 3u;
+            resetDraw.indexType = R4IndexType::UInt16;
+            if (!backend.BindGraphicsPipeline(m_impl->markerReset, error) ||
+                !backend.SetStencilReference(0u, error) || !backend.DrawIndexed(resetDraw, error))
+                return false;
+            lightMarker.Reset();
+            ++m_telemetry.markerResets;
+        }
         if (shadowRecord) ++m_telemetry.submittedShadowed;
+    }
+    return true;
+}
+
+bool BuildMetalR4LocalLightVolumeBounds(const R4EngineLocalLight& light,
+    std::array<float, 3>& minimum, std::array<float, 3>& maximum)
+{
+    if (!finite(light) || light.range <= 0 ||
+        (light.type != R4EngineLocalLightType::Point &&
+            !(light.cone > 0 && light.cone < 3.0805f))) return false;
+    // Do not classify the fallback orientation of a malformed basis as hidden.
+    double direction2 = 0, right2 = 0, cross2 = 0;
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        direction2 += double(light.direction[i])*light.direction[i];
+        right2 += double(light.right[i])*light.right[i];
+        const unsigned j=(i+1)%3, k=(i+2)%3;
+        const double c=double(light.direction[j])*light.right[k]-double(light.direction[k])*light.right[j];
+        cross2 += c*c;
+    }
+    if (direction2 <= 1.e-10 || right2 <= 1.e-10 || cross2 <= 1.e-10) return false;
+    const auto model = localLightModel(light);
+    auto lo = light.type == R4EngineLocalLightType::Spot ?
+        std::array<float,3>{-.5f,-.5f,0} : std::array<float,3>{-1,-1,-1};
+    auto hi = light.type == R4EngineLocalLightType::Spot ?
+        std::array<float,3>{.5f,.5f,1} : std::array<float,3>{1,1,1};
+    if (light.type==R4EngineLocalLightType::OmniFace)
+    {
+        // Read the canonical du_sphere_part mesh used by this adapter. A full
+        // 2r cube would make the six-face parent needlessly hard to occlude.
+        static const auto bounds=[] {
+            std::array<std::array<float,3>,2> b;
+            b[0].fill(std::numeric_limits<float>::max());
+            b[1].fill(-std::numeric_limits<float>::max());
+            for (std::size_t i=0;i<DU_SPHERE_PART_NUMVERTEX;++i)
+            {
+                const std::array<float,3> v{du_sphere_part_vertices[i].x,
+                    du_sphere_part_vertices[i].y,du_sphere_part_vertices[i].z};
+                for (unsigned axis=0;axis<3;++axis)
+                { b[0][axis]=std::min(b[0][axis],v[axis]); b[1][axis]=std::max(b[1][axis],v[axis]); }
+            }
+            return b;
+        }();
+        lo=bounds[0]; hi=bounds[1];
+    }
+    minimum.fill(std::numeric_limits<float>::max());
+    maximum.fill(-std::numeric_limits<float>::max());
+    for (unsigned corner=0; corner<8; ++corner)
+        for (unsigned axis=0; axis<3; ++axis)
+        {
+            const double x=(corner&1)?hi[0]:lo[0], y=(corner&2)?hi[1]:lo[1], z=(corner&4)?hi[2]:lo[2];
+            const double v=x*model.e[axis]+y*model.e[4+axis]+z*model.e[8+axis]+model.e[12+axis];
+            if (!std::isfinite(v) || std::abs(v)>std::numeric_limits<float>::max()/2.0) return false;
+            minimum[axis]=std::min(minimum[axis],float(v));
+            maximum[axis]=std::max(maximum[axis],float(v));
+        }
+    for (unsigned axis=0; axis<3; ++axis)
+    {
+        // Expand past float rounding and the 1-cm HOM vertex packing tolerance.
+        const float padding=.01f+1.e-5f*std::max(std::abs(minimum[axis]),std::abs(maximum[axis]));
+        minimum[axis]-=padding; maximum[axis]+=padding;
     }
     return true;
 }
 
 bool RunMetalR4LocalLightAdapterSelfTest(std::string& error)
 {
+    xray::metal::R4LightMarker markers;
+    std::size_t resets = 0;
+    for (std::size_t i = 0; i < 400u; ++i)
+    {
+        const std::uint32_t expected = i < 125u ? 7u + std::uint32_t(i * 2u) :
+            5u + std::uint32_t((i - 125u) % 126u) * 2u;
+        if (markers.next != expected || !(markers.next & 1u) || markers.next > 255u)
+        { error = "R4 non-MSAA light marker rollover sequence differs from Windows"; return false; }
+        markers.Increment();
+        if (markers.NeedsReset()) { markers.Reset(); ++resets; }
+        if ((i == 123u && resets != 0u) || (i == 124u && (resets != 1u || markers.next != 5u)))
+        { error = "R4 marker 255 must trigger reset on the final submitted light"; return false; }
+    }
+    if (resets != 3u)
+    { error = "R4 light marker sequence did not roll over repeatedly"; return false; }
+    const auto reset = xray::metal::R4LightMarkerResetPipelineDesc();
+    if (reset.depthWrite || reset.colorWriteMasks != std::vector<std::uint8_t>{0u} ||
+        reset.stencil.frontFace.writeMask != 0xfeu ||
+        reset.stencil.frontFace.depthStencilPass != R4StencilOperation::Zero)
+    { error = "R4 marker reset does not preserve depth/color/geometry bit"; return false; }
     R4EngineLocalLight valid; valid.active = true; valid.range = 4.0f; valid.cone = 1.0f; valid.direction = {0,0,1}; valid.right = {1,0,0}; valid.color = {1,1,1,1};
     if (!finite(valid)) { error = "local-light finite admission rejected valid input"; return false; }
+    std::array<float,3> lo{}, hi{};
+    valid.type=R4EngineLocalLightType::OmniFace;
+    if (!BuildMetalR4LocalLightVolumeBounds(valid,lo,hi) || lo[0]>-2.8f || hi[2]<4)
+    { error="HOM volume bounds omitted the padded OmniFace mesh"; return false; }
+    valid.type=R4EngineLocalLightType::Spot;
+    if (!BuildMetalR4LocalLightVolumeBounds(valid,lo,hi) || lo[2]>0 || hi[2]<4 ||
+        hi[0]<4*std::tan(.5f))
+    { error="HOM volume bounds omitted the spot cone"; return false; }
+    valid.right=valid.direction;
+    if (BuildMetalR4LocalLightVolumeBounds(valid,lo,hi))
+    { error="HOM volume bounds accepted a degenerate basis"; return false; }
+    valid.right={1,0,0};
+    // Verify every production mesh vertex, including translated/rotated
+    // bases, rather than just matching the box implementation's constants.
+    for (const auto kind:{R4EngineLocalLightType::Point,R4EngineLocalLightType::Spot,R4EngineLocalLightType::OmniFace})
+        for (unsigned rotation=0;rotation<3;++rotation)
+        {
+            valid.type=kind; valid.position={13,-7,22};
+            valid.direction=rotation==0?std::array<float,3>{0,0,1}:
+                rotation==1?std::array<float,3>{1,0,0}:std::array<float,3>{.2f,.3f,.8f};
+            valid.right=rotation==1?std::array<float,3>{0,0,-1}:std::array<float,3>{1,0,0};
+            if (!BuildMetalR4LocalLightVolumeBounds(valid,lo,hi))
+            { error="HOM mesh containment rejected a valid basis"; return false; }
+            std::vector<float> vertices; std::vector<std::uint16_t> indices;
+            if (kind==R4EngineLocalLightType::Point) buildSphere(vertices,indices);
+            else if (kind==R4EngineLocalLightType::Spot) buildCone(vertices,indices);
+            else buildSpherePart(vertices,indices);
+            const auto model=localLightModel(valid);
+            for (std::size_t i=0;i<vertices.size();i+=3)
+                for (unsigned axis=0;axis<3;++axis)
+                {
+                    const float p=vertices[i]*model.e[axis]+vertices[i+1]*model.e[4+axis]+
+                        vertices[i+2]*model.e[8+axis]+model.e[12+axis];
+                    if (p<lo[axis] || p>hi[axis])
+                    { error="HOM bounds omitted a production accumulator mesh vertex"; return false; }
+                }
+        }
     valid.range = std::numeric_limits<float>::quiet_NaN();
     if (finite(valid)) { error = "local-light finite admission accepted NaN"; return false; }
     Matrix4 identity{{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};

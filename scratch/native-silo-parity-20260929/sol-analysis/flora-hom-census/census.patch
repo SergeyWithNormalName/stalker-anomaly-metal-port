@@ -1,0 +1,130 @@
+diff --git a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -5,6 +5,7 @@
+ #include "MetalR4VolumetricCapture.h"
+ #include "R4GameplayFrameAdmission.h"
+ #include "MetalR4FloraMaterialCapture.h"
++#include "MetalFixedFloraHomCensus.h"
+ #include "../xrRender/Blender_BmmD.h"
+ #include "../xrRender/FBasicVisual.h"
+ #include "../xrRender/MetalParticleCapture.h"
+@@ -1569,6 +1570,8 @@
+         }
+         consecutiveSceneRenderFailures = 0u;
+         gameplaySceneRendered = true;
++        ObserveFixedMainFloraHom(viewState.view,viewState.projection,viewState.eye,
++            viewState.valid && viewState.engineFrame==Device.dwFrame,Device.dwFrame);
+         const char* coldUploadProbe = std::getenv("XRAY_METAL_TEMPORAL_COLD_UPLOAD_PROBE");
+         static bool coldEncodeDiscarded = false;
+         if (coldUploadProbe && std::strcmp(coldUploadProbe, "1") == 0 && !coldEncodeDiscarded)
+diff --git a/src/Layers/xrRenderMetal/MetalFixedFloraHomCensus.h b/src/Layers/xrRenderMetal/MetalFixedFloraHomCensus.h
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/MetalFixedFloraHomCensus.h
+@@ -0,0 +1,105 @@
++#pragma once
++
++// Scratch-only fixed-view advisory. Never feeds a draw-admission decision.
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <string>
++#include <vector>
++
++inline void ObserveFixedMainFloraHom(const std::array<float,16>& view,
++    const std::array<float,16>& projection, const std::array<float,3>& eye,
++    bool cameraValid, std::uint32_t engineFrame)
++{
++    static const char* inputPath=std::getenv("XRAY_METAL_MAIN_FLORA_HOM_CENSUS_FILE");
++    static bool attempted=false;
++    if (!inputPath || !inputPath[0] || attempted || engineFrame!=700u)
++        return;
++    attempted=true;
++    using Clock=std::chrono::steady_clock;
++    const auto start=Clock::now();
++    const auto ms=[](Clock::time_point at){return std::chrono::duration<double,std::milli>(Clock::now()-at).count();};
++    const auto unavailable=[&](const char* reason){
++        std::fprintf(stderr,"METAL_FLORA_HOM_CENSUS frame=%u status=unavailable reason=%s geometry_verified=0 wind_verified=0 suppressed=0 overhead_ms=%.6f\n",engineFrame,reason,ms(start));
++    };
++    if (!cameraValid || engineFrame!=Device.dwFrame || Device.dwWidth!=1920u || Device.dwHeight!=1200u)
++    { unavailable("camera_frame_extent");return; }
++    struct Row
++    {
++        std::uint32_t id=0,material=0;
++        std::array<float,3> minimum{},maximum{};
++        bool hiddenRest=false,hiddenPadded=false;
++    };
++    std::ifstream input(inputPath,std::ios::binary|std::ios::ate);
++    if (!input || input.tellg()!=std::streamoff(152u+5316u*32u))
++    { unavailable("input_size");return; }
++    input.seekg(0);
++    const auto read=[&](auto& value){return bool(input.read(reinterpret_cast<char*>(&value),sizeof(value)));};
++    std::array<char,8> magic{};std::uint32_t count=0;
++    std::array<float,16> expectedView{},expectedProjection{};std::array<float,3> expectedEye{};
++    if (!read(magic) || std::memcmp(magic.data(),"R4HOM1\0\0",8) || !read(count) || count!=5316u ||
++        !read(expectedView) || !read(expectedProjection) || !read(expectedEye) ||
++        std::memcmp(view.data(),expectedView.data(),sizeof(expectedView)) ||
++        std::memcmp(projection.data(),expectedProjection.data(),sizeof(expectedProjection)) ||
++        std::memcmp(eye.data(),expectedEye.data(),sizeof(expectedEye)))
++    { unavailable("input_header_or_live_view_mismatch");return; }
++    std::vector<Row> rows(count);
++    std::uint32_t previous=0;bool first=true;
++    for (auto& row:rows)
++    {
++        if (!read(row.id)||!read(row.material)||!read(row.minimum)||!read(row.maximum)||
++            (row.material!=1u && row.material!=2u)||(!first && row.id<=previous))
++        { unavailable("input_row");return; }
++        for (unsigned axis=0;axis<3u;++axis)
++            if (!std::isfinite(row.minimum[axis]) || !std::isfinite(row.maximum[axis]) || row.minimum[axis]>row.maximum[axis])
++            { unavailable("input_bounds");return; }
++        first=false;previous=row.id;
++    }
++    if (input.peek()!=std::char_traits<char>::eof())
++    { unavailable("trailing_input");return; }
++    const double inputMs=ms(start);
++    Fmatrix v{},p{},full;
++    std::memcpy(&v,view.data(),sizeof(v));std::memcpy(&p,projection.data(),sizeof(p));full.mul(p,v);
++    Fvector camera;camera.set(eye[0],eye[1],eye[2]);
++    for (const auto& values:full.m) for (const auto value:values)
++        if (!std::isfinite(value)){unavailable("nonfinite_projection");return;}
++    const auto buildStart=Clock::now();
++    if (!RImplementation.HOM.RenderDiagnostic(full,camera,engineFrame))
++    { unavailable("hom_owner_or_raster");return; }
++    const double buildMs=ms(buildStart);
++    const auto testStart=Clock::now();
++    std::size_t hiddenRest=0,hiddenPadded=0,hiddenLeaf=0,hiddenTrunk=0;
++    for (auto& row:rows)
++    {
++        Fbox box;box.min.set(row.minimum[0],row.minimum[1],row.minimum[2]);
++        box.max.set(row.maximum[0],row.maximum[1],row.maximum[2]);
++        row.hiddenRest=!RImplementation.HOM.visibleDiagnostic(box,engineFrame);
++        hiddenRest+=row.hiddenRest;
++        hiddenLeaf+=row.hiddenRest && row.material==1u;hiddenTrunk+=row.hiddenRest && row.material==2u;
++        // This is a sensitivity sample, not a proven wind envelope.
++        box.min.sub(2.0f);box.max.add(2.0f);
++        row.hiddenPadded=!RImplementation.HOM.visibleDiagnostic(box,engineFrame);
++        hiddenPadded+=row.hiddenPadded;
++    }
++    const double testMs=ms(testStart);
++    bool outputWritten=false;
++    if (const char* outputDirectory=std::getenv("XRAY_METAL_MAIN_FLORA_HOM_CENSUS_OUT"))
++    {
++        std::ofstream output(std::string(outputDirectory)+"/flora-hom-frame-700.csv");
++        if (output)
++        {
++            output<<"engine_frame,visual_id,material,hidden_rest,hidden_padded_2m,geometry_verified,wind_verified,suppressed\n";
++            for (const auto& row:rows)
++                output<<engineFrame<<','<<row.id<<','<<(row.material==1u?"leaf":"trunk")<<','<<row.hiddenRest<<','<<row.hiddenPadded<<",0,0,0\n";
++            output.flush();outputWritten=bool(output);
++        }
++    }
++    std::fprintf(stderr,"METAL_FLORA_HOM_CENSUS frame=%u status=ready tested=%zu hidden_rest=%zu hidden_leaf=%zu hidden_trunk=%zu hidden_padded_2m=%zu input_ms=%.6f build_ms=%.6f tests_two_bounds_ms=%.6f overhead_ms=%.6f output_written=%u geometry_verified=0 wind_verified=0 suppressed=0\n",
++        engineFrame,rows.size(),hiddenRest,hiddenLeaf,hiddenTrunk,hiddenPadded,inputMs,buildMs,testMs,ms(start),unsigned(outputWritten));
++}

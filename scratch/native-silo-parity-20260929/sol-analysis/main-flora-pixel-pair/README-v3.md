@@ -1,0 +1,9 @@
+# Main Flora grouped-order pixel candidate v3
+
+V3 is a small delta on the reviewed v2 scratch draft. It adds a validation-only Flora adapter method and one explicit diagnostic mode; v1 and v2 remain unchanged.
+
+`XRAY_METAL_FLORA_MAIN_PIXEL_PAIR_MODE` defaults to `off-off`, which draws source order twice and preserves the prior infrastructure control. Explicit `source-vs-grouped` makes only the ON branch reorder whole individual legacy draws into stable exact-key groups. Group ordinals follow first source appearance; members retain source order. Every group key includes vertex/index buffer wrapper identity, source vertex/index base/count metadata, draw index buffer offset/count/type/base vertex, Leaf/Trunk material and actual PSO wrapper, material flags, all per-draw texture wrappers, shared wave texture, and sampler. No draw is merged or instanced; the adapter still computes/uploads every original transform/tree-lighting/wind uniform and issues one indexed draw per visual.
+
+The validation adapter builds a local draw-index order and never mutates `m_impl->draws`, `shadowGroups`, or group models. It samples telemetry and restores the prior adapter telemetry before returning. The source and candidate branch telemetry must agree on visible submitted visuals, draw count, and culls; the G-buffer pixel oracle then compares the four MRTs and D32S8. The original production world callback still runs once afterward in source order.
+
+Apply `main-flora-pixel-pair-v2.patch` first, then `grouped-order-v3.patch`. The v3 patch is an additive delta against the v2 draft, not a production-base patch. `grouped-order-v3-hashes.json` pins both the v2 draft base and the additional current production adapter files. This agent did not build, cook, or launch the game; root owns the v2 OFF/OFF gate and any later grouped candidate run.

@@ -1,0 +1,165 @@
+--- a/src/Layers/xrRenderMetal/R4LocalLightFaceVisibility.h
++++ b/src/Layers/xrRenderMetal/R4LocalLightFaceVisibility.h
+@@ -26,7 +26,8 @@
+ 
+ // The caller supplies the padded world AABB of the real accumulator mesh.
+ // All eight corners must lie strictly outside one homogeneous clip plane.
+-// The near/camera plane remains fail open, including boxes which cross it.
++// Homogeneous halfspaces remain valid for negative W and near-plane crossing:
++// any one separating plane proves no contained triangle can rasterize.
+ inline bool R4LocalLightFaceBoundsOutsideView(const std::array<float, 3>& minimum,
+     const std::array<float, 3>& maximum, const std::array<float, 16>& viewProjection)
+ {
+@@ -35,7 +36,7 @@
+             minimum[axis] > maximum[axis]) return false;
+     for (const float value : viewProjection)
+         if (!std::isfinite(value)) return false;
+-    std::array<bool, 5> outside{true, true, true, true, true};
++    std::array<bool, 6> outside{true, true, true, true, true, true};
+     for (unsigned corner = 0; corner < 8; ++corner)
+     {
+         const std::array<double, 4> position{
+@@ -61,7 +62,6 @@
+             roundoff[row] = 64.0 * std::numeric_limits<float>::epsilon() * magnitude[row];
+         }
+         const double base = 1.e-5 * std::max(1.0, std::abs(clip[3]));
+-        if (clip[3] <= base + roundoff[3] || clip[2] <= base + roundoff[2]) return false;
+         const double xMargin = base + roundoff[0] + roundoff[3];
+         const double yMargin = base + roundoff[1] + roundoff[3];
+         const double zMargin = base + roundoff[2] + roundoff[3];
+@@ -69,7 +69,8 @@
+         outside[1] = outside[1] && clip[0] > clip[3] + xMargin;
+         outside[2] = outside[2] && clip[1] < -clip[3] - yMargin;
+         outside[3] = outside[3] && clip[1] > clip[3] + yMargin;
+-        outside[4] = outside[4] && clip[2] > clip[3] + zMargin;
++        outside[4] = outside[4] && clip[2] < -base - roundoff[2];
++        outside[5] = outside[5] && clip[2] > clip[3] + zMargin;
+     }
+     return std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
+ }
+--- a/src/Layers/xrRenderMetal/tests/R4LocalLightFaceVisibilityProbe.cpp
++++ b/src/Layers/xrRenderMetal/tests/R4LocalLightFaceVisibilityProbe.cpp
+@@ -2,6 +2,67 @@
+ 
+ #include <cstdio>
+ #include <limits>
++#include <utility>
++#include <vector>
++
++namespace
++{
++using Clip=std::array<long double,4>;
++long double planeDistance(const Clip& p,unsigned plane)
++{
++    switch (plane)
++    {
++    case 0: return p[0]+p[3]; case 1: return p[3]-p[0];
++    case 2: return p[1]+p[3]; case 3: return p[3]-p[1];
++    case 4: return p[2]; default: return p[3]-p[2];
++    }
++}
++
++// Independent Sutherland-Hodgman clipping of actual triangles, rather than
++// repeating the production corner-rejection algorithm. Keep even degenerate
++// clipped polygons: their presence makes this oracle conservatively stricter.
++bool clippedBoxHasPolygon(const std::array<float,3>& lo,const std::array<float,3>& hi,
++    const std::array<float,16>& matrix)
++{
++    std::array<Clip,8> corners{};
++    for (unsigned corner=0;corner<8;++corner)
++    {
++        const Clip p{corner&1u?hi[0]:lo[0],corner&2u?hi[1]:lo[1],corner&4u?hi[2]:lo[2],1};
++        for (unsigned row=0;row<4;++row)
++            for (unsigned column=0;column<4;++column)
++                corners[corner][row]+=p[column]*matrix[column*4+row];
++    }
++    const unsigned triangles[12][3]={{0,1,3},{0,3,2},{4,6,7},{4,7,5},
++        {0,4,5},{0,5,1},{2,3,7},{2,7,6},{0,2,6},{0,6,4},{1,5,7},{1,7,3}};
++    for (const auto& triangle:triangles)
++    {
++        std::vector<Clip> polygon{corners[triangle[0]],corners[triangle[1]],corners[triangle[2]]};
++        for (unsigned plane=0;plane<6 && !polygon.empty();++plane)
++        {
++            std::vector<Clip> clipped;
++            Clip previous=polygon.back();
++            long double previousDistance=planeDistance(previous,plane);
++            for (const auto& current:polygon)
++            {
++                const long double currentDistance=planeDistance(current,plane);
++                if ((previousDistance>=0)!=(currentDistance>=0))
++                {
++                    const long double t=previousDistance/(previousDistance-currentDistance);
++                    Clip intersection{};
++                    for (unsigned axis=0;axis<4;++axis)
++                        intersection[axis]=previous[axis]+t*(current[axis]-previous[axis]);
++                    clipped.push_back(intersection);
++                }
++                if (currentDistance>=0) clipped.push_back(current);
++                previous=current; previousDistance=currentDistance;
++            }
++            polygon=std::move(clipped);
++        }
++        if (!polygon.empty()) return true;
++    }
++    return false;
++}
++} // namespace
+ 
+ int main()
+ {
+@@ -17,12 +78,16 @@
+     ok &= outside({.2f,.2f,2}, {.3f,.3f,3});
+     ok &= !outside({.2f,.2f,.2f}, {.3f,.3f,.3f});
+     ok &= !outside({1,.2f,.2f}, {2,.3f,.3f}); // Boundary touches.
+-    ok &= !outside({2,.2f,-.1f}, {3,.3f,.3f}); // Near-plane crossing.
++    ok &= outside({2,.2f,-.1f}, {3,.3f,.3f}); // Side separates despite near crossing.
++    ok &= !outside({.2f,.2f,-.1f}, {.3f,.3f,.3f}); // Visible near crossing.
++    ok &= outside({.2f,.2f,-3}, {.3f,.3f,-2}); // Fully behind near plane.
++    ok &= !outside({-.5f,-.5f,-.5f}, {.5f,.5f,.5f}); // Eye-inside box.
++    ok &= !outside({-5,-5,-5}, {5,5,5}); // Box contains the frustum.
+     ok &= !outside({3,.2f,.2f}, {2,.3f,.3f}); // Invalid box.
+     vp[15] = 0;
+-    ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
++    ok &= outside({2,.2f,.2f}, {3,.3f,.3f});
+     vp[15] = -1;
+-    ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
++    ok &= outside({2,.2f,.2f}, {3,.3f,.3f});
+     vp[15] = 1;
+     // Compare translated/cancelling clip evaluation to the actual float dot
+     // products. A double result strictly outside is insufficient near an edge.
+@@ -46,8 +111,34 @@
+     ok &= floatOutsideRight(distantLo,distantHi) && outside(distantLo,distantHi);
+     vp[12] = 0;
+     vp[14] = -100000000.0f;
+-    ok &= !outside({2,.2f,100000000.0f},{3,.3f,100000016.0f}); // Float near-plane touch.
++    ok &= !outside({.2f,.2f,100000000.0f},{.3f,.3f,100000016.0f}); // Float near-plane touch.
+     vp[14] = 0;
++    std::uint32_t randomState=0x589341d7u;
++    const auto random=[&]() {
++        randomState=randomState*1664525u+1013904223u;
++        return float(randomState>>8u)/float(0x01000000u)*2-1;
++    };
++    std::size_t rejected=0, tested=0, omissions=0;
++    for (unsigned sample=0;sample<4000;++sample)
++    {
++        std::array<float,3> lo{},hi{};
++        for (unsigned axis=0;axis<3;++axis)
++        {
++            const float center=random()*50;
++            const float radius=std::abs(random())*15+.05f;
++            lo[axis]=center-radius; hi[axis]=center+radius;
++        }
++        // Dense projections include mixed-sign W, shear, translation and
++        // near-plane crossings; the certificate applies to any finite matrix.
++        for (auto& component:vp) component=random()*3;
++        const bool reject=outside(lo,hi);
++        ++tested;
++        rejected+=reject;
++        if (reject && clippedBoxHasPolygon(lo,hi,vp))
++        { std::fprintf(stderr,"face visibility omitted an independently clipped triangle at sample %u\n",sample); ++omissions; ok=false; break; }
++    }
++    ok &= rejected>100; // Ensure the oracle exercised real certificates.
++    std::printf("FACE_CLIP_ORACLE random_views=%zu certified_rejects=%zu clipped_omissions=%zu\n",tested,rejected,omissions);
+     vp[0] = std::numeric_limits<float>::quiet_NaN();
+     ok &= !outside({2,.2f,.2f}, {3,.3f,.3f});
+     R4EngineLocalLight light;

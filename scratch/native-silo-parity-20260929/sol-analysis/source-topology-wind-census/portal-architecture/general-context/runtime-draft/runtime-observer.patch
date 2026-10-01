@@ -1,0 +1,3529 @@
+diff --git a/src/Layers/xrRender/R_calculate.cpp b/src/Layers/xrRender/R_calculate.cpp
+--- a/src/Layers/xrRender/R_calculate.cpp
++++ b/src/Layers/xrRender/R_calculate.cpp
+@@ -1,10 +1,29 @@
+ #include "stdafx.h"
+ #include "../../xrEngine/customhud.h"
+ #include "../../Include/xrRender/R4BackendSelection.h"
++#if defined(XR_PLATFORM_APPLE)
++#include "../xrRenderMetal/MetalRenderDeviceRender.h"
++#endif
++
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <locale>
+ 
+ float g_fSCREEN;
++// Diagnostic-only copied-reader generation; no retained level/CDB pointers.
++u32 g_metalPortalObservedLevelGeneration = 0;
++// Monotonic across level unload/reload; zero remains the unavailable sentinel.
++u32 g_metalPortalNextGeneration = 0;
++
+ 
+ extern float r_dtex_range;
++extern float ps_r__ssaDISCARD;
++extern float ps_r__ssaDISCARD_exp;
++extern float ps_r__ssaDISCARD_fade_k;
++extern float ps_r__LOD;
+ extern float r_ssaDISCARD;
+ extern float r_ssaDONTSORT;
+ extern float r_ssaLOD_A;
+@@ -68,6 +87,37 @@
+ 			}
+ 			ViewBase.CreateFromMatrix(Device.mFullTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+ 			GMBase.traverse(pLastSector, ViewBase, Device.vCameraPosition, Device.mFullTransform);
++#if defined(XR_PLATFORM_APPLE)
++            const char* topologyCensus = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++            if (Device.dwFrame == 700u && topologyCensus && std::strcmp(topologyCensus, "1") == 0)
++            {
++                xray::metal::R4PortalContextFrameInput input;
++                input.generation = g_metalPortalObservedLevelGeneration;
++                input.frameID = Device.dwFrame;
++                input.currentEye = Device.vCameraPosition;
++                input.savedEye = Device.vCameraPosition_saved;
++                input.width = Device.dwWidth;
++                input.height = Device.dwHeight;
++                input.fovDegrees = Device.fFOV;
++                input.geometryLod = ps_r__LOD;
++                input.discardPixels = ps_r__ssaDISCARD;
++                input.discardExponent = ps_r__ssaDISCARD_exp;
++                input.discardFadeK = ps_r__ssaDISCARD_fade_k;
++                input.screenFactor = g_fSCREEN;
++                input.effectiveDiscard = r_ssaDISCARD;
++                std::memcpy(input.currentView.data(), &Device.mView, sizeof(input.currentView));
++                std::memcpy(input.currentProjection.data(), &Device.mProject, sizeof(input.currentProjection));
++                input.fullTransform = Device.mFullTransform;
++                input.viewportNear = Device.ViewportNear;
++                input.ssaDiscard = r_ssaDISCARD;
++                input.ssaLodA = r_ssaLOD_A;
++                input.ssaLodB = r_ssaLOD_B;
++                input.drawPortals = psDeviceFlags.test(rsDrawPortals);
++                CDB::MODEL* borrowedStaticCform = g_pGameLevel->ObjectSpace.GetStaticModel();
++                static_cast<MetalRenderDeviceRender*>(Device.m_pRender)->ObservePortalFrame(
++                    input, borrowedStaticCform);
++            }
++#endif
+ 		}
+ 		RImplementation.phase = PHASE_NORMAL;
+ 		GMBase.r_dsgraph_capture_metal_world();
+diff --git a/src/Layers/xrRenderPC_R4/r4_loader.cpp b/src/Layers/xrRenderPC_R4/r4_loader.cpp
+--- a/src/Layers/xrRenderPC_R4/r4_loader.cpp
++++ b/src/Layers/xrRenderPC_R4/r4_loader.cpp
+@@ -1,6 +1,10 @@
+ #include "stdafx.h"
+ #include "r4.h"
+ #include "../xrRender/ResourceManager.h"
++#include <fstream>
++extern u32 g_metalPortalObservedLevelGeneration;
++// Owned by R_calculate.cpp; only published after a successful active-reader copy.
++extern u32 g_metalPortalNextGeneration;
+ #include "../xrRender/fbasicvisual.h"
+ #include "../../xrEngine/fmesh.h"
+ #include "../../xrEngine/xrLevel.h"
+@@ -34,6 +38,27 @@
+ 	R_ASSERT(!b_loaded);
+ 	if (SelectedR4Backend() == R4BackendKind::Metal)
+ 	{
++        // A new load starts unavailable. Never carry the prior level's receipt forward.
++        g_metalPortalObservedLevelGeneration = 0;
++        // Observe-only snapshot of the active engine reader. Position is unchanged.
++        const char* portalObserve = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++        const char* portalLevelFile = std::getenv("XRAY_METAL_PORTAL_ACTIVE_LEVEL_FILE");
++        if (portalObserve && std::strcmp(portalObserve, "1") == 0 &&
++            portalLevelFile && portalLevelFile[0] == '/' && fs && fs->length() > 0 &&
++            fs->length() <= 512*1024*1024 && fs->tell() >= 0 && fs->tell() <= fs->length())
++        {
++            std::ofstream copy(portalLevelFile, std::ios::binary | std::ios::trunc);
++            const auto* begin = static_cast<const char*>(fs->pointer()) - fs->tell();
++            copy.write(begin, fs->length());
++            copy.flush();
++            const bool bytesWritten = bool(copy) &&
++                copy.tellp() == std::streampos(fs->length());
++            copy.close();
++            if (bytesWritten && !copy.fail() && ++g_metalPortalNextGeneration != 0)
++                g_metalPortalObservedLevelGeneration = g_metalPortalNextGeneration;
++            Msg("METAL_PORTAL_ACTIVE_READER generation=%u bytes=%d cursor=%d copy_ok=%d suppression=0",
++                g_metalPortalObservedLevelGeneration, fs->length(), fs->tell(), int(bool(copy)));
++        }
+ 		pApp->LoadBegin();
+ 		g_pGamePersistent->LoadTitle();
+ 		// Keep the level light DB lifecycle alive for the value-only Metal
+@@ -153,6 +178,7 @@
+ 	if (!b_loaded) return;
+ 	if (SelectedR4Backend() == R4BackendKind::Metal)
+ 	{
++        g_metalPortalObservedLevelGeneration = 0;
+ #if defined(XR_PLATFORM_APPLE)
+ 		static_cast<MetalRenderDeviceRender*>(Device.m_pRender)->UnloadLevelScene();
+ #endif
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.h b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.h
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "R4MaterialSet.h"
++#include "R4PortalGenerationContext.h"
+ #include "R4DdsTexture.h"
+ #include "IR4Backend.h"
+ #include "MetalR4DynamicWorldAdapter.h"
+@@ -137,6 +138,7 @@
+         std::array<float, 16> previousView{};
+         std::array<float, 16> previousProjection{};
+         std::array<float, 3> eye{};
++        R4FloraSsaObserverSettings floraSsaObserver;
+         std::uint32_t engineFrame = 0;
+         std::uint32_t previousFrame = 0;
+         bool cameraCut = false;
+@@ -198,6 +200,8 @@
+ 
+     bool Prepare(IR4Backend& backend, const Options& options, std::string& error);
+     void Reset();
++    bool ObservePortalFrame(const xray::metal::R4PortalContextFrameInput& input,
++        CDB::MODEL* borrowedStaticCform);
+ 
+     // Replacing or clearing the callback is safe while another frame is
+     // rendering: Render captures an immutable callback handle for that frame.
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -17,6 +17,7 @@
+ #include "R4SubmittedViewHistory.h"
+ #include "R4ActiveOcclusionSceneBridge.h"
+ #include "R4ActiveOcclusionCatalogSelection.h"
++#include "R4PortalGenerationContext.h"
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <ImageIO/ImageIO.h>
+ 
+@@ -35,6 +36,7 @@
+ #include <new>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <sstream>
+ 
+ // Keep the production scene in precisely one source of truth while the
+ // standalone executable remains a useful validation harness.  Defining this
+@@ -43,6 +45,8 @@
+ #define XRAY_METAL_ENGINE_SCENE_IMPLEMENTATION 1
+ #include "MetalBootstrap.mm"
+ #undef XRAY_METAL_ENGINE_SCENE_IMPLEMENTATION
++
++extern u32 g_metalPortalObservedLevelGeneration;
+ 
+ namespace
+ {
+@@ -2540,7 +2544,9 @@
+     R4FloraViewState result;
+     result.view=view.view; result.projection=view.projection;
+     result.previousView=view.previousView; result.previousProjection=view.previousProjection;
+-    result.eye=view.eye; result.staticGlobals=staticGlobals;
++    result.eye=view.eye; result.engineFrame=view.engineFrame;
++    result.ssaObserver=view.floraSsaObserver;
++    result.staticGlobals=staticGlobals;
+     result.timeSeconds=environment.globalTime; result.treeScaleBiasCorrection=environment.treeScaleBiasCorrection;
+     result.previousBenders=motion.previousBenders; result.currentBenders=motion.currentBenders;
+     result.bendersSetup=motion.bendersSetup; result.windParams=motion.windParams;
+@@ -6307,6 +6313,14 @@
+ struct MetalR4EngineScene::Impl
+ {
+     LevelScene scene;
++    xray::metal::R4PortalGenerationCache portalCache;
++    xray::metal::R4PortalContextFrameInput portalInput;
++    xray::metal::R4PortalContextFrameOutput portalOutput;
++    bool portalObserverEnabled = false;
++    bool portalAttempted = false;
++    bool portalPending = false;
++    bool portalSelectedViewMatches = false;
++    bool portalWasSubmitted = false;
+     R4SubmittedViewHistory viewHistory;
+     R4DetailGrassMotionSnapshot floraMotion;
+     TerrainScene terrain;
+@@ -6707,6 +6721,75 @@
+             std::numeric_limits<std::uint32_t>::max(), backend,
+             impl->scene, error))
+         return false;
++    const char* portalEnabled = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++    impl->portalObserverEnabled = portalEnabled && std::strcmp(portalEnabled, "1") == 0;
++    if (impl->portalObserverEnabled)
++    {
++        impl->portalCache.generation = g_metalPortalObservedLevelGeneration;
++        impl->portalCache.unavailableReason = "active-reader-generation-unavailable";
++        const char* activePath = std::getenv("XRAY_METAL_PORTAL_ACTIVE_LEVEL_FILE");
++        if (g_metalPortalObservedLevelGeneration != 0 && activePath && activePath[0] == '/')
++        {
++            const auto initStart = std::chrono::steady_clock::now();
++            std::vector<std::uint8_t> activeLevelBytes;
++            std::ifstream activeInput(activePath, std::ios::binary);
++            activeInput.seekg(0, std::ios::end);
++            const auto activeSize = activeInput.tellg();
++            if (activeInput && activeSize > 0 && activeSize <= std::streamoff(512u * 1024u * 1024u))
++            {
++                activeLevelBytes.resize(static_cast<std::size_t>(activeSize));
++                activeInput.seekg(0, std::ios::beg);
++                activeInput.read(reinterpret_cast<char*>(activeLevelBytes.data()),
++                    static_cast<std::streamsize>(activeLevelBytes.size()));
++                const bool activeReadOk = bool(activeInput) &&
++                    activeInput.gcount() == static_cast<std::streamsize>(activeLevelBytes.size());
++                activeInput.close();
++                // Refuse host/active disagreement. The engine already captured the live
++                // main level reader; level.geom is separately tied to the loaded scene.
++                std::vector<std::uint8_t> hostLevelBytes;
++                std::ifstream hostInput(options.levelDirectory / "level", std::ios::binary);
++                hostInput.seekg(0, std::ios::end);
++                const auto hostSize = hostInput.tellg();
++                bool hostReadOk = hostInput && hostSize == activeSize;
++                if (hostReadOk)
++                {
++                    hostLevelBytes.resize(static_cast<std::size_t>(hostSize));
++                    hostInput.seekg(0, std::ios::beg);
++                    hostInput.read(reinterpret_cast<char*>(hostLevelBytes.data()),
++                        static_cast<std::streamsize>(hostLevelBytes.size()));
++                    hostReadOk = bool(hostInput) && hostInput.gcount() ==
++                        static_cast<std::streamsize>(hostLevelBytes.size());
++                }
++                hostInput.close();
++                if (activeReadOk && hostReadOk && activeLevelBytes == hostLevelBytes)
++                {
++                    if (!fileSha256(activePath, impl->portalCache.activeLevelReaderSha256) ||
++                        impl->portalCache.activeLevelReaderSha256.empty())
++                        impl->portalCache.unavailableReason = "active-level-reader-hash-failed";
++                    else
++                    {
++                        const std::string activeReaderSha = impl->portalCache.activeLevelReaderSha256;
++                        xray::metal::R4LevelGeometry activeGeometry;
++                        std::string portalError;
++                        if (xray::metal::ParseR4LevelGeometry(impl->scene.geometryBytes,
++                                activeLevelBytes, activeGeometry, portalError))
++                        {
++                            // The active parser result is the cache source. Exact main-level
++                            // bytes and shared level.geom bytes bind it to this scene generation.
++                            const bool cacheReady = xray::metal::BuildR4PortalGenerationCache(activeGeometry,
++                                g_metalPortalObservedLevelGeneration, impl->portalCache);
++                            impl->portalCache.activeLevelReaderSha256 = activeReaderSha;
++                            if (!cacheReady) impl->portalCache.unavailableReason = "portal-cache-build-failed";
++                        }
++                        else impl->portalCache.unavailableReason = "active-level-parse-failed";
++                    }
++                }
++                else impl->portalCache.unavailableReason = "active-host-level-bytes-mismatch";
++            }
++            impl->portalCache.initializationCpuMs = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - initStart).count();
++        }
++    }
+     if (!impl->scene.productionMsc || !impl->scene.productionBaseLighting ||
+         !impl->scene.productionSun || !impl->scene.productionLuminance ||
+         impl->scene.textureMaterials.size() != materialInputs.size())
+@@ -7401,10 +7484,41 @@
+     }
+     if (impl->viewHistory.HasPending())
+     { error = "only one primary world view may produce temporal history per Metal submission"; return false; }
++    const bool keepCalculatePortalSnapshot = impl->portalPending;
++    const auto portalInputSnapshot = impl->portalInput;
++    const auto portalOutputSnapshot = impl->portalOutput;
+     DiscardUnsubmittedFrame();
++    if (keepCalculatePortalSnapshot)
++    {
++        impl->portalPending = true;
++        impl->portalInput = portalInputSnapshot;
++        impl->portalOutput = portalOutputSnapshot;
++    }
+     std::uint32_t width = 0, height = 0;
+     backend.DrawableSize(width, height);
+-    const ViewState view = impl->viewHistory.Select(incomingView, width, height);
++    ViewState view = impl->viewHistory.Select(incomingView, width, height);
++    if (impl->portalPending && view.engineFrame == impl->portalInput.frameID)
++    {
++        view.floraSsaObserver.engineFrame = view.engineFrame;
++        view.floraSsaObserver.width = width;
++        view.floraSsaObserver.height = height;
++        view.floraSsaObserver.fovDegrees = impl->portalInput.fovDegrees;
++        view.floraSsaObserver.geometryLod = impl->portalInput.geometryLod;
++        view.floraSsaObserver.discardPixels = impl->portalInput.discardPixels;
++        view.floraSsaObserver.discardExponent = impl->portalInput.discardExponent;
++        view.floraSsaObserver.discardFadeK = impl->portalInput.discardFadeK;
++        view.floraSsaObserver.screenFactor = impl->portalInput.screenFactor;
++        view.floraSsaObserver.effectiveDiscard = impl->portalInput.effectiveDiscard;
++        view.floraSsaObserver.valid = impl->portalOutput.valid && view.valid;
++    }
++    if (impl->portalPending)
++    {
++        impl->portalSelectedViewMatches = view.valid &&
++            view.engineFrame == impl->portalInput.frameID &&
++            std::memcmp(view.view.data(), impl->portalInput.currentView.data(), sizeof(float) * 16u) == 0 &&
++            std::memcmp(view.projection.data(), impl->portalInput.currentProjection.data(), sizeof(float) * 16u) == 0 &&
++            std::memcmp(view.eye.data(), &impl->portalInput.currentEye, sizeof(float) * 3u) == 0;
++    }
+     // Reallocate producers before preparing temporal consumers. Otherwise AO
+     // would bind the old-sized history on the first frame after a resize.
+     if (!ensureLevelDepthTarget(backend, impl->scene, error)) return false;
+@@ -7873,9 +7987,220 @@
+     return rendered;
+ }
+ 
++bool MetalR4EngineScene::ObservePortalFrame(
++    const xray::metal::R4PortalContextFrameInput& input, CDB::MODEL* borrowedStaticCform)
++{
++    if (!impl || !impl->portalObserverEnabled || input.frameID != 700u || impl->portalAttempted)
++        return false;
++    impl->portalAttempted = true;
++    impl->portalInput = input;
++    impl->portalOutput = {};
++    impl->portalOutput.generation = input.generation;
++    impl->portalOutput.frameID = input.frameID;
++    impl->portalOutput.initializationCpuMs = impl->portalCache.initializationCpuMs;
++    impl->portalPending = true;
++    impl->portalSelectedViewMatches = false;
++    impl->portalWasSubmitted = false;
++    const auto frameStart = std::chrono::steady_clock::now();
++    if (input.generation == 0 || input.generation != impl->portalCache.generation ||
++        !impl->portalCache.qualified)
++        impl->portalOutput.unavailableReason = impl->portalCache.unavailableReason.empty() ?
++            "stale-or-unqualified-runtime-generation" : impl->portalCache.unavailableReason;
++    else
++    {
++        // borrowedStaticCform is consumed synchronously by the detector and never stored.
++        xray::metal::ObserveR4PortalGeneration(impl->portalCache, input,
++            borrowedStaticCform, impl->portalOutput);
++    }
++    impl->portalOutput.frameCpuMs = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - frameStart).count();
++    impl->portalOutput.initializationCpuMs = impl->portalCache.initializationCpuMs;
++    return impl->portalOutput.valid;
++}
++
+ void MetalR4EngineScene::OnFrameSubmitted()
+ {
+     if (!impl) return;
++    if (impl->portalPending && !impl->portalWasSubmitted)
++    {
++        impl->portalWasSubmitted = true;
++        bool idsValid = false;
++        std::vector<std::pair<std::uint32_t, std::string>> ids;
++        const char* idDirectory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        if (idDirectory && idDirectory[0] == '/')
++        {
++            std::ifstream idsFile(std::filesystem::path(idDirectory) / "main-flora-ids-frame-700.csv");
++            std::string line;
++            bool footer = false, footerSeen = false, header = false, malformedIds = false;
++            bool frameMetadata = false, extentMetadata = false;
++            std::unordered_set<std::uint32_t> seen;
++            try
++            {
++                while (std::getline(idsFile, line))
++                {
++                    if (footerSeen) { malformedIds = true; ids.clear(); break; }
++                    if (line == "visual_id,material") { if (header) { ids.clear(); break; } header = true; continue; }
++                    if (line == "engine_frame,700") { frameMetadata = true; continue; }
++                    if (line == "extent," + std::to_string(impl->portalInput.width) + "," +
++                        std::to_string(impl->portalInput.height)) { extentMetadata = true; continue; }
++                    if (line.rfind("encode_complete,", 0) == 0)
++                    {
++                        footerSeen = true;
++                        footer = line == "encode_complete,5316" && ids.size() == 5316u;
++                        if (!footer) malformedIds = true;
++                        continue;
++                    }
++                    if (!header || line.empty() || line[0] == '#') continue;
++                    const auto comma = line.find(',');
++                    if (comma == std::string::npos) { ids.clear(); break; }
++                    std::size_t parsedChars = 0;
++                    const unsigned long parsedId = std::stoul(line.substr(0, comma), &parsedChars, 10);
++                    if (parsedChars != comma || parsedId > std::numeric_limits<std::uint32_t>::max())
++                    { malformedIds = true; ids.clear(); break; }
++                    const auto id = static_cast<std::uint32_t>(parsedId);
++                    const std::string material = line.substr(comma + 1u);
++                    if ((material != "leaf" && material != "trunk") || !seen.insert(id).second)
++                    { ids.clear(); break; }
++                    ids.emplace_back(id, material);
++                }
++                idsValid = bool(idsFile.eof()) && header && footerSeen && footer &&
++                    !malformedIds && frameMetadata && extentMetadata && ids.size() == 5316u;
++            }
++            catch (...) { ids.clear(); idsValid = false; }
++        }
++        const auto csvBitsMatch = [](const std::string& line, const char* key,
++            const float* expected, std::size_t count) {
++            const std::string prefix = std::string(key) + ",";
++            if (line.rfind(prefix, 0) != 0) return false;
++            std::istringstream input(line.substr(prefix.size()));
++            std::string token;
++            for (std::size_t i = 0; i < count; ++i)
++            {
++                if (!std::getline(input, token, ',' ) || token.size() != 8u) return false;
++                char* end = nullptr;
++                const unsigned long bits = std::strtoul(token.c_str(), &end, 16);
++                std::uint32_t expectedBits = 0;
++                std::memcpy(&expectedBits, expected + i, sizeof(expectedBits));
++                if (!end || *end || bits != expectedBits) return false;
++            }
++            return !std::getline(input, token, ',');
++        };
++        std::array<float,3> expectedEye{{impl->portalInput.currentEye.x,
++            impl->portalInput.currentEye.y, impl->portalInput.currentEye.z}};
++        const std::array<float,7> expectedSsa{{impl->portalInput.fovDegrees,
++            impl->portalInput.geometryLod, impl->portalInput.discardPixels,
++            impl->portalInput.discardExponent, impl->portalInput.discardFadeK,
++            impl->portalInput.screenFactor, impl->portalInput.effectiveDiscard}};
++        unsigned csvViewMatches = 0, csvProjectionMatches = 0, csvEyeMatches = 0, csvSsaMatches = 0;
++        if (idDirectory && idDirectory[0] == '/')
++        {
++            std::ifstream check(std::filesystem::path(idDirectory) / "main-flora-ids-frame-700.csv");
++            std::string line;
++            while (std::getline(check, line))
++            {
++                csvViewMatches += csvBitsMatch(line, "view_bits", impl->portalInput.currentView.data(), 16u) ? 1u : 0u;
++                csvProjectionMatches += csvBitsMatch(line, "projection_bits", impl->portalInput.currentProjection.data(), 16u) ? 1u : 0u;
++                csvEyeMatches += csvBitsMatch(line, "eye_bits", expectedEye.data(), 3u) ? 1u : 0u;
++                csvSsaMatches += csvBitsMatch(line, "ssa_settings_bits", expectedSsa.data(), 7u) ? 1u : 0u;
++            }
++        }
++        const bool csvViewMatch = csvViewMatches == 1u;
++        const bool csvProjectionMatch = csvProjectionMatches == 1u;
++        const bool csvEyeMatch = csvEyeMatches == 1u;
++        const bool csvSsaMatch = csvSsaMatches == 1u;
++        bool idsIndicesValid = impl->portalOutput.valid;
++        for (const auto& row : ids)
++            idsIndicesValid = idsIndicesValid && row.first < impl->portalOutput.graph.rawVisualVisible.size() &&
++                row.first < impl->portalOutput.graph.ownerFrustumTests.size();
++        idsValid = idsValid && csvViewMatch && csvProjectionMatch && csvEyeMatch &&
++            csvSsaMatch && idsIndicesValid;
++        const bool complete = impl->portalOutput.valid && impl->portalSelectedViewMatches && idsValid;
++        const char* receiptPath = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_FILE");
++        if (receiptPath && receiptPath[0] == '/')
++        {
++            std::ofstream receipt(receiptPath, std::ios::binary | std::ios::trunc);
++            receipt.imbue(std::locale::classic());
++            receipt << std::setprecision(std::numeric_limits<double>::max_digits10) << std::boolalpha;
++            const auto writeBits = [&receipt](const char* name, const float* values, std::size_t count) {
++                receipt << "\"" << name << "\":[";
++                for (std::size_t i = 0; i < count; ++i) {
++                    std::uint32_t bits = 0; std::memcpy(&bits, values + i, sizeof(bits));
++                    if (i) receipt << ','; receipt << bits;
++                }
++                receipt << "],";
++            };
++            const std::array<float,3> currentEye{{impl->portalInput.currentEye.x,
++                impl->portalInput.currentEye.y, impl->portalInput.currentEye.z}};
++            const std::array<float,3> savedEye{{impl->portalInput.savedEye.x,
++                impl->portalInput.savedEye.y, impl->portalInput.savedEye.z}};
++            receipt << "{\n\"schema\":\"r4-source-topology-runtime-v1\",\n"
++                << "\"complete\":" << complete << ",\"suppressed\":0,\n";
++            writeBits("current_eye_bits", currentEye.data(), currentEye.size());
++            writeBits("saved_eye_bits", savedEye.data(), savedEye.size());
++            writeBits("view_bits", impl->portalInput.currentView.data(), 16u);
++            writeBits("projection_bits", impl->portalInput.currentProjection.data(), 16u);
++            writeBits("full_transform_bits", &impl->portalInput.fullTransform.m[0][0], 16u);
++            receipt << "\n"
++                << "\"generation\":" << impl->portalInput.generation
++                << ",\"frame\":" << impl->portalInput.frameID
++                << ",\"active_level_sha256\":\"" << impl->portalCache.activeLevelReaderSha256 << "\",\n"
++                << "\"start_sector\":" << impl->portalOutput.startSector
++                << ",\"observer_valid\":" << impl->portalOutput.valid
++                << ",\"view_match\":" << impl->portalSelectedViewMatches
++                << ",\"flora_ids_valid\":" << idsValid
++                << ",\"csv_view_match\":" << csvViewMatch
++                << ",\"csv_projection_match\":" << csvProjectionMatch
++                << ",\"csv_eye_match\":" << csvEyeMatch
++                << ",\"csv_ssa_match\":" << csvSsaMatch
++                << ",\"flora_id_count\":" << ids.size()
++                << ",\"width\":" << impl->portalInput.width
++                << ",\"height\":" << impl->portalInput.height
++                << ",\"fov\":" << impl->portalInput.fovDegrees
++                << ",\"ssa_discard\":" << impl->portalInput.effectiveDiscard
++                << ",\"draw_portals\":" << impl->portalInput.drawPortals
++                << ",\"init_cpu_ms\":" << impl->portalCache.initializationCpuMs
++                << ",\"frame_cpu_ms\":" << impl->portalOutput.frameCpuMs
++                << ",\"unavailable_reason\":\"" << impl->portalOutput.unavailableReason << "\",\n"
++                << "\"reached\":[";
++            for (std::size_t i = 0; i < impl->portalOutput.graph.reached.size(); ++i)
++            {
++                if (i) receipt << ',';
++                const auto& sector = impl->portalOutput.graph.reached[i];
++                receipt << "{\"sector\":" << sector.sectorId << ",\"frusta\":[";
++                for (std::size_t fi = 0; fi < sector.values.size(); ++fi)
++                {
++                    if (fi) receipt << ',';
++                    const CFrustum& frustum = sector.values[fi];
++                    receipt << "{\"plane_count\":" << frustum.p_count << ",\"planes\":[";
++                    for (int pi = 0; pi < frustum.p_count; ++pi)
++                    {
++                        if (pi) receipt << ',';
++                        const Fplane& plane = frustum.planes[pi];
++                        receipt << '[' << plane.n.x << ',' << plane.n.y << ',' << plane.n.z << ',' << plane.d << ']';
++                    }
++                    receipt << "]}";
++                }
++                receipt << "]}";
++            }
++            receipt << "],\n\"flora_ids\":[";
++            for (std::size_t i = 0; i < ids.size(); ++i)
++            {
++                if (i) receipt << ',';
++                const std::uint32_t id = ids[i].first;
++                const bool indexValid = id < impl->portalOutput.graph.rawVisualVisible.size() &&
++                    id < impl->portalOutput.graph.ownerFrustumTests.size();
++                if (i && !indexValid) { idsValid = false; }
++                receipt << "{\"id\":" << id << ",\"material\":\"" << ids[i].second
++                    << "\",\"raw_visible\":" << (indexValid ?
++                        unsigned(impl->portalOutput.graph.rawVisualVisible[id]) : 1u)
++                    << ",\"owner_tests\":" << (indexValid ?
++                        impl->portalOutput.graph.ownerFrustumTests[id] : 0u) << '}';
++            }
++            receipt << "]}\n";
++            receipt.close();
++        }
++        impl->portalPending = false;
++    }
+     commitLevelSceneUploads(impl->scene);
+     commitTerrainSceneUploads(impl->terrain);
+     if (impl->defVertex) impl->defVertex->CommitSubmittedFrame();
+@@ -7898,6 +8223,7 @@
+ void MetalR4EngineScene::DiscardUnsubmittedFrame()
+ {
+     if (!impl) return;
++    if (impl->portalPending) { impl->portalPending = false; impl->portalSelectedViewMatches = false; }
+     impl->viewHistory.Discard();
+     discardLevelSceneUploads(impl->scene);
+     discardTerrainSceneUploads(impl->terrain);
+diff --git a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.h b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.h
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.h
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.h
+@@ -65,6 +65,8 @@
+     const std::string& LastError() const { return lastError; }
+     bool LoadLevelScene(const std::filesystem::path& levelDirectory);
+     void UnloadLevelScene();
++    bool ObservePortalFrame(const xray::metal::R4PortalContextFrameInput& input,
++        CDB::MODEL* borrowedStaticCform);
+     bool CopyLatestCompletedSaveThumbnail(R4SaveThumbnailSnapshot& snapshot) const;
+     // Called by dxEnvironmentRender::OnFrame on the render thread before its
+     // Metal early return. This is value-only and deliberately cannot expose a
+diff --git a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -40,6 +40,8 @@
+ 
+ // Source LOD controls captured before the value-only OmniFace setup.
+ extern float r_ssaGLOD_start, r_ssaGLOD_end;
++extern float g_fSCREEN, r_ssaDISCARD;
++extern float ps_r__ssaDISCARD_exp, ps_r__ssaDISCARD_fade_k;
+ extern ENGINE_API BOOL g_appLoaded;
+ 
+ namespace
+@@ -599,6 +601,12 @@
+         static_cast<unsigned long long>(scene.DrawableVisualCount()),
+         static_cast<unsigned long long>(scene.DrawableIndexCount()));
+     return true;
++}
++
++bool MetalRenderDeviceRender::ObservePortalFrame(
++    const xray::metal::R4PortalContextFrameInput& input, CDB::MODEL* borrowedStaticCform)
++{
++    return scene.ObservePortalFrame(input, borrowedStaticCform);
+ }
+ 
+ void MetalRenderDeviceRender::UnloadLevelScene()
+@@ -1721,6 +1729,27 @@
+     else
+     {
+         scene.OnFrameSubmitted();
++        const char* captureDirectory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        if (captureDirectory && *captureDirectory && viewState.valid)
++        {
++            const char* captureFrame = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_FRAME");
++            char* end = nullptr;
++            const unsigned long parsed = captureFrame ? std::strtoul(captureFrame, &end, 10) : 0ul;
++            if (captureFrame && *captureFrame && *end == '\0' &&
++                parsed == viewState.engineFrame && parsed == Device.dwFrame)
++            {
++                const auto path = std::filesystem::path(captureDirectory) /
++                    ("main-flora-ids-frame-" + std::to_string(Device.dwFrame) + ".submitted");
++                std::FILE* marker = std::fopen(path.string().c_str(), "wb");
++                if (marker)
++                {
++                    std::fprintf(marker, "engine_frame,%u\nsubmitted_serial,%llu\n",
++                        Device.dwFrame,
++                        static_cast<unsigned long long>(backend->LastSubmittedSerial()));
++                    std::fclose(marker);
++                }
++            }
++        }
+         deviceState = dsOK;
+     }
+     frameActive = false;
+@@ -1745,6 +1774,32 @@
+     };
+     viewState.engineFrame = Device.dwFrame;
+     viewState.valid = true;
++    static const bool ssaObserverRequested = [] {
++        const char* directory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        return directory && *directory;
++    }();
++    if (ssaObserverRequested)
++    {
++        auto& settings = viewState.floraSsaObserver;
++        settings.engineFrame = Device.dwFrame;
++        settings.width = Device.dwWidth;
++        settings.height = Device.dwHeight;
++        settings.fovDegrees = Device.fFOV;
++        settings.geometryLod = ps_r__LOD;
++        settings.discardPixels = ps_r__ssaDISCARD;
++        settings.discardExponent = ps_r__ssaDISCARD_exp;
++        settings.discardFadeK = ps_r__ssaDISCARD_fade_k;
++        settings.screenFactor = g_fSCREEN;
++        settings.effectiveDiscard = r_ssaDISCARD;
++        settings.valid = settings.width > 0u && settings.height > 0u &&
++            std::isfinite(settings.fovDegrees) && settings.fovDegrees > 0.0f &&
++            std::isfinite(settings.geometryLod) && settings.geometryLod > 0.0f &&
++            std::isfinite(settings.discardPixels) && settings.discardPixels > 0.0f &&
++            std::isfinite(settings.discardExponent) &&
++            std::isfinite(settings.discardFadeK) && settings.discardFadeK > 1.0f &&
++            std::isfinite(settings.screenFactor) && settings.screenFactor > 0.0f &&
++            std::isfinite(settings.effectiveDiscard) && settings.effectiveDiscard > 0.0f;
++    }
+ }
+ void MetalRenderDeviceRender::SetCacheXform_prev(Fmatrix& view, Fmatrix& projection)
+ {
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -2,9 +2,11 @@
+ 
+ #include "IR4Backend.h"
+ #include "R4DdsTexture.h"
++#include "R4FloraBlenderMaterial.h"
+ #include "R4LevelGeometry.h"
+ 
+ #include <array>
++#include <cstdint>
+ #include <filesystem>
+ #include <memory>
+ #include <string>
+@@ -13,13 +15,54 @@
+ // This is deliberately a standalone admission adapter.  MetalR4EngineScene
+ // owns the G-buffer pass and may decide later whether to call it; the adapter
+ // never opens, closes, or submits a pass itself.
++struct R4FloraSsaObserverSettings
++{
++    std::uint32_t engineFrame = 0;
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    float fovDegrees = 0.0f;
++    float geometryLod = 0.0f;
++    float discardPixels = 0.0f;
++    float discardExponent = 0.0f;
++    float discardFadeK = 0.0f;
++    float screenFactor = 0.0f;
++    float effectiveDiscard = 0.0f;
++    bool valid = false;
++};
++
+ struct R4FloraViewState
+ {
+     std::array<float, 16> view{};
+     std::array<float, 16> projection{};
++    std::array<float, 16> previousView{};
++    std::array<float, 16> previousProjection{};
+     std::array<float, 3> eye{};
++    std::uint32_t engineFrame = 0;
++    R4FloraSsaObserverSettings ssaObserver;
++    // Authoritative scene static_globals from combine/G-buffer setup. Tree
++    // shaders consume ambient/hemi/sun/fog here; synthesizing a zero-filled
++    // copy turns otherwise valid foliage into black silhouettes.
++    std::shared_ptr<IR4Buffer> staticGlobals;
++    std::array<std::array<float, 4>, 32> previousBenders{};
++    std::array<std::array<float, 4>, 32> currentBenders{};
++    std::array<float, 4> bendersSetup{};
++    std::array<float, 4> windParams{};
++    std::array<float, 4> windSetupGrass{};
++    std::array<float, 4> windSetupTrees{};
++    std::array<float, 4> windAnimation{};
++    std::array<float, 4> windAnimationPrevious{};
++    float treeScaleBiasCorrection = 1.0f;
+     float timeSeconds = 0.0f;
+     bool valid = false;
++    bool previousValid = false;
++    bool windValid = false;
++    // Validation-only switch: draw alpha-tested leaf geometry through the
++    // same branch-wind vertex path but use the opaque depth-only fragment
++    // shader to measure the coverage hidden by alpha discard.
++    bool shadowIgnoreAlpha = false;
++    // Validation-only selector: shadow draws are restricted to tree visuals
++    // outside the production camera frustum when true.
++    bool shadowOnlyOffCamera = false;
+ };
+ 
+ // MSC's tree input is P4/N4/T3/B3/I4.  Level geometry is P3/C4/C4/C4/S4;
+@@ -59,6 +102,15 @@
+         std::filesystem::path leafFragmentMetallibPath;
+         std::filesystem::path trunkVertexMetallibPath;
+         std::filesystem::path trunkFragmentMetallibPath;
++        // Optional, isolated shadow caster shader bundle. When empty, the
++        // visible Flora path stays available and shadow draws are a no-op.
++        std::filesystem::path shadowShaderDirectory;
++        std::filesystem::path instancedShadowShaderDirectory;
++        std::filesystem::path wavesTexturePath;
++        // Archive-winning CBlender_Tree settings from shaders.xr, keyed by
++        // the exact shader name in R4LevelGeometry. Missing records are
++        // rejected instead of inferring alpha or Object LOD state.
++        std::vector<R4FloraBlenderMaterial> shaderMaterials;
+         xray::metal::R4DdsBytesProvider ddsBytesProvider;
+     };
+ 
+@@ -71,6 +123,9 @@
+         std::size_t submittedVisuals = 0;
+         std::size_t culledVisuals = 0;
+         std::size_t draws = 0;
++        std::size_t shadowSubmittedVisuals = 0;
++        std::size_t shadowCulledVisuals = 0;
++        std::size_t shadowDraws = 0;
+     };
+ 
+     MetalR4FloraAdapter();
+@@ -92,6 +147,21 @@
+     bool DrawIntoActiveGBuffer(IR4Backend& backend,
+         const R4FloraViewState& view, std::string& error);
+ 
++    // Requires the active sun/local shadow pass. lightViewProjection must be
++    // the exact matrix used by the corresponding Windows shadow phase.
++    bool DrawShadowCasters(IR4Backend& backend,
++        const std::array<float, 16>& lightViewProjection,
++        const R4FloraViewState& view, std::string& error);
++
++    // Diagnostic-only draw into an isolated scene-owned pass. Selects one
++    // implementation for this call and restores configured mode/telemetry.
++    bool DrawShadowCastersForValidation(IR4Backend& backend,
++        const std::array<float, 16>& lightViewProjection,
++        const R4FloraViewState& view, bool instanced,
++        Telemetry& sampledTelemetry, std::string& error);
++
++    bool HasShadowCasters() const;
++
+     bool IsReady() const { return m_ready; }
+     const std::string& Status() const { return m_status; }
+     const Telemetry& LastTelemetry() const { return m_telemetry; }
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -1,11 +1,14 @@
+ #include "MetalR4FloraAdapter.h"
+ #include "MetalR4EngineFs.h"
++#include "R4StaticShadowIndex.h"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
++#include <numeric>
+ #include <fstream>
+ #include <iterator>
+ #include <limits>
+@@ -16,10 +19,115 @@
+ {
+ constexpr std::uint32_t kTreeVisualType = 7u;
+ constexpr std::size_t kStaticGlobalsSize = 528u;
+-constexpr std::size_t kLeafVertexGlobalsSize = 464u;
++constexpr std::size_t kLeafVertexGlobalsSize = 1520u;
+ constexpr std::size_t kTrunkVertexGlobalsSize = 496u;
+-constexpr std::size_t kFragmentGlobalsSize = 176u;
++// The leaf PS has ssfx_floravariation and two flora-fix float4s after the
++// 176-byte common prefix. The trunk PS ends at that prefix. Binding only the
++// prefix lets the leaf shader read stale upload-arena bytes as color variation.
++constexpr std::size_t kLeafFragmentGlobalsSize = 224u;
++// The original opaque deffer_base_flat PS binds the shared 176-byte globals
++// block and 256-byte dynamic_transforms block, matching its exact reflected
++// CB0/CB1 TLAB slots. It has no alpha discard; the adjacent shadow PS is a
++// separate depth-only shader.
++constexpr std::size_t kTrunkFragmentGlobalsSize = 176u;
+ constexpr std::size_t kTransformsSize = 256u;
++constexpr std::size_t kTreeShadowGlobalsSize = 320u;
++constexpr std::size_t kTreeShadowStaticGlobalsSize = 528u;
++
++struct MainFloraIdCaptureConfig
++{
++    std::filesystem::path directory;
++    std::uint32_t frame = 0;
++    bool enabled = false;
++};
++
++const MainFloraIdCaptureConfig& mainFloraIdCaptureConfig()
++{
++    static const MainFloraIdCaptureConfig config = [] {
++        MainFloraIdCaptureConfig result;
++        const char* directory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        const char* frame = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_FRAME");
++        if (!directory || !*directory || !frame || !*frame)
++            return result;
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(frame, &end, 10);
++        if (*end != '\0' || parsed < 300ul ||
++            parsed > std::numeric_limits<std::uint32_t>::max())
++        {
++            std::fprintf(stderr, "METAL_MAIN_FLORA_IDS status=invalid_frame value=%s\n", frame);
++            return result;
++        }
++        result.directory = directory;
++        result.frame = static_cast<std::uint32_t>(parsed);
++        result.enabled = true;
++        return result;
++    }();
++    return config;
++}
++
++std::uint32_t floatBits(const float value)
++{
++    std::uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++}
++
++template<std::size_t N>
++void writeFloatBits(std::ofstream& output, const char* key,
++    const std::array<float, N>& values)
++{
++    output << key;
++    for (const float value : values)
++    {
++        char bits[9];
++        std::snprintf(bits, sizeof(bits), "%08x", unsigned(floatBits(value)));
++        output << ',' << bits;
++    }
++    output << '\n';
++}
++
++struct CapturedMainFloraDraw
++{
++    std::uint32_t visualId = 0;
++    bool leaf = false;
++};
++
++bool writeMainFloraIds(const MainFloraIdCaptureConfig& config,
++    const R4FloraViewState& view, const std::vector<CapturedMainFloraDraw>& rows,
++    const std::size_t culled)
++{
++    const auto outputPath = config.directory /
++        ("main-flora-ids-frame-" + std::to_string(config.frame) + ".csv");
++    auto partialPath = outputPath;
++    partialPath += ".partial";
++    std::ofstream output(partialPath, std::ios::binary | std::ios::trunc);
++    if (!output)
++        return false;
++    const auto& settings = view.ssaObserver;
++    output << "schema,main-flora-id-observer/v1\n"
++           << "engine_frame," << view.engineFrame << '\n'
++           << "extent," << settings.width << ',' << settings.height << '\n'
++           << "admitted," << rows.size() + culled << '\n'
++           << "submitted," << rows.size() << '\n'
++           << "culled," << culled << '\n';
++    writeFloatBits(output, "view_bits", view.view);
++    writeFloatBits(output, "projection_bits", view.projection);
++    writeFloatBits(output, "eye_bits", view.eye);
++    writeFloatBits(output, "ssa_settings_bits", std::array<float, 7>{
++        settings.fovDegrees, settings.geometryLod, settings.discardPixels,
++        settings.discardExponent, settings.discardFadeK,
++        settings.screenFactor, settings.effectiveDiscard});
++    output << "visual_id,material\n";
++    for (const auto& row : rows)
++        output << row.visualId << ',' << (row.leaf ? "leaf" : "trunk") << '\n';
++    output << "encode_complete," << rows.size() << '\n';
++    output.close();
++    if (!output)
++        return false;
++    std::error_code renameError;
++    std::filesystem::rename(partialPath, outputPath, renameError);
++    return !renameError;
++}
+ 
+ struct Matrix4 { float elements[16]{}; };
+ 
+@@ -87,6 +195,8 @@
+     return std::any_of(outside.begin(), outside.end(), [](const bool value) { return value; });
+ }
+ 
++using FloraShadowIndex = xray::metal::R4StaticShadowIndex;
++
+ bool readText(const std::filesystem::path& path, std::string& value)
+ {
+     std::ifstream input(path, std::ios::binary);
+@@ -145,18 +255,94 @@
+         error = "flora MSC metallib or adjacent reflection receipt is unavailable";
+         return false;
+     }
+-    static constexpr const char* VertexTlab =
++    static constexpr const char* TrunkVertexTlab =
+         "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
++    static constexpr const char* LeafVertexTlab =
++        "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]";
++    const bool leafWindVertex = std::string(vsName) == "leaf_wave_hq.vs.metallib";
++    const bool alphaTestedFragment = std::string(psName) == "leaf_wave_hq.ps.metallib";
++    const char* vertexTlab = leafWindVertex ? LeafVertexTlab : TrunkVertexTlab;
+     if (vs.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
+-        vs.find("\"ResourceCount\":2") == std::string::npos ||
+-        vs.find(VertexTlab) == std::string::npos || vs.find(vsInputs) == std::string::npos ||
++        vs.find(leafWindVertex ? "\"ResourceCount\":4" : "\"ResourceCount\":2") == std::string::npos ||
++        vs.find(vertexTlab) == std::string::npos || vs.find(vsInputs) == std::string::npos ||
+         ps.find("\"ShaderType\":\"Fragment\"") == std::string::npos ||
+         ps.find("\"ResourceCount\":" + std::to_string(psResourceCount)) == std::string::npos ||
+         ps.find(psTlab) == std::string::npos ||
+-        ps.find("\"num_render_targets\":4") == std::string::npos)
++        ps.find("\"num_render_targets\":4") == std::string::npos ||
++        ps.find(std::string("\"discards\":") + (alphaTestedFragment ? "true" : "false")) ==
++            std::string::npos)
+     {
+         error = "flora MSC reflection does not match the recorded tree ABI";
+         return false;
++    }
++    return true;
++}
++
++bool validateTreeShadowBundle(const std::filesystem::path& directory, std::string& error)
++{
++    const std::array<const char*, 4> names = {"shadow_direct_tree.vs.metallib",
++        "shadow_direct_tree_aref.vs.metallib", "shadow_direct_base_color.ps.metallib",
++        "shadow_direct_base_aref_color.ps.metallib"};
++    for (const char* name : names)
++        if (!std::filesystem::is_regular_file(directory / name))
++        {
++            error = std::string("flora shadow MSC bundle is missing ") + name;
++            return false;
++        }
++    const auto reflection = [&directory](const char* name, std::string& json) {
++        std::filesystem::path path = directory / name;
++        path.replace_extension(".reflection.json");
++        return readText(path, json);
++    };
++    std::string opaqueVs, leafVs, opaquePs, alphaPs;
++    if (!reflection(names[0], opaqueVs) || !reflection(names[1], leafVs) ||
++        !reflection(names[2], opaquePs) || !reflection(names[3], alphaPs))
++    {
++        error = "flora shadow MSC reflection receipt is missing";
++        return false;
++    }
++    const auto contains = [](const std::string& text, const char* token) {
++        return text.find(token) != std::string::npos;
++    };
++    if (!contains(opaqueVs, "\"ShaderType\":\"Vertex\"") ||
++        !contains(opaqueVs, "\"ResourceCount\":2") ||
++        !contains(opaqueVs, "\"name\":\"position0\"") ||
++        !contains(opaqueVs, "\"columnCount\":4,\"elementType\":\"Float\"") ||
++        !contains(leafVs, "\"ShaderType\":\"Vertex\"") ||
++        !contains(leafVs, "\"ResourceCount\":4") ||
++        !contains(leafVs, "\"name\":\"texcoord0\"") ||
++        !contains(leafVs, "\"elementType\":\"Int32\"") ||
++        !contains(opaquePs, "\"ShaderType\":\"Fragment\"") ||
++        !contains(opaquePs, "\"num_render_targets\":1") ||
++        !contains(alphaPs, "\"ShaderType\":\"Fragment\"") ||
++        !contains(alphaPs, "\"ResourceCount\":2") ||
++        !contains(alphaPs, "\"discards\":true"))
++    {
++        error = "flora shadow reflection differs from the treewave/AREF source ABI";
++        return false;
++    }
++    return true;
++}
++
++// Exact MSC resource order: the model SRV precedes the unchanged source CBs.
++bool validateInstancedTreeShadowBundle(const std::filesystem::path& directory, std::string& error)
++{
++    for (const bool leaf : {false, true})
++    {
++        const std::string name = leaf ? "shadow_direct_tree_instanced_aref.vs" :
++            "shadow_direct_tree_instanced.vs";
++        std::string json;
++        if (!std::filesystem::is_regular_file(directory / (name + ".metallib")) ||
++            !readText(directory / (name + ".reflection.json"), json))
++        { error = "E08 instanced Flora shader/reflection unavailable"; return false; }
++        const std::string expected = leaf ?
++            "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":72,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":96,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"Sampler\"}]" :
++            "\"TopLevelArgumentBuffer\":[{\"EltOffset\":0,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"SRV\"},{\"EltOffset\":24,\"Name\":\"\",\"Size\":24,\"Slot\":0,\"Space\":0,\"Type\":\"CBV\"},{\"EltOffset\":48,\"Name\":\"\",\"Size\":24,\"Slot\":1,\"Space\":0,\"Type\":\"CBV\"}]";
++        if (json.find(expected) == std::string::npos ||
++            json.find("\"ShaderType\":\"Vertex\"") == std::string::npos ||
++            json.find(leaf ? "\"ResourceCount\":5" : "\"ResourceCount\":3") == std::string::npos ||
++            json.find("\"needs_draw_params\":false") == std::string::npos)
++        { error = "E08 instanced Flora reflected model-buffer ABI mismatch"; return false; }
+     }
+     return true;
+ }
+@@ -226,6 +412,27 @@
+     return result;
+ }
+ 
++bool validateFloraMaterialFlags(const FloraMaterial material, const bool alphaBlend,
++    const bool objectLod, std::string& error)
++{
++    if (objectLod)
++    {
++        error = "Object LOD Flora variant has no admitted Metal G-buffer pipeline";
++        return false;
++    }
++    if (material == FloraMaterial::LeafBump && !alphaBlend)
++    {
++        error = "opaque leaf B_TREE variant has no admitted Metal G-buffer pipeline";
++        return false;
++    }
++    if (material == FloraMaterial::TrunkFlat && alphaBlend)
++    {
++        error = "alpha trunk B_TREE variant has no matching admitted wind pipeline";
++        return false;
++    }
++    return true;
++}
++
+ std::string geometryCacheKey(const xray::metal::R4StaticVisual& visual)
+ {
+     return std::to_string(visual.vertexBufferId) + ':' + std::to_string(visual.vertexBase) + ':' +
+@@ -327,8 +534,13 @@
+     struct Draw
+     {
+         std::uint32_t visualId = 0;
++        std::size_t shadowGroup = 0;
+         Material material = Material::LeafBump;
++        bool alphaTested = false;
++        bool objectLod = false;
+         Matrix4 model{};
++        std::array<float, 5> treeScale{};
++        std::array<float, 5> treeBias{};
+         bool hasBounds = false;
+         std::array<float, 3> boundsMinimum{};
+         std::array<float, 3> boundsMaximum{};
+@@ -336,17 +548,36 @@
+         std::shared_ptr<IR4Buffer> vertices;
+         std::shared_ptr<IR4Buffer> indices;
+         std::vector<std::shared_ptr<IR4Texture>> textures;
+-        std::shared_ptr<IR4Buffer> vertexGlobals;
+-        std::shared_ptr<IR4Buffer> staticGlobals;
+-        std::shared_ptr<IR4Buffer> fragmentGlobals;
+-        std::shared_ptr<IR4Buffer> transforms;
+     };
+     std::shared_ptr<IR4GraphicsPipeline> leafPipeline;
+     std::shared_ptr<IR4GraphicsPipeline> trunkPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> leafShadowPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaShadowPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> trunkShadowPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> leafInstancedShadowPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> leafNoAlphaInstancedShadowPipeline;
++    std::shared_ptr<IR4GraphicsPipeline> trunkInstancedShadowPipeline;
++    struct ShadowGroup
++    {
++        std::size_t representative = 0;
++        std::vector<Matrix4> models;
++    };
++    std::vector<ShadowGroup> shadowGroups;
++    bool shadowInstancing = false;
++    bool reuseVisibleGlobals = std::getenv("XRAY_METAL_E08_FLORA_REUSE_GLOBALS") != nullptr;
++    std::vector<std::uint8_t> visibleVertexGlobals;
++    std::vector<std::uint8_t> visibleFragmentGlobals;
++    std::vector<std::uint8_t> visibleTransforms;
+     std::shared_ptr<IR4Sampler> sampler;
++    std::shared_ptr<IR4Texture> wavesTexture;
++    std::string shadowError;
+     std::unordered_map<std::string, CachedGeometry> geometry;
+     std::unordered_map<std::string, std::shared_ptr<IR4Texture>> textures;
+     std::vector<Draw> draws;
++    FloraShadowIndex shadowIndex;
++    bool shadowLinear = std::getenv("XRAY_METAL_E08_FLORA_LINEAR") != nullptr;
++    bool shadowOracle = std::getenv("XRAY_METAL_E08_FLORA_ORACLE") != nullptr;
++    std::size_t oracleViews = 0;
+ };
+ 
+ MetalR4FloraAdapter::MetalR4FloraAdapter() = default;
+@@ -360,6 +591,16 @@
+     m_status.clear();
+     m_telemetry = {};
+     m_impl = std::make_unique<Impl>();
++    std::unordered_map<std::string, R4FloraBlenderMaterial> materialFlags;
++    for (const R4FloraBlenderMaterial& material : options.shaderMaterials)
++    {
++        if (material.shaderName.empty() || !materialFlags.emplace(material.shaderName, material).second)
++        {
++            m_status = "flora shader material metadata is empty or duplicated";
++            status = m_status;
++            return true;
++        }
++    }
+     if (!options.ddsBytesProvider)
+     {
+         m_status = "flora MSC admission requires the engine XRFS DDS provider";
+@@ -418,6 +659,88 @@
+         status = m_status;
+         return true;
+     }
++    if (!options.shadowShaderDirectory.empty())
++    {
++        std::string shadowError;
++        const auto makeShadowPipeline = [&backend, &shadowError](const char* label, const char* key,
++            const std::filesystem::path& vsPath, const std::filesystem::path& psPath,
++            const bool alphaTested) {
++            R4GraphicsPipelineDesc pipeline;
++            pipeline.label = label;
++            pipeline.shaderKey = key;
++            const std::string vsString = vsPath.string();
++            const std::string psString = psPath.string();
++            pipeline.vertexMetallibPath = vsString.c_str();
++            pipeline.fragmentMetallibPath = psString.c_str();
++            pipeline.vertexAttributes = {{11u, 6u, 0u, R4VertexFormat::Float4}};
++            if (alphaTested)
++                // shadow_direct_tree_aref.vs has POSITION0/TEXCOORD0, so its
++                // second MSC vertex input maps to attribute index 12 (not the
++                // full tree G-buffer's texcoord index 15).
++                pipeline.vertexAttributes.push_back({12u, 6u, 56u, R4VertexFormat::Int4});
++            pipeline.vertexLayouts = {{6u, sizeof(R4FloraStaticVertex)}};
++            pipeline.colorFormats = {R4PixelFormat::R32Float};
++            pipeline.depthFormat = R4PixelFormat::Depth32Float;
++            pipeline.depthCompare = R4CompareFunction::Less;
++            pipeline.depthWrite = true;
++            // CBlender_Tree's shadow r_Pass does not override D3DRS_CULLMODE.
++            // The regular R4 scene baseline is D3DCULL_CCW, which maps to
++            // Metal back-face culling with clockwise front faces.
++            pipeline.cullMode = R4CullMode::Back;
++            pipeline.frontFace = R4Winding::Clockwise;
++            return backend.CreateGraphicsPipeline(pipeline, shadowError);
++        };
++        if (!validateTreeShadowBundle(options.shadowShaderDirectory, shadowError))
++            m_impl->shadowError = shadowError;
++        else
++        {
++            m_impl->trunkShadowPipeline = makeShadowPipeline("R4 flora shadow regular-tree opaque",
++                "r4-flora-shadow-tree-opaque-v1",
++                options.shadowShaderDirectory / "shadow_direct_tree.vs.metallib",
++                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", false);
++            if (m_impl->trunkShadowPipeline)
++                m_impl->leafShadowPipeline = makeShadowPipeline("R4 flora shadow regular-tree alpha",
++                    "r4-flora-shadow-tree-aref-v1",
++                    options.shadowShaderDirectory / "shadow_direct_tree_aref.vs.metallib",
++                    options.shadowShaderDirectory / "shadow_direct_base_aref_color.ps.metallib", true);
++            if (m_impl->leafShadowPipeline)
++                m_impl->leafNoAlphaShadowPipeline = makeShadowPipeline(
++                    "R4 flora shadow regular-tree alpha-ignore validation",
++                    "r4-flora-shadow-tree-aref-no-alpha-validation-v1",
++                    options.shadowShaderDirectory / "shadow_direct_tree_aref.vs.metallib",
++                    options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", true);
++            if (!m_impl->trunkShadowPipeline || !m_impl->leafShadowPipeline ||
++                !m_impl->leafNoAlphaShadowPipeline)
++                m_impl->shadowError = "flora shadow pipeline creation failed: " + shadowError;
++        }
++        if (!options.instancedShadowShaderDirectory.empty() &&
++            std::getenv("XRAY_METAL_E08_FLORA_INSTANCING_OFF") == nullptr)
++        {
++            if (!m_impl->shadowError.empty() ||
++                !validateInstancedTreeShadowBundle(options.instancedShadowShaderDirectory, shadowError))
++            { status = "E08 instanced Flora preparation failed: " + shadowError; return false; }
++            const auto& dir = options.instancedShadowShaderDirectory;
++            m_impl->trunkInstancedShadowPipeline = makeShadowPipeline(
++                "R4 E08 instanced Flora trunk shadow", "r4-e08-flora-instanced-trunk",
++                dir / "shadow_direct_tree_instanced.vs.metallib",
++                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", false);
++            m_impl->leafInstancedShadowPipeline = makeShadowPipeline(
++                "R4 E08 instanced Flora leaf shadow", "r4-e08-flora-instanced-leaf",
++                dir / "shadow_direct_tree_instanced_aref.vs.metallib",
++                options.shadowShaderDirectory / "shadow_direct_base_aref_color.ps.metallib", true);
++            m_impl->leafNoAlphaInstancedShadowPipeline = makeShadowPipeline(
++                "R4 E08 instanced Flora leaf alpha-ignore", "r4-e08-flora-instanced-leaf-no-alpha",
++                dir / "shadow_direct_tree_instanced_aref.vs.metallib",
++                options.shadowShaderDirectory / "shadow_direct_base_color.ps.metallib", true);
++            if (!m_impl->trunkInstancedShadowPipeline || !m_impl->leafInstancedShadowPipeline ||
++                !m_impl->leafNoAlphaInstancedShadowPipeline)
++            { status = "E08 instanced Flora pipeline failed: " + shadowError; return false; }
++            m_impl->shadowInstancing = true;
++        }
++        if (!m_impl->shadowError.empty())
++            std::fprintf(stderr, "METAL_FLORA_SHADOW_UNAVAILABLE reason=\"%s\"\n",
++                m_impl->shadowError.c_str());
++    }
+     R4SamplerDesc sampler;
+     sampler.label = "R4 flora MSC base sampler";
+     sampler.maxAnisotropy = 8u;
+@@ -425,6 +748,20 @@
+     if (!m_impl->sampler)
+     {
+         m_status = "flora MSC sampler unavailable: " + error;
++        status = m_status;
++        return true;
++    }
++    if (options.wavesTexturePath.empty())
++    {
++        m_status = "flora wind bundle requires the production fx\\wind_wave XRFS texture";
++        status = m_status;
++        return true;
++    }
++    xray::metal::R4DdsTexture waves;
++    if (!xray::metal::LoadR4DdsTexture(options.wavesTexturePath, options.ddsBytesProvider, waves, error) ||
++        !uploadDds(backend.Resources(), waves, "R4 flora production wind-wave DDS", m_impl->wavesTexture, error))
++    {
++        m_status = "flora wind-wave texture unavailable: " + error;
+         status = m_status;
+         return true;
+     }
+@@ -442,6 +779,22 @@
+         if (!visual || visual->shaderId >= geometry.shaders.size() ||
+             visual->vertexBufferId >= geometry.vertexBuffers.size() || visual->indexBufferId >= geometry.indexBuffers.size())
+             localError = "missing visual, material, or source buffer";
++        const R4FloraBlenderMaterial* blenderMaterial = nullptr;
++        if (localError.empty())
++        {
++            const std::string& shaderName = geometry.shaders[visual->shaderId].shaderName;
++            const auto found = materialFlags.find(shaderName);
++            if (found == materialFlags.end())
++                localError = "archive-winning B_TREE metadata is missing for " + shaderName;
++            else
++                blenderMaterial = &found->second;
++        }
++        if (localError.empty() && blenderMaterial)
++            validateFloraMaterialFlags(candidate.material == Impl::Material::LeafBump ?
++                    FloraMaterial::LeafBump : FloraMaterial::TrunkFlat,
++                blenderMaterial->alphaBlend, blenderMaterial->objectLod, localError);
++        if (localError.empty() && !visual->hasTreeLighting)
++            localError = "tree visual is missing its authored OGF_TREEDEF2 scale/bias lighting";
+         std::vector<R4FloraStaticVertex> vertices;
+         std::vector<std::uint16_t> indices;
+         if (localError.empty() && !RepackR4FloraStaticVertices(
+@@ -473,6 +826,11 @@
+         Impl::Draw draw;
+         draw.visualId = visual ? visual->visualId : 0u;
+         draw.material = candidate.material;
++        if (blenderMaterial)
++        {
++            draw.alphaTested = blenderMaterial->alphaBlend;
++            draw.objectLod = blenderMaterial->objectLod;
++        }
+         draw.indexCount = visual ? visual->indexCount : 0u;
+         if (visual && visual->referencedPositionBounds.available)
+         {
+@@ -486,6 +844,8 @@
+                 std::memcpy(draw.model.elements, visual->modelTransform.data(), sizeof(draw.model.elements));
+             else
+                 for (std::size_t element = 0; element < 16u; element += 5u) draw.model.elements[element] = 1.0f;
++            draw.treeScale = visual->treeScale;
++            draw.treeBias = visual->treeBias;
+             const std::string key = geometryCacheKey(*visual);
+             const auto cached = m_impl->geometry.find(key);
+             if (cached != m_impl->geometry.end())
+@@ -563,20 +923,6 @@
+                 draw.textures.emplace_back(std::move(texture));
+             }
+         }
+-        const auto makeUniform = [&resources, &localError](const std::size_t size, const char* label) {
+-            R4BufferDesc desc{size, R4ResourceStorage::Shared, R4BufferUsage::Uniform, label};
+-            return resources.CreateBuffer(desc, nullptr, 0, localError);
+-        };
+-        if (localError.empty())
+-        {
+-            draw.vertexGlobals = makeUniform(candidate.material == Impl::Material::LeafBump ?
+-                kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize, "R4 flora VS globals");
+-            draw.staticGlobals = makeUniform(kStaticGlobalsSize, "R4 flora static globals");
+-            draw.fragmentGlobals = makeUniform(kFragmentGlobalsSize, "R4 flora PS globals");
+-            draw.transforms = makeUniform(kTransformsSize, "R4 flora transforms");
+-            if (!draw.vertexGlobals || !draw.staticGlobals || !draw.fragmentGlobals || !draw.transforms)
+-                localError = localError.empty() ? "flora uniform allocation failed" : localError;
+-        }
+         if (!localError.empty())
+         {
+             ++m_telemetry.skippedVisuals;
+@@ -587,6 +933,40 @@
+         m_impl->draws.emplace_back(std::move(draw));
+         ++m_telemetry.admittedVisuals;
+     }
++    for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
++    {
++        const auto& d = m_impl->draws[i];
++        m_impl->shadowIndex.Add(d.hasBounds, d.boundsMinimum, d.boundsMaximum, d.model.elements, i);
++    }
++    m_impl->shadowIndex.Finish();
++    // Only identical geometry/material resources share a draw. Instance order
++    // within each group follows the original level draw order; the immutable
++    // model slice is fresh for every light/cascade and every submitted frame.
++    std::vector<std::size_t> groupSizes;
++    for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
++    {
++        auto& d = m_impl->draws[i];
++        std::size_t g = 0;
++        for (; g < m_impl->shadowGroups.size(); ++g)
++        {
++            const auto& r = m_impl->draws[m_impl->shadowGroups[g].representative];
++            if (d.vertices == r.vertices && d.indices == r.indices && d.indexCount == r.indexCount &&
++                d.material == r.material && d.alphaTested == r.alphaTested &&
++                d.objectLod == r.objectLod && d.textures[0] == r.textures[0])
++                break;
++        }
++        if (g == m_impl->shadowGroups.size())
++        { m_impl->shadowGroups.push_back({i, {}}); groupSizes.push_back(0); }
++        d.shadowGroup = g;
++        ++groupSizes[g];
++    }
++    for (std::size_t g = 0; g < groupSizes.size(); ++g)
++        m_impl->shadowGroups[g].models.reserve(groupSizes[g]);
++    std::fprintf(stderr, "METAL_E08_FLORA_INSTANCING enabled=%d groups=%zu instances=%zu stride=64\n",
++        int(m_impl->shadowInstancing), m_impl->shadowGroups.size(), m_impl->draws.size());
++
++    std::fprintf(stderr, "METAL_E08_FLORA_INVENTORY draws=%zu geometry_buffers=%zu textures=%zu\n",
++        m_impl->draws.size(), m_impl->geometry.size(), m_impl->textures.size());
+     m_ready = !m_impl->draws.empty();
+     m_status = m_ready ? "flora MSC adapter ready" : "flora MSC adapter admitted no visuals";
+     status = m_status;
+@@ -598,14 +978,35 @@
+ {
+     if (!m_ready || !view.valid)
+         return true;
++    if (!view.staticGlobals)
++    {
++        error = "flora requires the live scene static_globals buffer";
++        return false;
++    }
+     Matrix4 viewMatrix;
+     Matrix4 projection;
++    Matrix4 previousViewMatrix;
++    Matrix4 previousProjection;
+     std::memcpy(viewMatrix.elements, view.view.data(), sizeof(viewMatrix.elements));
+     std::memcpy(projection.elements, view.projection.data(), sizeof(projection.elements));
++    std::memcpy(previousViewMatrix.elements,
++        view.previousValid ? view.previousView.data() : view.view.data(),
++        sizeof(previousViewMatrix.elements));
++    std::memcpy(previousProjection.elements,
++        view.previousValid ? view.previousProjection.data() : view.projection.data(),
++        sizeof(previousProjection.elements));
+     const Matrix4 vp = multiply(projection, viewMatrix);
++    const Matrix4 previousVp = multiply(previousProjection, previousViewMatrix);
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    const auto& captureConfig = mainFloraIdCaptureConfig();
++    const bool selectedFrame = captureConfig.enabled && view.engineFrame == captureConfig.frame;
++    const bool captureIds = selectedFrame && view.ssaObserver.valid &&
++        view.ssaObserver.engineFrame == view.engineFrame;
++    std::vector<CapturedMainFloraDraw> captured;
++    if (captureIds)
++        captured.reserve(m_impl->draws.size());
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+@@ -615,58 +1016,125 @@
+             ++m_telemetry.culledVisuals;
+             continue;
+         }
+-        std::vector<std::uint8_t> vertexGlobals(
+-            draw.material == Impl::Material::LeafBump ? kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize);
+-        std::vector<std::uint8_t> staticGlobals(kStaticGlobalsSize);
+-        std::vector<std::uint8_t> fragmentGlobals(kFragmentGlobalsSize);
+-        std::vector<std::uint8_t> transforms(kTransformsSize);
++        std::vector<std::uint8_t> localVertex, localFragment, localTransforms;
++        auto& vertexGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleVertexGlobals : localVertex;
++        auto& fragmentGlobals = m_impl->reuseVisibleGlobals ? m_impl->visibleFragmentGlobals : localFragment;
++        auto& transforms = m_impl->reuseVisibleGlobals ? m_impl->visibleTransforms : localTransforms;
++        // CPU staging only: every GPU bind still receives an immutable arena
++        // slice. assign clears the complete source CB, including unused bytes.
++        vertexGlobals.assign(draw.material == Impl::Material::LeafBump ?
++            kLeafVertexGlobalsSize : kTrunkVertexGlobalsSize, 0);
++        fragmentGlobals.assign(draw.material == Impl::Material::LeafBump ?
++            kLeafFragmentGlobalsSize : kTrunkFragmentGlobalsSize, 0);
++        transforms.assign(kTransformsSize, 0);
+         std::memcpy(vertexGlobals.data(), &wvp, sizeof(wvp));
+-        std::memcpy(vertexGlobals.data() + 64u, &vp, sizeof(vp));
+-        std::memcpy(vertexGlobals.data() + 160u, &draw.model, sizeof(draw.model));
+-        std::memcpy(vertexGlobals.data() + 224u, &wv, sizeof(wv));
+-        putFloat4(vertexGlobals, 288u, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
+-        putFloat4(vertexGlobals, 304u, 0.0f, 0.0f, 0.0f, 1.0f);
+-        putFloat4(vertexGlobals, 320u, 0.0f, 0.0f, 0.0f, 0.0f);
+-        putFloat4(vertexGlobals, 352u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+-        if (draw.material == Impl::Material::TrunkFlat)
+-        {
++        std::memcpy(vertexGlobals.data() + 64u, &previousVp, sizeof(previousVp));
++        const bool leaf = draw.material == Impl::Material::LeafBump;
++        const std::size_t transformOffset = leaf ? 1216u : 160u;
++        const std::size_t viewTransformOffset = leaf ? 1280u : 224u;
++        const std::size_t constsOffset = leaf ? 1344u : 288u;
++        std::memcpy(vertexGlobals.data() + transformOffset, &draw.model, sizeof(draw.model));
++        std::memcpy(vertexGlobals.data() + viewTransformOffset, &wv, sizeof(wv));
++        putFloat4(vertexGlobals, constsOffset, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
++        // FTreeVisual halves OGF_TREEDEF2 colours at load, then R4 applies
++        // r__d_tree_SBC * 1.3333 before binding c_scale/c_bias/c_sun.
++        const float treeCorrection = std::isfinite(view.treeScaleBiasCorrection) ?
++            view.treeScaleBiasCorrection * (1.3333f * 0.5f) : 0.0f;
++        const std::size_t scaleOffset = leaf ? 1360u : 304u;
++        const std::size_t biasOffset = leaf ? 1376u : 320u;
++        const std::size_t sunOffset = leaf ? 1424u : 368u;
++        putFloat4(vertexGlobals, scaleOffset, treeCorrection * draw.treeScale[0],
++            treeCorrection * draw.treeScale[1], treeCorrection * draw.treeScale[2],
++            treeCorrection * draw.treeScale[3]);
++        putFloat4(vertexGlobals, biasOffset, treeCorrection * draw.treeBias[0],
++            treeCorrection * draw.treeBias[1], treeCorrection * draw.treeBias[2],
++            treeCorrection * draw.treeBias[3]);
++        putFloat4(vertexGlobals, sunOffset, treeCorrection * draw.treeScale[4],
++            treeCorrection * draw.treeBias[4], 0.0f, 0.0f);
++        if (leaf)
++        {
++            if (view.windValid)
++            {
++                std::memcpy(vertexGlobals.data() + 160u, view.previousBenders.data(),
++                    sizeof(view.previousBenders));
++                std::memcpy(vertexGlobals.data() + 672u, view.currentBenders.data(),
++                    sizeof(view.currentBenders));
++                std::memcpy(vertexGlobals.data() + 1184u, view.bendersSetup.data(),
++                    sizeof(view.bendersSetup));
++            }
++            putFloat4(vertexGlobals, 1200u, 0.0f, 0.0f, 0.0f, 0.0f);
++            putFloat4(vertexGlobals, 1392u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
++            putFloat4(vertexGlobals, 1408u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
++            putFloat4(vertexGlobals, 1440u, view.windParams[0], view.windParams[1],
++                view.windParams[2], view.windParams[3]);
++            putFloat4(vertexGlobals, 1456u, view.windSetupGrass[0], view.windSetupGrass[1],
++                view.windSetupGrass[2], view.windSetupGrass[3]);
++            putFloat4(vertexGlobals, 1472u, view.windSetupTrees[0], view.windSetupTrees[1],
++                view.windSetupTrees[2], view.windSetupTrees[3]);
++            putFloat4(vertexGlobals, 1488u, view.windAnimation[0], view.windAnimation[1],
++                view.windAnimation[2], view.windAnimation[3]);
++            putFloat4(vertexGlobals, 1504u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
++                view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++        }
++        else
++        {
++            putFloat4(vertexGlobals, 336u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
++            putFloat4(vertexGlobals, 352u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+             putFloat4(vertexGlobals, 384u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+             putFloat4(vertexGlobals, 400u, 0.0f, 0.0f, 0.0f, view.timeSeconds);
+-        }
+-        std::memcpy(staticGlobals.data(), &viewMatrix, sizeof(viewMatrix));
+-        std::memcpy(staticGlobals.data() + 128u, &projection, sizeof(projection));
+-        std::memcpy(staticGlobals.data() + 192u, &vp, sizeof(vp));
+-        putFloat4(staticGlobals, 256u, view.timeSeconds, 0.0f, 0.0f, 0.0f);
+-        putFloat4(staticGlobals, 384u, view.eye[0], view.eye[1], view.eye[2], 0.0f);
++            putFloat4(vertexGlobals, 416u, view.windParams[0], view.windParams[1],
++                view.windParams[2], view.windParams[3]);
++            putFloat4(vertexGlobals, 432u, view.windSetupGrass[0], view.windSetupGrass[1],
++                view.windSetupGrass[2], view.windSetupGrass[3]);
++            putFloat4(vertexGlobals, 448u, view.windSetupTrees[0], view.windSetupTrees[1],
++                view.windSetupTrees[2], view.windSetupTrees[3]);
++            putFloat4(vertexGlobals, 464u, view.windAnimation[0], view.windAnimation[1],
++                view.windAnimation[2], view.windAnimation[3]);
++            putFloat4(vertexGlobals, 480u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
++                view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++        }
+         std::memcpy(fragmentGlobals.data(), &wvp, sizeof(wvp));
+-        std::memcpy(fragmentGlobals.data() + 64u, &vp, sizeof(vp));
++        std::memcpy(fragmentGlobals.data() + 64u, &previousVp, sizeof(previousVp));
+         std::memcpy(transforms.data(), &wvp, sizeof(wvp));
+         std::memcpy(transforms.data() + 64u, &wv, sizeof(wv));
+         std::memcpy(transforms.data() + 128u, &draw.model, sizeof(draw.model));
+         putFloat4(transforms, 192u, 0.0f, 0.0f, 0.0f, 0.25f);
+-        if (!backend.Resources().UpdateBuffer(draw.vertexGlobals, 0, vertexGlobals.data(), vertexGlobals.size(), error) ||
+-            !backend.Resources().UpdateBuffer(draw.staticGlobals, 0, staticGlobals.data(), staticGlobals.size(), error) ||
+-            !backend.Resources().UpdateBuffer(draw.fragmentGlobals, 0, fragmentGlobals.data(), fragmentGlobals.size(), error) ||
+-            !backend.Resources().UpdateBuffer(draw.transforms, 0, transforms.data(), transforms.size(), error))
++        R4FrameBufferSlice vertexGlobalsSlice;
++        R4FrameBufferSlice fragmentGlobalsSlice;
++        R4FrameBufferSlice transformsSlice;
++        if (!backend.UploadFrameData(vertexGlobals.data(), vertexGlobals.size(), 256u,
++                vertexGlobalsSlice, error) ||
++            !backend.UploadFrameData(fragmentGlobals.data(), fragmentGlobals.size(), 256u,
++                fragmentGlobalsSlice, error) ||
++            !backend.UploadFrameData(transforms.data(), transforms.size(), 256u,
++                transformsSlice, error))
+             return false;
+-        const bool leaf = draw.material == Impl::Material::LeafBump;
+-        R4MscStageBindings vs{R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer, 0u,
+-            draw.vertexGlobals, 0, vertexGlobals.size()}, {R4MscResourceType::ConstantBuffer, 24u,
+-            draw.staticGlobals, 0, staticGlobals.size()}}};
++        R4MscStageBindings vs;
++        vs.stage = R4ShaderStage::Vertex;
++        if (leaf)
++            vs = {R4ShaderStage::Vertex, 96u, {{R4MscResourceType::Texture, 0u, nullptr, 0u, 0u,
++                m_impl->wavesTexture}, {R4MscResourceType::ConstantBuffer, 24u, vertexGlobalsSlice.buffer,
++                vertexGlobalsSlice.offset, vertexGlobalsSlice.size}, {R4MscResourceType::ConstantBuffer, 48u,
++                view.staticGlobals, 0u, kStaticGlobalsSize}, {R4MscResourceType::Sampler, 72u,
++                nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
++        else
++            vs = {R4ShaderStage::Vertex, 48u, {{R4MscResourceType::ConstantBuffer, 0u,
++                vertexGlobalsSlice.buffer, vertexGlobalsSlice.offset, vertexGlobalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 24u, view.staticGlobals, 0u, kStaticGlobalsSize}}};
+         R4MscStageBindings ps;
+         ps.stage = R4ShaderStage::Fragment;
+         if (leaf)
+             ps = {R4ShaderStage::Fragment, 168u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
+                 {R4MscResourceType::Texture, 24u, {}, 0, 0, draw.textures[1]},
+                 {R4MscResourceType::Texture, 48u, {}, 0, 0, draw.textures[2]},
+-                {R4MscResourceType::ConstantBuffer, 72u, draw.fragmentGlobals, 0, kFragmentGlobalsSize},
+-                {R4MscResourceType::ConstantBuffer, 96u, draw.transforms, 0, kTransformsSize},
+-                {R4MscResourceType::ConstantBuffer, 120u, draw.staticGlobals, 0, kStaticGlobalsSize},
++                {R4MscResourceType::ConstantBuffer, 72u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 96u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 120u, view.staticGlobals, 0, kStaticGlobalsSize},
+                 {R4MscResourceType::Sampler, 144u, {}, 0, 0, {}, m_impl->sampler}}};
+         else
+             ps = {R4ShaderStage::Fragment, 96u, {{R4MscResourceType::Texture, 0u, {}, 0, 0, draw.textures[0]},
+-                {R4MscResourceType::ConstantBuffer, 24u, draw.fragmentGlobals, 0, kFragmentGlobalsSize},
+-                {R4MscResourceType::ConstantBuffer, 48u, draw.transforms, 0, kTransformsSize},
++                {R4MscResourceType::ConstantBuffer, 24u, fragmentGlobalsSlice.buffer, fragmentGlobalsSlice.offset, fragmentGlobalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 48u, transformsSlice.buffer, transformsSlice.offset, transformsSlice.size},
+                 {R4MscResourceType::Sampler, 72u, {}, 0, 0, {}, m_impl->sampler}}};
+         R4IndexedDrawDesc indexed;
+         indexed.indexBuffer = draw.indices;
+@@ -679,8 +1147,252 @@
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
+-    }
++        if (captureIds)
++            captured.push_back({draw.visualId, leaf});
++    }
++    if (selectedFrame)
++        std::fprintf(stderr, "METAL_MAIN_FLORA_IDS frame=%u status=%s submitted=%zu culled=%zu\n",
++            view.engineFrame,
++            !captureIds ? "invalid_settings" :
++                (writeMainFloraIds(captureConfig, view, captured, m_telemetry.culledVisuals) ?
++                    "encode_complete" : "write_failed"),
++            m_telemetry.submittedVisuals, m_telemetry.culledVisuals);
+     return true;
++}
++
++bool MetalR4FloraAdapter::HasShadowCasters() const
++{
++    return m_ready && m_impl && m_impl->leafShadowPipeline &&
++        m_impl->leafNoAlphaShadowPipeline && m_impl->trunkShadowPipeline;
++}
++
++bool MetalR4FloraAdapter::DrawShadowCasters(IR4Backend& backend,
++    const std::array<float, 16>& lightViewProjection,
++    const R4FloraViewState& view, std::string& error)
++{
++    if (!m_ready || !m_impl || !view.valid)
++        return true;
++    if (!HasShadowCasters())
++    {
++        error = m_impl->shadowError.empty() ? "flora shadow bundle is not configured" : m_impl->shadowError;
++        return false;
++    }
++    if (!m_impl->wavesTexture || !m_impl->sampler)
++    {
++        error = "flora shadow tree branch requires the visible-path wind-wave texture and sampler";
++        return false;
++    }
++    Matrix4 lvp{};
++    std::memcpy(lvp.elements, lightViewProjection.data(), sizeof(lvp.elements));
++    for (const float value : lvp.elements)
++        if (!std::isfinite(value))
++        {
++            error = "flora shadow matrix contains a non-finite value";
++            return false;
++        }
++    m_telemetry.shadowDraws = 0u;
++    m_telemetry.shadowSubmittedVisuals = 0u;
++    m_telemetry.shadowCulledVisuals = 0u;
++    Matrix4 cameraView{};
++    Matrix4 cameraProjection{};
++    std::memcpy(cameraView.elements, view.view.data(), sizeof(cameraView));
++    std::memcpy(cameraProjection.elements, view.projection.data(), sizeof(cameraProjection));
++    const Matrix4 cameraVp = multiply(cameraProjection, cameraView);
++    std::shared_ptr<IR4Buffer> lastVertices;
++    std::shared_ptr<IR4GraphicsPipeline> lastPipeline;
++    std::vector<std::uint8_t> staticGlobals(kTreeShadowStaticGlobalsSize);
++    std::memcpy(staticGlobals.data() + 192u, &lvp, sizeof(lvp));
++    R4FrameBufferSlice staticGlobalsSlice;
++    bool staticGlobalsUploaded = false;
++    const auto& selected = m_impl->shadowIndex.Query(lvp.elements);
++    if (m_impl->shadowLinear)
++    {
++        auto& all = m_impl->shadowIndex.candidates;
++        all.resize(m_impl->draws.size()); std::iota(all.begin(), all.end(), 0u);
++    }
++    if (m_impl->shadowOracle)
++    {
++        for (std::size_t i = 0; i < m_impl->draws.size(); ++i)
++        {
++            const auto& d = m_impl->draws[i];
++            if (!isOutsideMetalClipVolume(d.hasBounds, d.boundsMinimum, d.boundsMaximum,
++                    multiply(lvp, d.model)) && !std::binary_search(selected.begin(), selected.end(), i))
++            { error = "E08 Flora shadow broad phase omitted an oracle caster"; return false; }
++        }
++        if (++m_impl->oracleViews % 1000 == 0)
++            std::fprintf(stderr, "METAL_E08_FLORA_ORACLE views=%zu draws=%zu misses=0\n",
++                m_impl->oracleViews, m_impl->draws.size());
++    }
++    m_telemetry.shadowCulledVisuals = m_impl->draws.size() - selected.size();
++    if (m_impl->shadowInstancing)
++        for (auto& group : m_impl->shadowGroups) group.models.clear();
++    const auto encodeCaster = [&](const Impl::Draw& draw, const std::vector<Matrix4>* models) {
++        const bool leaf = draw.material == Impl::Material::LeafBump;
++        const auto& pipeline = models ? (leaf ?
++            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaInstancedShadowPipeline : m_impl->leafInstancedShadowPipeline) :
++            m_impl->trunkInstancedShadowPipeline) : (leaf ?
++            (view.shadowIgnoreAlpha ? m_impl->leafNoAlphaShadowPipeline : m_impl->leafShadowPipeline) :
++            m_impl->trunkShadowPipeline);
++        std::vector<std::uint8_t> globals(kTreeShadowGlobalsSize);
++        std::memcpy(globals.data(), &lvp, sizeof(lvp));
++        std::memcpy(globals.data() + 64u, &lvp, sizeof(lvp));
++        std::memcpy(globals.data() + 160u, &draw.model, sizeof(draw.model));
++        putFloat4(globals, 224u, 1.0f / 1024.0f, 1.0f / 1024.0f, 0.0f, 0.0f);
++        // Both original regular-tree permutations consume the same current
++        // wind state: aref branches sample s_waves; opaque trunks use the
++        // trunk analytic wave. Only the branch VS binds the wave texture.
++        putFloat4(globals, 240u, view.windParams[0], view.windParams[1],
++            view.windParams[2], view.windParams[3]);
++        putFloat4(globals, 256u, view.windSetupGrass[0], view.windSetupGrass[1],
++            view.windSetupGrass[2], view.windSetupGrass[3]);
++        putFloat4(globals, 272u, view.windSetupTrees[0], view.windSetupTrees[1],
++            view.windSetupTrees[2], view.windSetupTrees[3]);
++        putFloat4(globals, 288u, view.windAnimation[0], view.windAnimation[1],
++            view.windAnimation[2], view.windAnimation[3]);
++        putFloat4(globals, 304u, view.windAnimationPrevious[0], view.windAnimationPrevious[1],
++            view.windAnimationPrevious[2], view.windAnimationPrevious[3]);
++        R4FrameBufferSlice globalsSlice;
++        if (!backend.UploadFrameData(globals.data(), globals.size(), 256u, globalsSlice, error))
++            return false;
++        if (!staticGlobalsUploaded)
++        {
++            if (!backend.UploadFrameData(staticGlobals.data(), staticGlobals.size(), 256u,
++                    staticGlobalsSlice, error))
++                return false;
++            staticGlobalsUploaded = true;
++        }
++
++        R4MscStageBindings vs;
++        vs.stage = R4ShaderStage::Vertex;
++        if (leaf)
++            vs = {R4ShaderStage::Vertex, 96u, {
++                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, m_impl->wavesTexture},
++                {R4MscResourceType::ConstantBuffer, 24u, globalsSlice.buffer,
++                    globalsSlice.offset, globalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 48u, staticGlobalsSlice.buffer,
++                    staticGlobalsSlice.offset, staticGlobalsSlice.size},
++                {R4MscResourceType::Sampler, 72u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
++        else
++            vs = {R4ShaderStage::Vertex, 48u, {
++                {R4MscResourceType::ConstantBuffer, 0u, globalsSlice.buffer,
++                    globalsSlice.offset, globalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 24u, staticGlobalsSlice.buffer,
++                    staticGlobalsSlice.offset, staticGlobalsSlice.size}}};
++
++        if (models)
++        {
++            R4FrameBufferSlice modelSlice;
++            if (!backend.UploadFrameData(models->data(), models->size() * sizeof(Matrix4),
++                    256u, modelSlice, error))
++                return false;
++            // The descriptor-table buffer entry encodes GPU address and byte
++            // length for both CBV and structured-buffer SRV resources.
++            vs = leaf ? R4MscStageBindings{R4ShaderStage::Vertex, 120u, {
++                {R4MscResourceType::ConstantBuffer, 0u, modelSlice.buffer, modelSlice.offset, modelSlice.size},
++                {R4MscResourceType::Texture, 24u, nullptr, 0u, 0u, m_impl->wavesTexture},
++                {R4MscResourceType::ConstantBuffer, 48u, globalsSlice.buffer, globalsSlice.offset, globalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 72u, staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size},
++                {R4MscResourceType::Sampler, 96u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}} :
++                R4MscStageBindings{R4ShaderStage::Vertex, 72u, {
++                {R4MscResourceType::ConstantBuffer, 0u, modelSlice.buffer, modelSlice.offset, modelSlice.size},
++                {R4MscResourceType::ConstantBuffer, 24u, globalsSlice.buffer, globalsSlice.offset, globalsSlice.size},
++                {R4MscResourceType::ConstantBuffer, 48u, staticGlobalsSlice.buffer, staticGlobalsSlice.offset, staticGlobalsSlice.size}}};
++        }
++
++        if (leaf && !view.shadowIgnoreAlpha)
++        {
++            R4MscStageBindings ps{R4ShaderStage::Fragment, 48u, {
++                {R4MscResourceType::Texture, 0u, nullptr, 0u, 0u, draw.textures[0]},
++                {R4MscResourceType::Sampler, 24u, nullptr, 0u, 0u, nullptr, m_impl->sampler}}};
++            if (!backend.BindMscResources(ps, error))
++                return false;
++        }
++        if (pipeline != lastPipeline)
++        {
++            if (!backend.BindGraphicsPipeline(pipeline, error))
++                return false;
++            lastPipeline = pipeline;
++        }
++        if (!backend.BindMscResources(vs, error))
++            return false;
++        if (draw.vertices != lastVertices)
++        {
++            if (!backend.BindVertexBuffer(6u, draw.vertices, 0u, error))
++                return false;
++            lastVertices = draw.vertices;
++        }
++        R4IndexedDrawDesc indexed;
++        indexed.indexBuffer = draw.indices;
++        indexed.indexCount = draw.indexCount;
++        indexed.indexType = R4IndexType::UInt16;
++        indexed.instanceCount = models ? static_cast<std::uint32_t>(models->size()) : 1u;
++        if (!backend.DrawIndexed(indexed, error))
++            return false;
++        m_telemetry.shadowSubmittedVisuals += indexed.instanceCount;
++        ++m_telemetry.shadowDraws;
++        return true;
++    };
++    for (const std::size_t drawIndex : selected)
++    {
++        const Impl::Draw& draw = m_impl->draws[drawIndex];
++        if (view.shadowOnlyOffCamera)
++        {
++            const Matrix4 cameraWvp = multiply(cameraVp, draw.model);
++            if (!isOutsideMetalClipVolume(draw.hasBounds,
++                    draw.boundsMinimum, draw.boundsMaximum, cameraWvp))
++            {
++                ++m_telemetry.shadowCulledVisuals;
++                continue;
++            }
++        }
++        const Matrix4 wvp = multiply(lvp, draw.model);
++        if (isOutsideMetalClipVolume(draw.hasBounds, draw.boundsMinimum, draw.boundsMaximum, wvp))
++        {
++            ++m_telemetry.shadowCulledVisuals;
++            continue;
++        }
++        if (m_impl->shadowInstancing)
++            m_impl->shadowGroups[draw.shadowGroup].models.push_back(draw.model);
++        else if (!encodeCaster(draw, nullptr))
++            return false;
++    }
++    if (m_impl->shadowInstancing)
++        for (const auto& group : m_impl->shadowGroups)
++            if (!group.models.empty() &&
++                !encodeCaster(m_impl->draws[group.representative], &group.models))
++                return false;
++    return true;
++}
++
++bool MetalR4FloraAdapter::DrawShadowCastersForValidation(IR4Backend& backend,
++    const std::array<float, 16>& lightViewProjection,
++    const R4FloraViewState& view, const bool instanced,
++    Telemetry& sampledTelemetry, std::string& error)
++{
++    if (!m_ready || !m_impl || !view.valid)
++    {
++        error = "Flora pixel oracle requires a prepared adapter and valid scene view";
++        return false;
++    }
++    if (instanced && (!m_impl->trunkInstancedShadowPipeline ||
++        !m_impl->leafInstancedShadowPipeline || !m_impl->leafNoAlphaInstancedShadowPipeline))
++    {
++        error = "Flora pixel oracle requires the admitted instanced shadow shader directory";
++        return false;
++    }
++    struct Restore
++    {
++        bool& mode;
++        const bool savedMode;
++        Telemetry& telemetry;
++        const Telemetry savedTelemetry;
++        ~Restore() { mode = savedMode; telemetry = savedTelemetry; }
++    } restore{m_impl->shadowInstancing, m_impl->shadowInstancing, m_telemetry, m_telemetry};
++    m_telemetry = {};
++    m_impl->shadowInstancing = instanced;
++    const bool result = DrawShadowCasters(backend, lightViewProjection, view, error);
++    sampledTelemetry = m_telemetry;
++    return result;
+ }
+ 
+ bool RunR4FloraAdapterSelfTest(std::string& error)
+@@ -716,6 +1428,18 @@
+         vertices[0].texcoord[0] != 1024 || vertices[0].texcoord[1] != -1024)
+     {
+         if (error.empty()) error = "flora static vertex repack did not preserve the recorded ABI";
++        return false;
++    }
++    // Verify that after unpack_D3DCOLOR (c.bgra) and unpack_bx4 (4*v - 2) in the shader,
++    // the normal corresponds to the intended world basis direction (+X axis).
++    const float shaderNormalX = 4.0f * vertices[0].normal[2] - 2.0f;
++    const float shaderNormalY = 4.0f * vertices[0].normal[1] - 2.0f;
++    const float shaderNormalZ = 4.0f * vertices[0].normal[0] - 2.0f;
++    if (std::abs(shaderNormalX - 2.0f) > 0.05f ||
++        std::abs(shaderNormalY) > 0.05f ||
++        std::abs(shaderNormalZ) > 0.05f)
++    {
++        error = "flora normal unpacking does not preserve world basis after shader unpack_D3DCOLOR/unpack_bx4";
+         return false;
+     }
+     std::vector<std::filesystem::path> textures;
+@@ -754,6 +1478,28 @@
+         selected[1].material != FloraMaterial::TrunkFlat)
+     {
+         error = "flora automatic candidate selection lost its proof leaves or admitted a duplicate";
++        return false;
++    }
++    const std::vector<R4FloraBlenderMaterial> materialRecords = {
++        {"flora\\leaf_wave", true, false}, {"flora\\trunk_wave", false, false}};
++    std::unordered_map<std::string, R4FloraBlenderMaterial> materialFlags;
++    for (const R4FloraBlenderMaterial& record : materialRecords)
++        materialFlags.emplace(record.shaderName, record);
++    const auto leafFlags = materialFlags.find(candidates.shaders[selected[0].visual->shaderId].shaderName);
++    const auto trunkFlags = materialFlags.find(candidates.shaders[selected[1].visual->shaderId].shaderName);
++    std::string flagsError;
++    if (leafFlags == materialFlags.end() || trunkFlags == materialFlags.end() ||
++        !validateFloraMaterialFlags(FloraMaterial::LeafBump,
++            leafFlags == materialFlags.end() ? false : leafFlags->second.alphaBlend,
++            leafFlags == materialFlags.end() ? false : leafFlags->second.objectLod, flagsError) ||
++        !validateFloraMaterialFlags(FloraMaterial::TrunkFlat,
++            trunkFlags == materialFlags.end() ? true : trunkFlags->second.alphaBlend,
++            trunkFlags == materialFlags.end() ? true : trunkFlags->second.objectLod, flagsError) ||
++        validateFloraMaterialFlags(FloraMaterial::LeafBump, false, false, flagsError) ||
++        validateFloraMaterialFlags(FloraMaterial::TrunkFlat, true, false, flagsError) ||
++        validateFloraMaterialFlags(FloraMaterial::LeafBump, true, true, flagsError))
++    {
++        error = "flora archive B_TREE alpha/Object LOD flags selected the wrong G-buffer route";
+         return false;
+     }
+     Matrix4 identity;
+@@ -787,5 +1533,50 @@
+         error = "flora Metal clip-volume AABB culling is not conservative";
+         return false;
+     }
++    FloraShadowIndex index;
++    std::vector<Matrix4> models;
++    std::vector<std::array<float, 3>> minima, maxima;
++    std::uint32_t seed = 0xE08;
++    auto random = [&seed]() { seed = seed * 1664525u + 1013904223u;
++        return float(seed & 65535u) / 65535.f; };
++    for (std::size_t i = 0; i < 1024; ++i)
++    {
++        Matrix4 model = identity;
++        for (std::size_t a = 0; a < 3; ++a)
++        {
++            for (std::size_t k = 0; k < 3; ++k) model.elements[k * 4 + a] = random() * 4 - 2;
++            model.elements[12 + a] = random() * 2000 - 1000;
++        }
++        std::array<float, 3> lo = {-random() * 10, -random() * 10, -random() * 10};
++        std::array<float, 3> hi = {random() * 10, random() * 10, random() * 10};
++        if (i == 0) model = nonFinite;
++        if (i == 1) model.elements[3] = .5f; // non-affine -> always a candidate
++        models.push_back(model); minima.push_back(lo); maxima.push_back(hi);
++        index.Add(i != 2, lo, hi, model.elements, i);
++    }
++    index.Finish();
++    for (std::size_t v = 0; v < 128; ++v)
++    {
++        Matrix4 vp = identity;
++        for (std::size_t a = 0; a < 16; ++a) vp.elements[a] = (random() * 2 - 1) * .01f;
++        if (v == 0) vp = identity;
++        if (v == 1) vp = nonFinite;
++        if (v == 2) vp.elements[0] = std::numeric_limits<float>::max();
++        const auto& selected = index.Query(vp.elements);
++        if (!std::is_sorted(selected.begin(), selected.end()) ||
++            std::adjacent_find(selected.begin(), selected.end()) != selected.end())
++        { error = "E08 Flora candidates changed source order or duplicate draws"; return false; }
++        for (std::size_t i = 0; i < models.size(); ++i)
++            if (!isOutsideMetalClipVolume(i != 2, minima[i], maxima[i], multiply(vp, models[i])) &&
++                !std::binary_search(selected.begin(), selected.end(), i))
++            { error = "E08 Flora index omitted an independent corner-oracle caster"; return false; }
++    }
++    // Touching a Metal plane must pass through to the exact test.
++    FloraShadowIndex boundary;
++    boundary.Add(true, {1, -1, 0}, {1, 1, 1}, identity.elements, 0);
++    boundary.Add(true, {100, 100, 100}, {101, 101, 101}, identity.elements, 1);
++    boundary.Finish();
++    if (boundary.Query(identity.elements).empty() || boundary.Query(identity.elements).front() != 0)
++    { error = "E08 Flora index rejected a clip-plane boundary"; return false; }
+     return true;
+ }
+diff --git a/src/Layers/xrRenderMetal/CMakeLists.txt b/src/Layers/xrRenderMetal/CMakeLists.txt
+--- a/src/Layers/xrRenderMetal/CMakeLists.txt
++++ b/src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -8,6 +8,121 @@
+ endif()
+ 
+ include(CTest)
++
++# Embed the canonical production skin kernel at configure time. A changed MSL
++# source must trigger reconfiguration before the backend can rebuild.
++set(R4_COMPUTE_SKIN_MSL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/R4ComputeSkin.metal")
++set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${R4_COMPUTE_SKIN_MSL_PATH}")
++file(SHA256 "${R4_COMPUTE_SKIN_MSL_PATH}" R4_COMPUTE_SKIN_SHA256)
++file(READ "${R4_COMPUTE_SKIN_MSL_PATH}" R4_COMPUTE_SKIN_MSL)
++set(R4_COMPUTE_SKIN_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
++file(MAKE_DIRECTORY "${R4_COMPUTE_SKIN_GENERATED_DIR}")
++configure_file(R4ComputeSkinSource.h.in
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}/R4ComputeSkinSource.h" @ONLY)
++
++add_executable(XRay.Metal.LightHomBoundsProbe tests/R4LightHomBoundsProbe.cpp)
++target_compile_features(XRay.Metal.LightHomBoundsProbe PRIVATE cxx_std_17)
++add_test(NAME XRay.Metal.LightHomBounds.SelfTest COMMAND XRay.Metal.LightHomBoundsProbe)
++
++add_executable(XRay.Metal.LocalLightFaceVisibilityProbe tests/R4LocalLightFaceVisibilityProbe.cpp)
++target_compile_features(XRay.Metal.LocalLightFaceVisibilityProbe PRIVATE cxx_std_17)
++add_test(NAME XRay.Metal.LocalLightFaceVisibility.SelfTest COMMAND XRay.Metal.LocalLightFaceVisibilityProbe)
++
++add_executable(XRay.Metal.DynamicWorldPreparedStateProbe tests/R4DynamicWorldPreparedStateProbe.cpp)
++target_compile_features(XRay.Metal.DynamicWorldPreparedStateProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.DynamicWorldPreparedStateProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.DynamicWorldPreparedState.SelfTest COMMAND XRay.Metal.DynamicWorldPreparedStateProbe)
++
++add_executable(XRay.Metal.ComputeSkinPoseJournalProbe
++  tests/R4ComputeSkinPoseJournalProbe.cpp
++)
++
++# Strict FP is limited to the coverage/bridge arithmetic and independent probes.
++set_source_files_properties(
++  R4ActiveOcclusionCoverage.cpp
++  R4ActiveOcclusionSceneBridge.cpp
++  tests/R4ActiveOcclusionCoverageInputProbe.cpp
++  tests/R4ActiveOcclusionCoverageOracleProbe.cpp
++  tests/R4ActiveOcclusionSceneBridgeProbe.cpp
++  R4ActiveOcclusionCatalogSelection.cpp
++  tests/R4ActiveOcclusionCatalogSelectionProbe.cpp
++  PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-fno-finite-math-only;-ffp-contract=off"
++)
++
++add_executable(XRay.Metal.ActiveOcclusionCatalogSelectionProbe
++  tests/R4ActiveOcclusionCatalogSelectionProbe.cpp
++  R4ActiveOcclusionCatalogSelection.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionCatalogSelectionProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionCatalogSelectionProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusion.CatalogSelection
++  COMMAND XRay.Metal.ActiveOcclusionCatalogSelectionProbe
++)
++
++add_executable(XRay.Metal.ActiveOcclusionCoverageInputProbe
++  tests/R4ActiveOcclusionCoverageInputProbe.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionCoverageInputProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionCoverageInputProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusion.CoverageInput
++  COMMAND XRay.Metal.ActiveOcclusionCoverageInputProbe
++)
++
++add_executable(XRay.Metal.ActiveOcclusionCoverageOracleProbe
++  tests/R4ActiveOcclusionCoverageOracleProbe.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionCoverageOracleProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionCoverageOracleProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusion.CoverageOracle
++  COMMAND XRay.Metal.ActiveOcclusionCoverageOracleProbe
++)
++
++add_executable(XRay.Metal.ActiveOcclusionSceneBridgeProbe
++  tests/R4ActiveOcclusionSceneBridgeProbe.cpp
++  R4ActiveOcclusionSceneBridge.cpp
++  R4ActiveOcclusionCoverage.cpp
++)
++target_compile_features(XRay.Metal.ActiveOcclusionSceneBridgeProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ActiveOcclusionSceneBridgeProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ActiveOcclusionSceneBridge.SelfTest
++  COMMAND XRay.Metal.ActiveOcclusionSceneBridgeProbe
++)
++
++add_executable(XRay.Metal.WholeLightVisibilityLedgerProbe
++  tests/R4WholeLightVisibilityLedgerProbe.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilityLedgerProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.WholeLightVisibilityLedgerProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.WholeLightVisibilityLedger.SelfTest
++  COMMAND XRay.Metal.WholeLightVisibilityLedgerProbe
++)
++
++add_executable(XRay.Metal.WholeLightVisibilitySelectionProbe
++  tests/R4WholeLightVisibilitySelectionProbe.cpp
++  R4WholeLightVisibilitySelection.cpp
++  R4LocalShadowBatchPlan.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilitySelectionProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.WholeLightVisibilitySelectionProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.WholeLightVisibilitySelection.SelfTest
++  COMMAND XRay.Metal.WholeLightVisibilitySelectionProbe
++)
++target_compile_features(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.ComputeSkinPoseJournalProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.ComputeSkinPoseJournal.SelfTest
++  COMMAND XRay.Metal.ComputeSkinPoseJournalProbe
++)
++
++add_executable(XRay.Metal.StaticConstantGroupsProbe
++  tests/R4StaticConstantGroupsProbe.cpp
++)
++target_compile_features(XRay.Metal.StaticConstantGroupsProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.StaticConstantGroupsProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.StaticConstantGroups.SelfTest
++  COMMAND XRay.Metal.StaticConstantGroupsProbe
++)
+ 
+ add_library(XRay.Metal.R4Backend STATIC
+   MetalR4DefObjectsLodAdapter.cpp
+@@ -26,18 +141,42 @@
+   MetalR4ScopeAdapter.h
+   MetalR4LocalLightAdapter.cpp
+   MetalR4LocalLightAdapter.h
++  MetalR4LightHomDiagnostic.cpp
++  MetalR4LightHomDiagnostic.h
+   MetalR4ParticleAdapter.cpp
+   MetalR4ParticleAdapter.h
++  MetalR4RainAdapter.cpp
++  MetalR4RainAdapter.h
++  MetalR4LensFlareAdapter.h
++  MetalR4LensFlareAdapter.cpp
+   MetalR4StaticForwardAdapter.cpp
+   MetalR4StaticForwardAdapter.h
++  MetalR4BloomAdapter.cpp
++  MetalR4BloomAdapter.h
++  MetalR4VolumetricAdapter.cpp
++  MetalR4VolumetricAdapter.h
++  MetalR4VolumetricCapture.cpp
++  MetalR4VolumetricCapture.h
++  MetalR4SsfxAoAdapter.cpp
++  MetalR4SsfxAoAdapter.h
++  MetalR4FogScatteringAdapter.cpp
++  MetalR4FogScatteringAdapter.h
++  MetalR4WaterAdapter.cpp
++  MetalR4WaterAdapter.h
++  MetalR4SsrAdapter.cpp
++  MetalR4SsrAdapter.h
+   R4LocalLightFoundation.cpp
+   R4LocalLightFoundation.h
++  R4LocalShadowBatchPlan.cpp
++  R4LocalShadowBatchPlan.h
+   R4LocalShadowAtlasFoundation.cpp
+   R4LocalShadowAtlasFoundation.h
+   R4ParticleFoundation.cpp
+   R4ParticleFoundation.h
+   R4StaticForwardFoundation.cpp
+   R4StaticForwardFoundation.h
++  R4WaterFoundation.cpp
++  R4WaterFoundation.h
+   R4HudFoundation.cpp
+   R4HudFoundation.h
+   R4NightVisionFoundation.cpp
+@@ -46,11 +185,28 @@
+   R4DefVertexFoundation.h
+   R4DefObjectsLodFoundation.cpp
+   R4DefObjectsLodFoundation.h
++  R4ComputeSkinFoundation.cpp
++  R4ComputeSkinFoundation.h
++  R4StaticConstantGroups.h
++  R4ActiveOcclusionCoverage.cpp
++  R4ActiveOcclusionCoverage.h
++  R4ActiveOcclusionCatalogSelection.cpp
++  R4ActiveOcclusionCatalogSelection.h
++  R4ActiveOcclusionSceneBridge.cpp
++  R4ActiveOcclusionSceneBridge.h
+   MetalR4EngineFs.cpp
+   MetalR4EngineFs.h
++  MetalR4UiVideo.cpp
++  MetalR4UiVideo.h
+   MetalR4EngineScene.mm
+   MetalR4EngineScene.h
+   MetalR4Backend.mm
++  MetalR4MotionValidation.mm
++  MetalR4LocalShadowBatchValidation.mm
++  R4LocalShadowBatchValidation.h
++  MetalR4SunShadowValidation.mm
++  R4SunCascade.h
++  R4SunShadowValidation.h
+   MetalScreenshotCodec.cpp
+   MetalScreenshotCodec.h
+   R4DdsTexture.cpp
+@@ -59,14 +215,24 @@
+   R4MaterialSet.h
+   R4LevelGeometry.cpp
+   R4LevelGeometry.h
++  R4PortalGraphObserver.h
++  R4PortalGenerationContext.h
++  DisplayCapabilities.h
++  DisplayCapabilities.mm
+   IR4Backend.h
+   IR4Pipeline.h
+   IR4Resources.h
++  R4ComputeSkinMetal.h
++  R4WholeLightVisibilityLedger.h
++  R4WholeLightVisibilitySelection.cpp
++  R4WholeLightVisibilitySelection.h
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}/R4ComputeSkinSource.h"
+ )
+ target_compile_options(XRay.Metal.R4Backend PRIVATE -fobjc-arc)
+ target_compile_features(XRay.Metal.R4Backend PUBLIC cxx_std_17)
+ target_include_directories(XRay.Metal.R4Backend PUBLIC
+   ${CMAKE_CURRENT_SOURCE_DIR}
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}"
+   /opt/homebrew/include/SDL2
+ )
+ target_link_libraries(XRay.Metal.R4Backend PUBLIC
+@@ -97,6 +263,22 @@
+ )
+ target_compile_features(XRay.Metal.BackendSelectionSmoke PRIVATE cxx_std_17)
+ 
++add_executable(XRay.Metal.FrameUploadGpuProbe
++  tests/R4FrameUploadGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.FrameUploadGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.FrameUploadGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++add_test(
++  NAME XRay.Metal.FrameUploadGpu.SelfTest
++  COMMAND XRay.Metal.FrameUploadGpuProbe --self-test
++)
++add_test(
++  NAME XRay.Metal.PrivateUploadRecovery
++  COMMAND XRay.Metal.FrameUploadGpuProbe --private-upload-recovery
++)
++
++
+ add_executable(XRay.Metal.ScreenshotFallbackProbe
+   tests/MetalScreenshotFallbackProbe.cpp
+   MetalScreenshotFallback.h
+@@ -195,12 +377,65 @@
+   tests/R4DynamicWorldAdapterProbe.cpp
+ )
+ target_compile_features(XRay.Metal.DynamicWorldAdapterProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.DynamicWorldAdapterProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.DynamicWorldAdapterProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.DynamicWorldAdapter.SelfTest
+   COMMAND XRay.Metal.DynamicWorldAdapterProbe --self-test
+ )
+ 
++# Isolated native MSL prototype: production skinning is unchanged. The GPU
++# oracle compares its output against the existing CPU repack implementation.
++add_executable(XRay.Metal.ComputeSkinGpuProbe
++  tests/R4ComputeSkinGpuProbe.mm
++)
++target_compile_features(XRay.Metal.ComputeSkinGpuProbe PRIVATE cxx_std_17)
++target_compile_options(XRay.Metal.ComputeSkinGpuProbe PRIVATE -fobjc-arc)
++target_compile_definitions(XRay.Metal.ComputeSkinGpuProbe PRIVATE
++  R4_COMPUTE_SKIN_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/R4ComputeSkin.metal"
++)
++target_link_libraries(XRay.Metal.ComputeSkinGpuProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core "-framework Foundation" "-framework Metal"
++)
++add_test(NAME XRay.Metal.ComputeSkin.GpuOracle
++  COMMAND XRay.Metal.ComputeSkinGpuProbe --self-test
++)
++
++add_executable(XRay.Metal.ComputeSkinBoundsProbe
++  tests/R4ComputeSkinBoundsProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.ComputeSkinBoundsProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.ComputeSkinBoundsProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.ComputeSkin.Bounds
++  COMMAND XRay.Metal.ComputeSkinBoundsProbe
++)
++
++add_executable(XRay.Metal.ComputeSkinBackendGpuProbe
++  tests/R4ComputeSkinBackendGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.ComputeSkinBackendGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.ComputeSkinBackendGpuProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.ComputeSkin.BackendGpu
++  COMMAND XRay.Metal.ComputeSkinBackendGpuProbe --self-test
++)
++
++add_executable(XRay.Metal.WholeLightVisibilityBackendGpuProbe
++  tests/R4WholeLightVisibilityBackendGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.WholeLightVisibilityBackendGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.WholeLightVisibilityBackendGpuProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.WholeLightVisibility.BackendGpu
++  COMMAND XRay.Metal.WholeLightVisibilityBackendGpuProbe --self-test
++)
++
+ add_executable(XRay.Metal.FloraAdapterProbe
+   tests/R4FloraAdapterProbe.cpp
+ )
+@@ -245,7 +480,7 @@
+   tests/R4LocalLightFoundationProbe.cpp
+ )
+ target_compile_features(XRay.Metal.LocalLightFoundationProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.LocalLightFoundationProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.LocalLightFoundationProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.LocalLightFoundation.SelfTest
+   COMMAND XRay.Metal.LocalLightFoundationProbe --self-test
+@@ -261,6 +496,67 @@
+   COMMAND XRay.Metal.LocalShadowAtlasFoundationProbe
+ )
+ 
++add_executable(XRay.Metal.DisplayCapabilitiesProbe
++  tests/DisplayCapabilitiesProbe.mm
++  DisplayCapabilities.mm
++  DisplayCapabilities.h
++)
++target_compile_features(XRay.Metal.DisplayCapabilitiesProbe PRIVATE cxx_std_17)
++target_compile_options(XRay.Metal.DisplayCapabilitiesProbe PRIVATE -fobjc-arc)
++target_include_directories(XRay.Metal.DisplayCapabilitiesProbe PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}
++  /opt/homebrew/include/SDL2
++)
++target_link_libraries(XRay.Metal.DisplayCapabilitiesProbe PRIVATE
++  /opt/homebrew/lib/libSDL2.dylib
++  "-framework Cocoa"
++  "-framework Metal"
++  "-framework QuartzCore"
++)
++target_link_options(XRay.Metal.DisplayCapabilitiesProbe PRIVATE "-Wl,-rpath,/opt/homebrew/lib")
++add_test(
++  NAME XRay.Metal.DisplayCapabilities.SelfTest
++  COMMAND XRay.Metal.DisplayCapabilitiesProbe
++)
++
++add_executable(XRay.Metal.MetalFXSpatialScalerProbe
++  tests/MetalFXSpatialScalerProbe.mm
++)
++target_compile_features(XRay.Metal.MetalFXSpatialScalerProbe PRIVATE cxx_std_17)
++target_compile_options(XRay.Metal.MetalFXSpatialScalerProbe PRIVATE -fobjc-arc)
++target_include_directories(XRay.Metal.MetalFXSpatialScalerProbe PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(XRay.Metal.MetalFXSpatialScalerProbe PRIVATE
++  "-framework Foundation"
++  "-framework Metal"
++  "-framework MetalFX"
++  "-framework CoreGraphics"
++  "-framework ImageIO"
++)
++add_test(
++  NAME XRay.Metal.MetalFXSpatialScaler.SelfTest
++  COMMAND XRay.Metal.MetalFXSpatialScalerProbe
++)
++
++add_executable(XRay.Metal.CAMetalDisplayLinkProbe
++  tests/CAMetalDisplayLinkProbe.mm
++)
++target_compile_features(XRay.Metal.CAMetalDisplayLinkProbe PRIVATE cxx_std_17)
++target_compile_options(XRay.Metal.CAMetalDisplayLinkProbe PRIVATE -fobjc-arc)
++target_include_directories(XRay.Metal.CAMetalDisplayLinkProbe PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(XRay.Metal.CAMetalDisplayLinkProbe PRIVATE
++  "-framework Cocoa"
++  "-framework Metal"
++  "-framework QuartzCore"
++)
++add_test(
++  NAME XRay.Metal.CAMetalDisplayLink.SelfTest
++  COMMAND XRay.Metal.CAMetalDisplayLinkProbe --self-test
++)
++
+ add_executable(XRay.Metal.ParticleFoundationProbe
+   tests/R4ParticleFoundationProbe.cpp
+ )
+@@ -275,7 +571,7 @@
+   tests/MetalR4ParticleAdapterProbe.cpp
+ )
+ target_compile_features(XRay.Metal.ParticleAdapterProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.ParticleAdapterProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.ParticleAdapterProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.ParticleAdapter.SelfTest
+   COMMAND XRay.Metal.ParticleAdapterProbe --self-test
+@@ -295,7 +591,7 @@
+   tests/R4NightVisionFoundationProbe.cpp
+ )
+ target_compile_features(XRay.Metal.NightVisionFoundationProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.NightVisionFoundationProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.NightVisionFoundationProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.NightVisionFoundation.SelfTest
+   COMMAND XRay.Metal.NightVisionFoundationProbe --self-test
+@@ -305,7 +601,7 @@
+   tests/MetalR4HudAdapterProbe.cpp
+ )
+ target_compile_features(XRay.Metal.HudAdapterProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.HudAdapterProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.HudAdapterProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.HudAdapter.SelfTest
+   COMMAND XRay.Metal.HudAdapterProbe --self-test
+@@ -323,19 +619,35 @@
+ 
+ add_executable(XRay.Metal.LocalLightAdapterProbe
+   tests/MetalR4LocalLightAdapterProbe.cpp
++  ../xrRender/du_sphere_part.cpp
+ )
+ target_compile_features(XRay.Metal.LocalLightAdapterProbe PRIVATE cxx_std_17)
++target_compile_definitions(XRay.Metal.LocalLightAdapterProbe PRIVATE ECORE_API=)
++target_include_directories(XRay.Metal.LocalLightAdapterProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../xrCore)
++if(TARGET XRay.Core.Defines)
++  target_link_libraries(XRay.Metal.LocalLightAdapterProbe PRIVATE XRay.Core.Defines)
++endif()
+ target_link_libraries(XRay.Metal.LocalLightAdapterProbe PRIVATE XRay.Metal.R4Backend)
+ add_test(
+   NAME XRay.Metal.LocalLightAdapter.SelfTest
+   COMMAND XRay.Metal.LocalLightAdapterProbe --self-test
+ )
+ 
++add_executable(XRay.Metal.LocalLightRolloverGpuProbe
++  tests/R4LocalLightRolloverGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++  ../xrRender/du_sphere_part.cpp
++)
++target_compile_features(XRay.Metal.LocalLightRolloverGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.LocalLightRolloverGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++# Canonical du_sphere_part data needs no renderer DLL export in this probe.
++target_compile_definitions(XRay.Metal.LocalLightRolloverGpuProbe PRIVATE ECORE_API=)
++
+ add_executable(XRay.Metal.DefVertexAdapterProbe
+   tests/MetalR4DefVertexAdapterProbe.cpp
+ )
+ target_compile_features(XRay.Metal.DefVertexAdapterProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.DefVertexAdapterProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.DefVertexAdapterProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.DefVertexAdapter.SelfTest
+   COMMAND XRay.Metal.DefVertexAdapterProbe --self-test
+@@ -345,7 +657,7 @@
+   tests/R4DefObjectsLodFoundationProbe.cpp
+ )
+ target_compile_features(XRay.Metal.DefObjectsLodFoundationProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.DefObjectsLodFoundationProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.DefObjectsLodFoundationProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.DefObjectsLodFoundation.SelfTest
+   COMMAND XRay.Metal.DefObjectsLodFoundationProbe --self-test
+@@ -355,7 +667,7 @@
+   tests/MetalR4DefObjectsLodAdapterProbe.cpp
+ )
+ target_compile_features(XRay.Metal.DefObjectsLodAdapterProbe PRIVATE cxx_std_17)
+-target_link_libraries(XRay.Metal.DefObjectsLodAdapterProbe PRIVATE XRay.Metal.R4Backend)
++target_link_libraries(XRay.Metal.DefObjectsLodAdapterProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
+ add_test(
+   NAME XRay.Metal.DefObjectsLodAdapter.SelfTest
+   COMMAND XRay.Metal.DefObjectsLodAdapterProbe --self-test
+@@ -409,3 +721,63 @@
+     "-framework Metal"
+   )
+ endif()
++
++add_executable(XRay.Metal.SubmittedViewHistoryProbe tests/R4SubmittedViewHistoryProbe.cpp)
++target_compile_features(XRay.Metal.SubmittedViewHistoryProbe PRIVATE cxx_std_17)
++add_test(NAME XRay.Metal.SubmittedViewHistory.SelfTest COMMAND XRay.Metal.SubmittedViewHistoryProbe)
++
++add_executable(XRay.Metal.SunCascadeCaptureProbe tests/R4SunCascadeCaptureProbe.cpp)
++target_compile_features(XRay.Metal.SunCascadeCaptureProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.SunCascadeCaptureProbe PRIVATE XRay.Render.R4 XRay.Core XRay.Collision)
++add_test(NAME XRay.Metal.SunCascadeCapture.SelfTest COMMAND XRay.Metal.SunCascadeCaptureProbe --self-test)
++
++add_executable(XRay.Metal.LocalShadowBatchPlanProbe tests/R4LocalShadowBatchPlanProbe.cpp)
++target_compile_features(XRay.Metal.LocalShadowBatchPlanProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.LocalShadowBatchPlanProbe PRIVATE XRay.Metal.R4Backend)
++add_test(NAME XRay.Metal.LocalShadowBatchPlan.SelfTest COMMAND XRay.Metal.LocalShadowBatchPlanProbe --self-test)
++
++add_executable(XRay.Metal.LocalShadowBatchGpuProbe
++  tests/R4LocalShadowBatchGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++  ../xrRender/du_sphere_part.cpp
++)
++target_compile_features(XRay.Metal.LocalShadowBatchGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.LocalShadowBatchGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++target_compile_definitions(XRay.Metal.LocalShadowBatchGpuProbe PRIVATE ECORE_API=)
++
++add_executable(XRay.Metal.FloraInstancingGpuProbe
++  tests/R4FloraInstancingGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.FloraInstancingGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.FloraInstancingGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++target_compile_definitions(XRay.Metal.FloraInstancingGpuProbe PRIVATE ECORE_API=)
++
++add_executable(XRay.Metal.AoIlControlsGpuProbe tests/R4AoIlControlsGpuProbe.cpp tests/R4LocalLightRolloverGpuSupport.cpp)
++target_compile_features(XRay.Metal.AoIlControlsGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.AoIlControlsGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++target_compile_definitions(XRay.Metal.AoIlControlsGpuProbe PRIVATE ECORE_API=)
++
++add_executable(XRay.Metal.VolumetricCaptureProbe tests/R4VolumetricCaptureProbe.cpp)
++target_compile_features(XRay.Metal.VolumetricCaptureProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.VolumetricCaptureProbe PRIVATE XRay.Metal.R4Backend XRay.Render.R4 XRay.Core XRay.Collision)
++add_test(NAME XRay.Metal.VolumetricCapture.SelfTest COMMAND XRay.Metal.VolumetricCaptureProbe --self-test)
++
++add_executable(XRay.Metal.EmissiveAccumulatorGpuProbe
++  tests/R4EmissiveAccumulatorGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.EmissiveAccumulatorGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.EmissiveAccumulatorGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++target_compile_definitions(XRay.Metal.EmissiveAccumulatorGpuProbe PRIVATE ECORE_API=)
++
++# E08 order-preserving index batching, independent CPU contract and real MSC GPU oracle.
++add_executable(XRay.Metal.StaticShadowMergeProbe tests/R4StaticShadowMergeProbe.cpp)
++target_compile_features(XRay.Metal.StaticShadowMergeProbe PRIVATE cxx_std_17)
++target_include_directories(XRay.Metal.StaticShadowMergeProbe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++add_test(NAME XRay.Metal.StaticShadowMerge.SelfTest COMMAND XRay.Metal.StaticShadowMergeProbe --self-test)
++add_executable(XRay.Metal.StaticShadowMergeGpuProbe
++  tests/R4StaticShadowMergeGpuProbe.cpp tests/R4LocalLightRolloverGpuSupport.cpp)
++target_compile_features(XRay.Metal.StaticShadowMergeGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.StaticShadowMergeGpuProbe PRIVATE XRay.Metal.R4Backend XRay.Core)
++target_compile_definitions(XRay.Metal.StaticShadowMergeGpuProbe PRIVATE ECORE_API=)
+diff --git a/src/Layers/xrRenderMetal/R4LevelGeometry.h b/src/Layers/xrRenderMetal/R4LevelGeometry.h
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.h
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.h
+@@ -62,6 +62,13 @@
+ 		0.0f, 0.0f, 1.0f, 0.0f,
+ 		0.0f, 0.0f, 0.0f, 1.0f};
+ 	std::string rejection;
++	// OGF_TREEDEF2 stores two authored _5color values immediately after the
++	// 4x4 transform.  Keeping them with the static visual is required for the
++	// tree c_scale/c_bias/c_sun constants; a generic value turns foliage into
++	// a different lighting material.
++	std::array<float, 5> treeScale{};
++	std::array<float, 5> treeBias{};
++	bool hasTreeLighting = false;
+ 	R4PositionBounds referencedPositionBounds;
+ };
+ 
+@@ -78,7 +85,34 @@
+ 	std::uint32_t visualId = 0;
+ 	std::uint8_t visualType = 0;
+ 	std::uint16_t shaderId = 0;
++	std::array<float, 6> box{};
++	std::array<float, 4> sphere{};
++	bool boundsValid = false;
+ 	std::vector<std::uint32_t> linkedChildren;
++};
++
++struct R4LevelSectorTopology
++{
++	std::uint32_t sectorId = 0;
++	std::uint32_t rootVisualId = 0;
++	std::vector<std::uint16_t> portalIds;
++};
++
++struct R4LevelPortalTopology
++{
++	std::uint32_t portalId = 0;
++	std::uint16_t frontSector = 0;
++	std::uint16_t backSector = 0;
++	std::vector<std::array<float, 3>> vertices;
++};
++
++struct R4LevelPortalMetadata
++{
++	bool available = false;
++	std::string unavailableReason = "sector topology was not parsed";
++	std::vector<R4LevelSectorTopology> sectors;
++	std::vector<R4LevelPortalTopology> portals;
++	std::vector<std::vector<std::uint32_t>> visualOwnerSectors;
+ };
+ 
+ struct R4LevelGeometry
+@@ -88,6 +122,7 @@
+ 	std::vector<R4LevelShader> shaders;
+ 	std::vector<R4VisualNode> visualNodes;
+ 	std::vector<R4StaticVisual> visuals;
++	R4LevelPortalMetadata portalMetadata;
+ };
+ 
+ bool CollectR4StaticVisualDescendants(
+diff --git a/src/Layers/xrRenderMetal/R4LevelGeometry.cpp b/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
+--- a/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
++++ b/src/Layers/xrRenderMetal/R4LevelGeometry.cpp
+@@ -6,6 +6,7 @@
+ #include <fstream>
+ #include <limits>
+ #include <sstream>
++#include <utility>
+ 
+ namespace xray::metal
+ {
+@@ -16,9 +17,13 @@
+ constexpr std::uint32_t kLevelShadersChunk = 2u;
+ constexpr std::uint32_t kLevelVertexBuffersChunk = 9u;
+ constexpr std::uint32_t kLevelIndexBuffersChunk = 10u;
++constexpr std::uint32_t kLevelPortalsChunk = 4u;
++constexpr std::uint32_t kLevelSectorsChunk = 8u;
+ constexpr std::uint32_t kOgfGeometryContainerChunk = 21u;
+ constexpr std::uint32_t kOgfHeaderChunk = 1u;
+ constexpr std::uint32_t kOgfLinkedChildrenChunk = 10u;
++constexpr std::uint32_t kSectorPortalsChunk = 1u;
++constexpr std::uint32_t kSectorRootChunk = 2u;
+ constexpr std::uint32_t kOgfTreeDefinitionChunk = 12u;
+ constexpr std::uint8_t kOgfFormatVersion = 4u;
+ constexpr std::uint16_t kD3dDeclEndStream = 0xffu;
+@@ -92,6 +97,18 @@
+ 	static_assert(sizeof(bits) == sizeof(value), "float must be 32-bit");
+ 	std::memcpy(&value, &bits, sizeof(value));
+ 	return true;
++}
++
++const Chunk* findOptionalUniqueChunk(const std::vector<Chunk>& chunks, const std::uint32_t id, bool& duplicate)
++{
++	const Chunk* found = nullptr;
++	for (const Chunk& chunk : chunks)
++		if (chunk.id == id)
++		{
++			if (found) { duplicate = true; return nullptr; }
++			found = &chunk;
++		}
++	return found;
+ }
+ 
+ bool readStringZ(
+@@ -460,6 +477,133 @@
+ 	appendU32(destination, static_cast<std::uint32_t>(payload.size()));
+ 	destination.insert(destination.end(), payload.begin(), payload.end());
+ }
++
++void parsePortalMetadata(const std::vector<std::uint8_t>& bytes, const std::vector<Chunk>& levelChunks,
++	R4LevelGeometry& geometry)
++{
++	auto& metadata = geometry.portalMetadata;
++	auto unavailable = [&metadata](const std::string& reason) {
++		metadata.available = false;
++		metadata.unavailableReason = reason;
++		metadata.sectors.clear(); metadata.portals.clear(); metadata.visualOwnerSectors.clear();
++	};
++	std::string error;
++	bool duplicate = false;
++	const Chunk* sectorChunk = findOptionalUniqueChunk(levelChunks, kLevelSectorsChunk, duplicate);
++	if (duplicate || !sectorChunk) { unavailable("missing or duplicate fsL_SECTORS"); return; }
++	std::vector<Chunk> sectorChunks;
++	if (!scanChunks(bytes, sectorChunk->dataBegin, sectorChunk->dataEnd, sectorChunks, error))
++		{ unavailable("malformed fsL_SECTORS: " + error); return; }
++	if (sectorChunks.empty()) { unavailable("empty fsL_SECTORS"); return; }
++	if (sectorChunks.size() > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1u)
++		{ unavailable("sector count exceeds portal endpoint ID range"); return; }
++	metadata.sectors.reserve(sectorChunks.size());
++	for (std::size_t index = 0; index < sectorChunks.size(); ++index)
++	{
++		const Chunk& sectorChunkData = sectorChunks[index];
++		if (sectorChunkData.id != index) { unavailable("sector chunk IDs are not dense"); return; }
++		std::vector<Chunk> chunks;
++		if (!scanChunks(bytes, sectorChunkData.dataBegin, sectorChunkData.dataEnd, chunks, error))
++			{ unavailable("malformed sector chunk: " + error); return; }
++		duplicate = false;
++		const Chunk* portalIds = findOptionalUniqueChunk(chunks, kSectorPortalsChunk, duplicate);
++		const Chunk* root = findOptionalUniqueChunk(chunks, kSectorRootChunk, duplicate);
++		if (duplicate || !portalIds || !root || (portalIds->dataEnd - portalIds->dataBegin) % 2u != 0u ||
++			root->dataEnd - root->dataBegin != 4u)
++			{ unavailable("sector portal/root chunks are missing, duplicate, or malformed"); return; }
++		R4LevelSectorTopology sector;
++		sector.sectorId = static_cast<std::uint32_t>(index);
++		if (!readU32(bytes, root->dataBegin, sector.rootVisualId) || sector.rootVisualId >= geometry.visualNodes.size())
++			{ unavailable("sector root visual ID is out of range"); return; }
++		const R4VisualNode& rootNode = geometry.visualNodes[sector.rootVisualId];
++		if (!rootNode.boundsValid) { unavailable("sector root OGF bounds are invalid"); return; }
++		for (std::size_t cursor = portalIds->dataBegin; cursor < portalIds->dataEnd; cursor += 2u)
++		{
++			std::uint16_t portalId = 0;
++			if (!readU16(bytes, cursor, portalId)) { unavailable("unreadable sector portal ID"); return; }
++			if (std::find(sector.portalIds.begin(), sector.portalIds.end(), portalId) != sector.portalIds.end())
++				{ unavailable("duplicate sector portal ID"); return; }
++			sector.portalIds.push_back(portalId);
++		}
++		metadata.sectors.push_back(std::move(sector));
++	}
++
++	duplicate = false;
++	const Chunk* portalChunk = findOptionalUniqueChunk(levelChunks, kLevelPortalsChunk, duplicate);
++	if (duplicate) { unavailable("duplicate fsL_PORTALS"); return; }
++	if (portalChunk)
++	{
++		constexpr std::size_t PortalRecordBytes = 80u; // u16 front/back, 6*Fvector, svector count
++		const std::size_t bytesAvailable = portalChunk->dataEnd - portalChunk->dataBegin;
++		if (bytesAvailable % PortalRecordBytes != 0u) { unavailable("fsL_PORTALS record size mismatch"); return; }
++		const std::size_t count = bytesAvailable / PortalRecordBytes;
++		if (count > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1u)
++			{ unavailable("portal count exceeds sector portal ID range"); return; }
++		metadata.portals.reserve(count);
++		for (std::size_t index = 0; index < count; ++index)
++		{
++			const std::size_t offset = portalChunk->dataBegin + index * PortalRecordBytes;
++			R4LevelPortalTopology portal;
++			portal.portalId = static_cast<std::uint32_t>(index);
++			std::uint32_t vertexCount = 0;
++			if (!readU16(bytes, offset, portal.frontSector) || !readU16(bytes, offset + 2u, portal.backSector) ||
++				!readU32(bytes, offset + 76u, vertexCount) || vertexCount < 3u || vertexCount > 6u ||
++				portal.frontSector == portal.backSector || portal.frontSector >= metadata.sectors.size() ||
++				portal.backSector >= metadata.sectors.size())
++				{ unavailable("portal endpoint or vertex count is invalid"); return; }
++			portal.vertices.reserve(vertexCount);
++			for (std::uint32_t vertex = 0; vertex < vertexCount; ++vertex)
++			{
++				std::array<float, 3> point{};
++				for (std::size_t axis = 0; axis < 3u; ++axis)
++					if (!readFloat(bytes, offset + 4u + (vertex * 3u + axis) * sizeof(float), point[axis]) ||
++						!std::isfinite(point[axis]))
++						{ unavailable("portal vertex is unreadable or nonfinite"); return; }
++				portal.vertices.push_back(point);
++			}
++			metadata.portals.push_back(std::move(portal));
++		}
++	}
++	for (const R4LevelSectorTopology& sector : metadata.sectors)
++		for (const std::uint16_t portalId : sector.portalIds)
++			if (portalId >= metadata.portals.size())
++				{ unavailable("sector references a missing portal ID"); return; }
++			else if (sector.sectorId != metadata.portals[portalId].frontSector &&
++				sector.sectorId != metadata.portals[portalId].backSector)
++				{ unavailable("sector lists a portal that is not incident to it"); return; }
++	for (const R4LevelPortalTopology& portal : metadata.portals)
++	{
++		const auto incident = [&portal](const R4LevelSectorTopology& sector) {
++			return std::find(sector.portalIds.begin(), sector.portalIds.end(), portal.portalId) != sector.portalIds.end();
++		};
++		if (!incident(metadata.sectors[portal.frontSector]) || !incident(metadata.sectors[portal.backSector]))
++			{ unavailable("portal endpoints do not list the portal as incident"); return; }
++	}
++
++	metadata.visualOwnerSectors.resize(geometry.visualNodes.size());
++	for (const R4LevelSectorTopology& sector : metadata.sectors)
++	{
++		std::vector<std::uint8_t> state(geometry.visualNodes.size(), 0u);
++		std::vector<std::pair<std::uint32_t, bool>> stack{{sector.rootVisualId, false}};
++		while (!stack.empty())
++		{
++			const auto [visualId, leaving] = stack.back(); stack.pop_back();
++			if (visualId >= geometry.visualNodes.size()) { unavailable("visual descendant ID is out of range"); return; }
++			if (leaving) { state[visualId] = 2u; continue; }
++			if (state[visualId] == 1u) { unavailable("cycle in sector root visual hierarchy"); return; }
++			if (state[visualId] == 2u) continue;
++			state[visualId] = 1u;
++			auto& owners = metadata.visualOwnerSectors[visualId];
++			if (std::find(owners.begin(), owners.end(), sector.sectorId) == owners.end()) owners.push_back(sector.sectorId);
++			stack.emplace_back(visualId, true);
++			const auto& children = geometry.visualNodes[visualId].linkedChildren;
++			for (auto child = children.rbegin(); child != children.rend(); ++child)
++				stack.emplace_back(*child, false);
++		}
++	}
++	metadata.available = true;
++	metadata.unavailableReason.clear();
++}
+ } // namespace
+ 
+ bool ParseR4LevelGeometry(
+@@ -605,6 +749,19 @@
+ 			error = "unreadable OGF_HEADER shader id";
+ 			return false;
+ 		}
++		node.boundsValid = true;
++		for (std::size_t index = 0; index < node.box.size(); ++index)
++		{
++			if (!readFloat(levelBytes, header->dataBegin + 4u + index * sizeof(float), node.box[index]) ||
++				!std::isfinite(node.box[index])) node.boundsValid = false;
++		}
++		for (std::size_t index = 0; index < node.sphere.size(); ++index)
++		{
++			if (!readFloat(levelBytes, header->dataBegin + 28u + index * sizeof(float), node.sphere[index]) ||
++				!std::isfinite(node.sphere[index])) node.boundsValid = false;
++		}
++		node.boundsValid = node.boundsValid && node.box[0] <= node.box[3] && node.box[1] <= node.box[4] &&
++			node.box[2] <= node.box[5] && node.sphere[3] >= 0.0f;
+ 		if (linkedChildren)
+ 		{
+ 			std::size_t childCursor = linkedChildren->dataBegin;
+@@ -672,6 +829,36 @@
+ 				visual.modelTransform[element] = value;
+ 			}
+ 			visual.hasModelTransform = true;
++			// FTreeVisual::Load reads _5color c_scale/c_bias directly after
++			// the transform and halves them before its R4 render-time correction.
++			// Preserve the source values here; the Metal flora adapter applies the
++			// same transform plus live r__d_tree_SBC.
++			constexpr std::size_t TreeLightingOffset = 64u;
++			constexpr std::size_t TreeLightingBytes = sizeof(float) * 10u;
++			if (treeDefinition->dataEnd - treeDefinition->dataBegin <
++				TreeLightingOffset + TreeLightingBytes)
++			{
++				error = "tree visual " + std::to_string(visual.visualId) +
++					" is missing OGF_TREEDEF2 scale/bias lighting";
++				return false;
++			}
++			for (std::size_t index = 0; index < visual.treeScale.size(); ++index)
++			{
++				std::memcpy(&visual.treeScale[index], levelBytes.data() +
++					treeDefinition->dataBegin + TreeLightingOffset + index * sizeof(float),
++					sizeof(float));
++				std::memcpy(&visual.treeBias[index], levelBytes.data() +
++					treeDefinition->dataBegin + TreeLightingOffset +
++					visual.treeScale.size() * sizeof(float) + index * sizeof(float),
++					sizeof(float));
++				if (!std::isfinite(visual.treeScale[index]) || !std::isfinite(visual.treeBias[index]))
++				{
++					error = "tree visual " + std::to_string(visual.visualId) +
++						" has non-finite OGF_TREEDEF2 scale/bias lighting";
++					return false;
++				}
++			}
++			visual.hasTreeLighting = true;
+ 		}
+ 		if (!readU32(levelBytes, geometryContainer->dataBegin, visual.vertexBufferId)
+ 			|| !readU32(levelBytes, geometryContainer->dataBegin + 4u, visual.vertexBase)
+@@ -721,6 +908,7 @@
+ 			}
+ 		}
+ 	}
++	parsePortalMetadata(levelBytes, levelChunks, result);
+ 
+ 	return true;
+ }
+@@ -873,6 +1061,8 @@
+ 	header[0] = kOgfFormatVersion;
+ 	header[1] = 7u;
+ 	header[2] = 1u;
++	const std::array<float, 10> headerBounds{-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 2.0f};
++	std::memcpy(header.data() + 4u, headerBounds.data(), headerBounds.size() * sizeof(float));
+ 	appendChunk(visual, kOgfHeaderChunk, header);
+ 	std::vector<std::uint8_t> treeDefinition;
+ 	for (std::size_t element = 0; element < 16u; ++element)
+@@ -883,7 +1073,7 @@
+ 		if (element == 14u) value = 4.0f;
+ 		appendFloat(treeDefinition, value);
+ 	}
+-	treeDefinition.resize(96u, 0u);
++	treeDefinition.resize(104u, 0u);
+ 	appendChunk(visual, kOgfTreeDefinitionChunk, treeDefinition);
+ 	appendChunk(visual, kOgfGeometryContainerChunk, geometryContainer);
+ 	std::vector<std::uint8_t> visuals;
+@@ -892,6 +1082,8 @@
+ 	std::vector<std::uint8_t> hierarchyHeader(44u, 0u);
+ 	hierarchyHeader[0] = kOgfFormatVersion;
+ 	hierarchyHeader[1] = 1u;
++	const std::array<float, 10> hierarchyBounds{-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 2.0f};
++	std::memcpy(hierarchyHeader.data() + 4u, hierarchyBounds.data(), hierarchyBounds.size() * sizeof(float));
+ 	appendChunk(hierarchy, kOgfHeaderChunk, hierarchyHeader);
+ 	std::vector<std::uint8_t> children;
+ 	appendU32(children, 1u);
+@@ -950,6 +1142,128 @@
+ 		return false;
+ 	}
+ 	error.clear();
++	if (parsed.portalMetadata.available || parsed.portalMetadata.unavailableReason.empty() ||
++		!parsed.visuals.front().valid)
++	{
++		error = "missing optional sector metadata changed normal geometry admission";
++		return false;
++	}
++
++	std::vector<std::uint8_t> topologyLevelBytes = levelBytes;
++	std::vector<std::uint8_t> portalPayload;
++	appendU16(portalPayload, 0u); appendU16(portalPayload, 1u);
++	for (float value : {2.0f, -1.0f, -1.0f, 2.0f, 1.0f, -1.0f, 2.0f, 1.0f, 1.0f,
++		2.0f, -1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}) appendFloat(portalPayload, value);
++	appendU32(portalPayload, 4u);
++	appendChunk(topologyLevelBytes, kLevelPortalsChunk, portalPayload);
++	std::vector<std::uint8_t> sectorsPayload;
++	for (std::uint32_t sectorId = 0u; sectorId < 2u; ++sectorId)
++	{
++		std::vector<std::uint8_t> sectorPayload, portalIds, rootPayload;
++		appendU16(portalIds, 0u); appendChunk(sectorPayload, kSectorPortalsChunk, portalIds);
++		appendU32(rootPayload, sectorId == 0u ? 1u : 0u);
++		appendChunk(sectorPayload, kSectorRootChunk, rootPayload);
++		appendChunk(sectorsPayload, sectorId, sectorPayload);
++	}
++	appendChunk(topologyLevelBytes, kLevelSectorsChunk, sectorsPayload);
++	if (!ParseR4LevelGeometry(geometryBytes, topologyLevelBytes, parsed, error) ||
++		!parsed.portalMetadata.available || parsed.portalMetadata.sectors.size() != 2u ||
++		parsed.portalMetadata.portals.size() != 1u || parsed.portalMetadata.visualOwnerSectors.size() != 2u ||
++		parsed.portalMetadata.visualOwnerSectors[0] != std::vector<std::uint32_t>{0u, 1u} ||
++		parsed.portalMetadata.visualOwnerSectors[1] != std::vector<std::uint32_t>{0u} ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "valid multi-root portal metadata fixture failed or changed geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> foreignPortalTopology = topologyLevelBytes;
++	std::vector<Chunk> topChunks;
++	bool duplicateChunk = false;
++	topChunks.clear();
++	if (!scanChunks(foreignPortalTopology, 0u, foreignPortalTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* foreignSectors = findOptionalUniqueChunk(topChunks, kLevelSectorsChunk, duplicateChunk);
++	if (!foreignSectors || duplicateChunk || foreignSectors->dataEnd != foreignPortalTopology.size())
++		{ error = "foreign-sector fixture chunk missing or not final"; return false; }
++	std::vector<std::uint8_t> foreignSectorPayload, foreignPortalIds, foreignRoot;
++	appendU16(foreignPortalIds, 0u); appendChunk(foreignSectorPayload, kSectorPortalsChunk, foreignPortalIds);
++	appendU32(foreignRoot, 0u); appendChunk(foreignSectorPayload, kSectorRootChunk, foreignRoot);
++	std::vector<std::uint8_t> foreignSectorChunk;
++	appendChunk(foreignSectorChunk, 2u, foreignSectorPayload);
++	const std::size_t foreignSectorListSize = foreignSectors->dataEnd - foreignSectors->dataBegin + foreignSectorChunk.size();
++	for (std::size_t byte = 0u; byte < 4u; ++byte)
++		foreignPortalTopology[foreignSectors->dataBegin - 4u + byte] =
++			static_cast<std::uint8_t>((foreignSectorListSize >> (byte * 8u)) & 0xffu);
++	foreignPortalTopology.insert(foreignPortalTopology.end(), foreignSectorChunk.begin(), foreignSectorChunk.end());
++	if (!ParseR4LevelGeometry(geometryBytes, foreignPortalTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid ||
++		parsed.portalMetadata.unavailableReason.find("not incident") == std::string::npos)
++	{
++		if (error.empty()) error = "foreign-sector portal reference did not fail open while preserving geometry";
++		return false;
++	}
++	std::vector<std::uint8_t> malformedTopology = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(malformedTopology, 0u, malformedTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* malformedPortals = findOptionalUniqueChunk(topChunks, kLevelPortalsChunk, duplicateChunk);
++	if (!malformedPortals || duplicateChunk) { error = "portal fixture chunk missing"; return false; }
++	malformedTopology[malformedPortals->dataBegin + 2u] = 9u;
++	if (!ParseR4LevelGeometry(geometryBytes, malformedTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "malformed optional portal metadata affected geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> unorderedRootBounds = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(unorderedRootBounds, 0u, unorderedRootBounds.size(), topChunks, error)) return false;
++	const Chunk* boundsVisualList = findOptionalUniqueChunk(topChunks, kLevelVisualsChunk, duplicateChunk);
++	if (!boundsVisualList || duplicateChunk) { error = "visual fixture chunk missing"; return false; }
++	std::vector<Chunk> boundsVisualItems;
++	if (!scanChunks(unorderedRootBounds, boundsVisualList->dataBegin, boundsVisualList->dataEnd, boundsVisualItems, error)) return false;
++	const Chunk* rootItem = nullptr;
++	for (const Chunk& item : boundsVisualItems) if (item.id == 1u) rootItem = &item;
++	if (!rootItem) { error = "root visual fixture missing"; return false; }
++	std::vector<Chunk> rootOgfChunks;
++	if (!scanChunks(unorderedRootBounds, rootItem->dataBegin, rootItem->dataEnd, rootOgfChunks, error)) return false;
++	const Chunk* rootHeader = nullptr;
++	for (const Chunk& item : rootOgfChunks) if (item.id == kOgfHeaderChunk) rootHeader = &item;
++	if (!rootHeader) { error = "root OGF header fixture missing"; return false; }
++	const float invertedMaxX = -2.0f;
++	std::memcpy(unorderedRootBounds.data() + rootHeader->dataBegin + 4u + 3u * sizeof(float),
++		&invertedMaxX, sizeof(invertedMaxX));
++	if (!ParseR4LevelGeometry(geometryBytes, unorderedRootBounds, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid || parsed.visualNodes[1].boundsValid)
++	{
++		if (error.empty()) error = "invalid optional root bounds affected geometry admission";
++		return false;
++	}
++	std::vector<std::uint8_t> cyclicTopology = topologyLevelBytes;
++	topChunks.clear();
++	if (!scanChunks(cyclicTopology, 0u, cyclicTopology.size(), topChunks, error)) return false;
++	duplicateChunk = false;
++	const Chunk* visualList = findOptionalUniqueChunk(topChunks, kLevelVisualsChunk, duplicateChunk);
++	if (!visualList || duplicateChunk) { error = "visual fixture chunk missing"; return false; }
++	std::vector<Chunk> visualItems;
++	if (!scanChunks(cyclicTopology, visualList->dataBegin, visualList->dataEnd, visualItems, error)) return false;
++	const Chunk* hierarchyChunk = nullptr;
++	for (const Chunk& item : visualItems) if (item.id == 1u) hierarchyChunk = &item;
++	if (!hierarchyChunk) { error = "hierarchy fixture missing"; return false; }
++	std::vector<Chunk> hierarchyChunks;
++	if (!scanChunks(cyclicTopology, hierarchyChunk->dataBegin, hierarchyChunk->dataEnd, hierarchyChunks, error)) return false;
++	const Chunk* hierarchyLinks = nullptr;
++	for (const Chunk& item : hierarchyChunks) if (item.id == kOgfLinkedChildrenChunk) hierarchyLinks = &item;
++	if (!hierarchyLinks || hierarchyLinks->dataEnd - hierarchyLinks->dataBegin != 8u)
++		{ error = "hierarchy link fixture malformed"; return false; }
++	cyclicTopology[hierarchyLinks->dataBegin + 4u] = 1u;
++	if (!ParseR4LevelGeometry(geometryBytes, cyclicTopology, parsed, error) || parsed.portalMetadata.available ||
++		parsed.visuals.size() != 1u || !parsed.visuals.front().valid)
++	{
++		if (error.empty()) error = "optional topology cycle affected geometry admission";
++		return false;
++	}
++	error.clear();
+ 
+ 	geometryBytes.back() = 3u;
+ 	if (!ParseR4LevelGeometry(geometryBytes, levelBytes, parsed, error))
+diff --git a/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake b/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
+--- a/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
++++ b/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
+@@ -101,6 +101,10 @@
+   ../xrRender/r__pixel_calculator.h
+   ../xrRender/r__screenshot.cpp
+   ../xrRender/R_calculate.cpp
++  ../../xrRenderMetal/R4PortalGenerationContext.cpp
++  ../../xrRenderMetal/R4PortalGraphPreparedObserver.cpp
++  ../../xrRenderMetal/R4PortalGenerationContext.h
++  ../../xrRenderMetal/R4PortalGraphObserver.h
+   ../xrRender/CHudInitializer.cpp
+   ../xrRender/gifPlayer.cpp
+   ../xrRender/r_sun_cascades.h
+diff --git a/src/Layers/xrRenderMetal/R4PortalGraphObserver.h b/src/Layers/xrRenderMetal/R4PortalGraphObserver.h
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4PortalGraphObserver.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include "R4LevelGeometry.h"
++#include "xrCDB/Frustum.h"
++
++namespace xray::metal
++{
++struct R4PortalGraphInputs
++{
++	bool captured = false; // caller sets only after all frame-bound fields are copied coherently
++	u32 startSector = u32(-1); // externally validated; CFORM detection is outside this helper
++	Fvector savedCameraEye;
++	Fvector graphEye;
++	Fmatrix fullTransform;
++	float viewportNear = 0.f;
++	float ssaDiscard = 0.f;
++	float ssaLodA = 0.f;
++	float ssaLodB = 0.f;
++	u32 options = 0; // source CDSGraphManager bits; VQ_HOM must be clear
++	bool drawPortals = false;
++};
++
++struct R4PortalSectorFrustums
++{
++	u32 sectorId = 0;
++	std::vector<CFrustum> values;
++};
++
++struct R4PortalGraphResult
++{
++	bool valid = false;
++	std::string unavailableReason;
++	std::vector<R4PortalSectorFrustums> reached;
++	std::vector<std::uint8_t> rawVisualVisible; // raw OGF sphere+AABB test; not ancestor/HOM/shipping visibility
++	std::vector<u32> ownerFrustumTests;
++	u32 portalChecks = 0;
++	u32 portalRecursions = 0;
++	u32 uncertainWideClipPasses = 0;
++};
++
++// Pure observer only. Invalid input means every visual is returned visible.
++bool ObserveR4PortalGraph(const R4LevelGeometry& geometry, const R4PortalGraphInputs& inputs,
++	R4PortalGraphResult& result);
++} // namespace xray::metal
+diff --git a/src/Layers/xrRenderMetal/R4PortalGenerationContext.h b/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4PortalGenerationContext.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include "R4LevelGeometry.h"
++#include "R4PortalGraphObserver.h"
++#include "xrCDB/xrCDB.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace xray::metal
++{
++struct R4PortalPlaneSphereValue
++{
++    Fplane plane;
++    Fsphere sphere;
++};
++
++// Only the parser-owned values consumed by the traversal are retained.
++struct R4PreparedPortalGraph
++{
++    bool qualified = false;
++    std::vector<R4VisualNode> visualNodes;
++    R4LevelPortalMetadata portalMetadata;
++    std::vector<R4PortalPlaneSphereValue> portalPlaneSpheres;
++};
++
++struct R4PortalGenerationCache
++{
++    u64 generation = 0;
++    bool qualified = false;
++    std::string unavailableReason;
++    R4PreparedPortalGraph graph;
++    u32 outdoorSector = u32(-1);
++    std::unique_ptr<CDB::MODEL> portalModel;
++    double initializationCpuMs = 0.0;
++    std::string activeLevelReaderSha256;
++
++    R4PortalGenerationCache() = default;
++    R4PortalGenerationCache(const R4PortalGenerationCache&) = delete;
++    R4PortalGenerationCache& operator=(const R4PortalGenerationCache&) = delete;
++    R4PortalGenerationCache(R4PortalGenerationCache&&) = default;
++    R4PortalGenerationCache& operator=(R4PortalGenerationCache&&) = default;
++};
++
++struct R4PortalContextFrameInput
++{
++    u64 generation = 0;
++    u32 frameID = 0;
++    Fvector currentEye;
++    Fvector savedEye;
++    Fmatrix fullTransform;
++    float viewportNear = 0.f;
++    float ssaDiscard = 0.f;
++    float ssaLodA = 0.f;
++    float ssaLodB = 0.f;
++    bool drawPortals = false;
++};
++
++struct R4PortalContextFrameOutput
++{
++    u64 generation = 0;
++    u32 frameID = 0;
++    bool valid = false;
++    u32 startSector = u32(-1);
++    std::string unavailableReason;
++    double initializationCpuMs = 0.0;
++    double frameCpuMs = 0.0;
++    R4PortalGraphResult graph; // owns all reached CFrustum values
++};
++
++// Reuses actual CFrustum/ClipPoly traversal math with the generation's already
++// qualified CPortal planes/spheres; it does not call CPortal::Setup.
++bool ObserveR4PreparedPortalGraph(const R4PreparedPortalGraph& prepared,
++    const R4PortalGraphInputs& inputs, R4PortalGraphResult& output);
++
++// Initializes atomically from one parser result. Every portal/root/owner relation
++// is validated here, and CPortal::Setup runs exactly once per portal/generation.
++bool BuildR4PortalGenerationCache(const R4LevelGeometry& parsed, u64 generation,
++                                  R4PortalGenerationCache& output);
++
++// Mirrors CRender::detectLastSector. staticCform is borrowed for the call only;
++// no CDB::RESULT, CDB::TRI, CPortal, CSector, or parser pointer is retained.
++bool ResolveR4DetectLastSector(const R4PortalGenerationCache& cache,
++    const Fvector& eye, const CDB::MODEL* staticCform, u32& sectorId,
++    std::string& unavailableReason);
++
++// Source-math observer only. HOM is forced off (options=6). A stale generation,
++// unresolved sector, or walker uncertainty returns invalid with no partial owners.
++bool ObserveR4PortalGeneration(const R4PortalGenerationCache& cache,
++    const R4PortalContextFrameInput& input, const CDB::MODEL* staticCform,
++    R4PortalContextFrameOutput& output);
++} // namespace xray::metal
+diff --git a/src/Layers/xrRenderMetal/R4PortalGenerationContext.cpp b/src/Layers/xrRenderMetal/R4PortalGenerationContext.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4PortalGenerationContext.cpp
+@@ -0,0 +1,298 @@
++#include "stdafx.h"
++#include "R4PortalGenerationContext.h"
++#include "r__sector.h"
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++namespace xray::metal
++{
++namespace
++{
++constexpr u32 kNoPortal = u32(-1);
++constexpr float kDetectLastSectorRange = 1000.f;
++
++bool finiteVector(const Fvector& v)
++{
++    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
++}
++
++bool validRootBox(const R4VisualNode& node, Fbox& box)
++{
++    if (!node.boundsValid)
++        return false;
++    Fvector min, max;
++    min.set(node.box[0], node.box[1], node.box[2]);
++    max.set(node.box[3], node.box[4], node.box[5]);
++    if (!finiteVector(min) || !finiteVector(max) || min.x > max.x || min.y > max.y || min.z > max.z)
++        return false;
++    box.set(min, max);
++    const float volume = box.getvolume();
++    return std::isfinite(volume) && volume >= 0.f;
++}
++
++bool validPortalPolygon(const R4LevelPortalTopology& portal, std::vector<Fvector>& points)
++{
++    if (portal.vertices.size() < 3u || portal.vertices.size() > 6u)
++        return false;
++    points.clear();
++    for (const auto& v : portal.vertices)
++    {
++        if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
++            return false;
++        Fvector p; p.set(v[0], v[1], v[2]); points.push_back(p);
++    }
++    Fvector normal; normal.mknormal_non_normalized(points[0], points[1], points[2]);
++    const float area = normal.magnitude();
++    if (!std::isfinite(area) || area <= EPS_S)
++        return false;
++    normal.div(area);
++    Fvector unitFanSum; unitFanSum.set(0.f, 0.f, 0.f);
++    for (std::size_t i = 2u; i < points.size(); ++i)
++    {
++        Fvector fan; fan.mknormal_non_normalized(points[0], points[i - 1u], points[i]);
++        const float fanArea = fan.magnitude();
++        if (!std::isfinite(fanArea) || fanArea <= EPS_S || normal.dotproduct(fan) <= EPS_S)
++            return false;
++        fan.div(fanArea); unitFanSum.add(fan);
++    }
++    if (!finiteVector(unitFanSum) || unitFanSum.magnitude() <= EPS_S)
++        return false;
++    for (const Fvector& p : points)
++    {
++        Fvector delta; delta.sub(p, points[0]);
++        if (_abs(normal.dotproduct(delta)) > EPS_L)
++            return false;
++    }
++    for (std::size_t i = 0; i < points.size(); ++i)
++    {
++        Fvector turn;
++        turn.mknormal_non_normalized(points[i], points[(i + 1u) % points.size()],
++            points[(i + 2u) % points.size()]);
++        if (!finiteVector(turn) || normal.dotproduct(turn) <= EPS_S)
++            return false;
++    }
++    return true;
++}
++
++bool buildPortalModel(const R4LevelPortalMetadata& topology, std::unique_ptr<CDB::MODEL>& model,
++    std::string& error)
++{
++    CDB::Collector collector;
++    u32 realTriangles = 0u;
++    for (const auto& portal : topology.portals)
++    {
++        std::vector<Fvector> points;
++        if (!validPortalPolygon(portal, points))
++        { error = "unqualified portal reached CDB collector"; return false; }
++        for (u32 j = 2u; j < points.size(); ++j)
++        {
++            collector.add_face_packed_D(points[0], points[j - 1u], points[j], portal.portalId);
++            ++realTriangles;
++        }
++    }
++    if (realTriangles == 0u)
++        return true; // No portal model; start-sector fallback may still use CFORM.
++    if (realTriangles == 1u)
++    {
++        // MODEL::build requires >=2 triangles and >=4 vertices. Keep the source
++        // loader's far-away sentinel idea, but never alias the synthetic hit to portal 0.
++        Fvector a, b, c;
++        a.set(-20000.f, -20000.f, -20000.f);
++        b.set(-20001.f, -20000.f, -20000.f);
++        c.set(-20000.f, -20001.f, -20000.f);
++        collector.add_face_packed_D(a, b, c, kNoPortal);
++    }
++    if (collector.getVS() < 4u || collector.getTS() < 2u ||
++        collector.getVS() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
++        collector.getTS() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
++    { error = "portal collector does not meet CDB::MODEL::build minimums"; return false; }
++
++    model.reset(new CDB::MODEL());
++    model->build(collector.getV(), static_cast<int>(collector.getVS()),
++        collector.getT(), static_cast<int>(collector.getTS()));
++    // MODEL::build/build_internal copy both arrays synchronously. memory()==0
++    // reports a failed/not-ready build before queries can touch a missing tree.
++    if (model->memory() == 0u)
++    { model.reset(); error = "CDB portal model build did not reach ready state"; return false; }
++    return true;
++}
++
++bool resolveDirection(const R4PortalGenerationCache& cache, const Fvector& eye,
++    const Fvector& direction, const CDB::MODEL* staticCform, u32& sectorId)
++{
++    if (cache.portalModel)
++    {
++        CDB::COLLIDER portalRay;
++        portalRay.ray_options(CDB::OPT_ONLYNEAREST);
++        portalRay.ray_query(cache.portalModel.get(), eye, direction, kDetectLastSectorRange);
++        if (portalRay.r_count() > 0)
++        {
++            const CDB::RESULT& hit = *portalRay.r_begin();
++            const u32 portalId = hit.dummy;
++            if (hit.id >= 0 && u32(hit.id) < cache.portalModel->get_tris_count() &&
++                portalId != kNoPortal && portalId < cache.graph.portalMetadata.portals.size())
++            {
++                const auto& source = cache.graph.portalMetadata.portals[portalId];
++                const auto& prepared = cache.graph.portalPlaneSpheres[portalId];
++                const u32 facing = prepared.plane.classify(eye) > 0.f ? source.frontSector : source.backSector;
++                if (facing < cache.graph.portalMetadata.sectors.size())
++                {
++                    const auto rootId = cache.graph.portalMetadata.sectors[facing].rootVisualId;
++                    Fbox root;
++                    if (rootId < cache.graph.visualNodes.size() &&
++                        validRootBox(cache.graph.visualNodes[rootId], root) && root.contains(eye))
++                    { sectorId = facing; return true; }
++                }
++            }
++            // Source checks only the nearest portal; an invalid/uncontained hit
++            // falls through to CFORM for this direction rather than trying later hits.
++        }
++    }
++
++    if (staticCform)
++    {
++        CDB::COLLIDER cformRay;
++        cformRay.ray_options(CDB::OPT_ONLYNEAREST);
++        cformRay.ray_query(staticCform, eye, direction, kDetectLastSectorRange);
++        if (cformRay.r_count() > 0)
++        {
++            // ray_query copies the hit TRI union (including its sector bits) into RESULT.
++            const CDB::RESULT& hit = *cformRay.r_begin();
++            const u32 sector = hit.sector;
++            if (hit.id >= 0 && u32(hit.id) < staticCform->get_tris_count() &&
++                sector < cache.graph.portalMetadata.sectors.size())
++            { sectorId = sector; return true; }
++        }
++    }
++    return false;
++}
++} // namespace
++
++bool BuildR4PortalGenerationCache(const R4LevelGeometry& parsed, const u64 generation,
++    R4PortalGenerationCache& output)
++{
++    output = R4PortalGenerationCache{}; // stale generations are destroyed before parsing new values.
++    R4PortalGenerationCache next;
++    next.generation = generation;
++    const auto& topology = parsed.portalMetadata;
++    if (!generation || !topology.available || topology.sectors.empty() ||
++        topology.visualOwnerSectors.size() != parsed.visualNodes.size())
++    { next.unavailableReason = "portal metadata, generation, or owner table unavailable"; output = std::move(next); return false; }
++
++    next.graph.visualNodes = parsed.visualNodes;
++    next.graph.portalMetadata = topology;
++    next.graph.portalPlaneSpheres.resize(topology.portals.size());
++    float largestVolume = 0.f;
++    for (u32 sid = 0u; sid < topology.sectors.size(); ++sid)
++    {
++        const auto& sector = topology.sectors[sid];
++        if (sector.sectorId != sid || sector.rootVisualId >= parsed.visualNodes.size())
++        { next.unavailableReason = "sector IDs or root visual reference are invalid"; output = std::move(next); return false; }
++        Fbox root;
++        if (!validRootBox(parsed.visualNodes[sector.rootVisualId], root))
++        { next.unavailableReason = "sector root has invalid or non-positive bounds"; output = std::move(next); return false; }
++        const float volume = root.getvolume();
++        if (volume > largestVolume)
++        { largestVolume = volume; next.outdoorSector = sid; }
++        for (std::size_t i = 0; i < sector.portalIds.size(); ++i)
++        {
++            const u16 pid = sector.portalIds[i];
++            if (pid >= topology.portals.size() ||
++                std::find(sector.portalIds.begin(), sector.portalIds.begin() + i, pid) != sector.portalIds.begin() + i ||
++                (topology.portals[pid].frontSector != sid && topology.portals[pid].backSector != sid))
++            { next.unavailableReason = "sector portal incidence is invalid or duplicated"; output = std::move(next); return false; }
++        }
++    }
++    if (next.outdoorSector == u32(-1))
++    { next.unavailableReason = "no valid largest-volume root visual"; output = std::move(next); return false; }
++
++    for (u32 pid = 0u; pid < topology.portals.size(); ++pid)
++    {
++        const auto& portalData = topology.portals[pid];
++        if (portalData.portalId != pid || portalData.frontSector >= topology.sectors.size() ||
++            portalData.backSector >= topology.sectors.size() || portalData.frontSector == portalData.backSector)
++        { next.unavailableReason = "portal IDs or endpoints are invalid"; output = std::move(next); return false; }
++        if (std::count(topology.sectors[portalData.frontSector].portalIds.begin(),
++                topology.sectors[portalData.frontSector].portalIds.end(), static_cast<u16>(pid)) != 1 ||
++            std::count(topology.sectors[portalData.backSector].portalIds.begin(),
++                topology.sectors[portalData.backSector].portalIds.end(), static_cast<u16>(pid)) != 1)
++        { next.unavailableReason = "portal endpoint adjacency is incomplete"; output = std::move(next); return false; }
++        std::vector<Fvector> points;
++        if (!validPortalPolygon(portalData, points))
++        { next.unavailableReason = "portal polygon is not finite, planar, convex and nondegenerate"; output = std::move(next); return false; }
++        CPortal portal; portal.Setup(points.data(), static_cast<int>(points.size()), nullptr, nullptr);
++        if (!finiteVector(portal.P.n) || !std::isfinite(portal.P.d) || portal.P.n.magnitude() <= EPS_S ||
++            !finiteVector(portal.S.P) || !std::isfinite(portal.S.R) || portal.S.R < 0.f)
++        { next.unavailableReason = "CPortal::Setup returned invalid cached values"; output = std::move(next); return false; }
++        next.graph.portalPlaneSpheres[pid] = {portal.P, portal.S};
++    }
++    for (const auto& owners : topology.visualOwnerSectors)
++        for (std::size_t i = 0; i < owners.size(); ++i)
++            if (owners[i] >= topology.sectors.size() ||
++                std::find(owners.begin(), owners.begin() + i, owners[i]) != owners.begin() + i)
++            { next.unavailableReason = "visual owner sector is out of range or duplicated"; output = std::move(next); return false; }
++
++    if (!buildPortalModel(topology, next.portalModel, next.unavailableReason))
++    { output = std::move(next); return false; }
++    next.graph.qualified = true;
++    next.qualified = true;
++    output = std::move(next);
++    return true;
++}
++
++bool ResolveR4DetectLastSector(const R4PortalGenerationCache& cache, const Fvector& eye,
++    const CDB::MODEL* staticCform, u32& sectorId, std::string& unavailableReason)
++{
++    sectorId = u32(-1);
++    unavailableReason.clear();
++    if (!cache.qualified || !finiteVector(eye))
++    { unavailableReason = "invalid or unqualified generation/eye"; return false; }
++    if (cache.graph.portalMetadata.sectors.size() == 1u)
++    {
++        sectorId = cache.outdoorSector; // source shortcut returns pOutdoorSector.
++        return sectorId == 0u;
++    }
++    Fvector down, up; down.set(0.f, -1.f, 0.f); up.set(0.f, 1.f, 0.f);
++    if (resolveDirection(cache, eye, down, staticCform, sectorId)) return true;
++    if (resolveDirection(cache, eye, up, staticCform, sectorId)) return true;
++    unavailableReason = "detectLastSector found no accepted portal or static-CFORM sector";
++    return false;
++}
++
++bool ObserveR4PortalGeneration(const R4PortalGenerationCache& cache,
++    const R4PortalContextFrameInput& input, const CDB::MODEL* staticCform,
++    R4PortalContextFrameOutput& output)
++{
++    output = {};
++    output.generation = input.generation;
++    output.frameID = input.frameID;
++    output.graph.rawVisualVisible.assign(cache.graph.visualNodes.size(), 1u);
++    output.graph.ownerFrustumTests.assign(cache.graph.visualNodes.size(), 0u);
++    if (!cache.qualified || input.generation != cache.generation)
++    { output.unavailableReason = "stale or unqualified level generation"; return false; }
++    u32 startSector = u32(-1);
++    if (!ResolveR4DetectLastSector(cache, input.currentEye, staticCform, startSector,
++        output.unavailableReason))
++        return false;
++
++    R4PortalGraphInputs graphInput;
++    graphInput.captured = true;
++    graphInput.startSector = startSector;
++    graphInput.savedCameraEye = input.savedEye;
++    graphInput.graphEye = input.currentEye;
++    graphInput.fullTransform = input.fullTransform;
++    graphInput.viewportNear = input.viewportNear;
++    graphInput.ssaDiscard = input.ssaDiscard;
++    graphInput.ssaLodA = input.ssaLodA;
++    graphInput.ssaLodB = input.ssaLodB;
++    graphInput.options = 0x6u; // source showHOM bit is deliberately off.
++    graphInput.drawPortals = input.drawPortals;
++    if (!ObserveR4PreparedPortalGraph(cache.graph, graphInput, output.graph) || !output.graph.valid)
++    { output.unavailableReason = output.graph.unavailableReason; output.graph.reached.clear(); return false; }
++    output.valid = true;
++    output.startSector = startSector;
++    return true;
++}
++} // namespace xray::metal
+diff --git a/src/Layers/xrRenderMetal/R4PortalGraphPreparedObserver.cpp b/src/Layers/xrRenderMetal/R4PortalGraphPreparedObserver.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/Layers/xrRenderMetal/R4PortalGraphPreparedObserver.cpp
+@@ -0,0 +1,190 @@
++#include "stdafx.h"
++#include "R4PortalGenerationContext.h"
++
++#include <algorithm>
++#include <cmath>
++#include <functional>
++#include <unordered_set>
++#include <utility>
++
++namespace xray::metal
++{
++namespace
++{
++constexpr u32 kVqHom = 1u;
++constexpr u32 kVqSsa = 2u;
++constexpr u32 kVqFade = 4u;
++constexpr u32 kMaxDepth = 128u;
++
++bool finiteVector(const Fvector& value)
++{
++	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
++}
++
++bool validPolygon(const R4LevelPortalTopology& portal, std::vector<Fvector>& points)
++{
++	if (portal.vertices.size() < 3u || portal.vertices.size() > 6u) return false;
++	points.clear();
++	for (const auto& source : portal.vertices)
++	{
++		if (!std::isfinite(source[0]) || !std::isfinite(source[1]) || !std::isfinite(source[2])) return false;
++		Fvector point; point.set(source[0], source[1], source[2]);
++		points.push_back(point);
++	}
++	Fvector normal; normal.mknormal_non_normalized(points[0], points[1], points[2]);
++	const float firstArea = normal.magnitude();
++	if (!std::isfinite(firstArea) || firstArea <= EPS_S) return false;
++	normal.div(firstArea);
++	Fvector unitFanSum; unitFanSum.set(0.f, 0.f, 0.f);
++	for (std::size_t i = 2u; i < points.size(); ++i)
++	{
++		Fvector fan; fan.mknormal_non_normalized(points[0], points[i - 1u], points[i]);
++		const float area = fan.magnitude();
++		if (!std::isfinite(area) || area <= EPS_S || normal.dotproduct(fan) <= EPS_S) return false;
++		fan.div(area); unitFanSum.add(fan);
++	}
++	if (!finiteVector(unitFanSum) || unitFanSum.magnitude() <= EPS_S) return false;
++	for (const Fvector& point : points)
++	{
++		Fvector delta; delta.sub(point, points[0]);
++		if (_abs(normal.dotproduct(delta)) > EPS_L) return false;
++	}
++	for (std::size_t i = 0u; i < points.size(); ++i)
++	{
++		Fvector turn;
++		turn.mknormal_non_normalized(points[i], points[(i + 1u) % points.size()], points[(i + 2u) % points.size()]);
++		if (!finiteVector(turn) || normal.dotproduct(turn) <= EPS_S) return false;
++	}
++	return true;
++}
++
++bool validFrustum(const CFrustum& frustum)
++{
++	if (frustum.p_count < 3 || frustum.p_count > FRUSTUM_MAXPLANES) return false;
++	for (int i = 0; i < frustum.p_count; ++i)
++	{
++		const auto& plane = frustum.planes[i];
++		if (!finiteVector(plane.n) || !std::isfinite(plane.d) || plane.n.magnitude() <= EPS_S) return false;
++	}
++	return true;
++}
++} // namespace
++
++bool ObserveR4PreparedPortalGraph(const R4PreparedPortalGraph& geometry, const R4PortalGraphInputs& in,
++	R4PortalGraphResult& out)
++{
++	out = {};
++	out.rawVisualVisible.assign(geometry.visualNodes.size(), 1u);
++	out.ownerFrustumTests.assign(geometry.visualNodes.size(), 0u);
++	const auto failOpen = [&](std::string reason) {
++		out.valid = false; out.unavailableReason = std::move(reason); out.reached.clear();
++		std::fill(out.rawVisualVisible.begin(), out.rawVisualVisible.end(), 1u);
++		return false;
++	};
++	const auto& topology = geometry.portalMetadata;
++	const auto& portals = geometry.portalPlaneSpheres;
++	if (!geometry.qualified || !topology.available || topology.sectors.empty() ||
++		topology.portals.size() != portals.size() || in.startSector >= topology.sectors.size())
++		return failOpen("cached portal generation or starting sector is invalid");
++	if (!in.captured || (in.options & kVqHom) || !finiteVector(in.savedCameraEye) || !finiteVector(in.graphEye) ||
++		!_valid(in.fullTransform) || !std::isfinite(in.viewportNear) || in.viewportNear <= 0.f ||
++		!std::isfinite(in.ssaDiscard) || in.ssaDiscard < 0.f || !std::isfinite(in.ssaLodA) ||
++		in.ssaLodA < 0.f || !std::isfinite(in.ssaLodB) || in.ssaLodB < 0.f || in.ssaLodB > in.ssaLodA)
++		return failOpen("invalid view, near plane, SSA thresholds, or HOM-enabled options");
++
++	out.reached.resize(topology.sectors.size());
++	std::vector<std::unordered_set<u16>> visited(topology.sectors.size());
++	Fmatrix rootTransform = in.fullTransform;
++	CFrustum base; base.CreateFromMatrix(rootTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
++	if (!validFrustum(base)) return failOpen("primary CFrustum::CreateFromMatrix returned invalid planes");
++	std::function<bool(u32, const CFrustum&, u32)> visit;
++	visit = [&](const u32 sid, const CFrustum& frustum, const u32 depth) {
++		if (depth > kMaxDepth) { out.unavailableReason = "portal graph recursion depth exceeded"; return false; }
++		out.reached[sid].sectorId = sid; out.reached[sid].values.push_back(frustum);
++		for (const u16 pid : topology.sectors[sid].portalIds)
++		{
++			++out.portalChecks;
++			if (visited[sid].find(pid) != visited[sid].end()) continue;
++			const auto& source = topology.portals[pid]; const auto& portal = portals[pid];
++			Fvector center = portal.sphere.P; float radius = portal.sphere.R;
++			if (!frustum.testSphere_dirty(center, radius)) continue;
++			u32 target = u32(-1);
++			Fvector nearDelta; nearDelta.sub(portal.sphere.P, in.savedCameraEye);
++			if (nearDelta.magnitude() < portal.sphere.R && _abs(portal.plane.classify(in.savedCameraEye)) <= in.viewportNear + EPS_L)
++				target = sid == source.frontSector ? source.backSector : source.frontSector;
++			else
++				target = portal.plane.classify(in.graphEye) > 0.f ? source.backSector : source.frontSector;
++			if (target == sid || target == in.startSector || target >= topology.sectors.size()) continue;
++
++			// Preserve the exact source expression: ((options & VQ_FADE) | VQ_SSA) && rsDrawPortals.
++			if (!(((in.options & kVqFade) | kVqSsa) && in.drawPortals) && (in.options & kVqSsa))
++			{
++				Fvector dir; dir.sub(portal.sphere.P, in.graphEye);
++				const float distSq = dir.square_magnitude();
++				if (!std::isfinite(distSq) || distSq <= 0.f) { out.unavailableReason = "invalid SSA distance"; return false; }
++				float ssa = portal.sphere.R * portal.sphere.R / distSq;
++				dir.div(_sqrt(distSq)); ssa *= _abs(portal.plane.n.dotproduct(dir));
++				if (!std::isfinite(ssa)) { out.unavailableReason = "nonfinite portal SSA"; return false; }
++				if (ssa < in.ssaDiscard) continue;
++				if ((in.options & kVqFade) && ssa < in.ssaLodB) continue;
++			}
++
++			sPoly sourcePoly, clippedPoly;
++			std::vector<Fvector> points;
++			for (const auto& v : source.vertices) { Fvector p; p.set(v[0], v[1], v[2]); points.push_back(p); }
++			sourcePoly.assign(points.data(), points.size());
++			sPoly* clipped = frustum.ClipPoly(sourcePoly, clippedPoly);
++			if (!clipped) continue;
++			CFrustum next;
++			if (clipped->size() > 6u) { next = frustum; ++out.uncertainWideClipPasses; }
++			else
++			{
++				R4LevelPortalTopology clippedRecord; std::vector<Fvector> clippedPoints;
++				for (const Fvector& p : *clipped) clippedRecord.vertices.push_back({p.x, p.y, p.z});
++				if (!validPolygon(clippedRecord, clippedPoints))
++					{ out.unavailableReason = "clipped portal polygon is degenerate or nonconvex"; return false; }
++				for (std::size_t i = 0u; i < clippedPoints.size(); ++i)
++				{
++					Fvector side; side.mknormal_non_normalized(in.graphEye, clippedPoints[i],
++						clippedPoints[(i + 1u) % clippedPoints.size()]);
++					if (!finiteVector(side) || side.magnitude() <= EPS_S)
++						{ out.unavailableReason = "portal-eye side plane is degenerate"; return false; }
++				}
++				Fvector unusedEye = in.graphEye, graphBase = in.graphEye;
++				Fmatrix full = in.fullTransform;
++				next.CreateFromPortal(clipped, unusedEye, graphBase, full);
++				if (!validFrustum(next)) { out.unavailableReason = "portal CFrustum::CreateFromPortal returned invalid planes"; return false; }
++			}
++			visited[sid].insert(pid); ++out.portalRecursions;
++			if (!visit(target, next, depth + 1u)) return false;
++		}
++		return true;
++	};
++	if (!visit(in.startSector, base, 0u)) return failOpen(out.unavailableReason.c_str());
++
++	std::fill(out.rawVisualVisible.begin(), out.rawVisualVisible.end(), 1u);
++	for (std::size_t vid = 0u; vid < geometry.visualNodes.size(); ++vid)
++	{
++		const auto& node = geometry.visualNodes[vid];
++		if (!node.boundsValid || vid >= topology.visualOwnerSectors.size()) continue;
++		const auto& owners = topology.visualOwnerSectors[vid];
++		if (owners.empty()) continue; // unknown ownership remains visible
++		out.rawVisualVisible[vid] = 0u;
++		Fvector center; center.set(node.sphere[0], node.sphere[1], node.sphere[2]);
++		for (const u32 sid : owners)
++		{
++			if (sid >= out.reached.size()) return failOpen("visual owner sector is out of range");
++			for (const CFrustum& frustum : out.reached[sid].values)
++			{
++				++out.ownerFrustumTests[vid];
++				u32 mask = frustum.getMask();
++				if (frustum.testSAABB(center, node.sphere[3], node.box.data(), mask) != fcvNone)
++					out.rawVisualVisible[vid] = 1u;
++			}
++		}
++	}
++	out.valid = true;
++	out.unavailableReason.clear();
++	return true;
++}
++} // namespace xray::metal

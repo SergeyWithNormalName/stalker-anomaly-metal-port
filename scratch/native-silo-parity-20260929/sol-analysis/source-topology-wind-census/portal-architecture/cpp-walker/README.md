@@ -1,0 +1,13 @@
+# Scratch C++ portal graph observer
+
+`R4PortalGraphObserver.h/.cpp` is a renderer-independent, scratch-only draft consuming the value-owned `R4LevelGeometry::portalMetadata` records. It takes the externally validated starting sector and same-frame saved eye, graph eye, full transform, `ViewportNear`, SSA cutoffs, graph options, and `rsDrawPortals` value. The caller must set `captured=true` only after taking a coherent frame snapshot; otherwise it fails open without reading the view fields. It does not raycast CFORM, infer a sector, load engine visuals, hold `CSector` pointers, touch CDB, cull draws, or enter a Metal frame.
+
+The observer uses the engine `CPortal::Setup` and `CFrustum` APIs directly: the root frustum uses `CreateFromMatrix`, portal tests use `testSphere_dirty`, polygons use `ClipPoly`, and descended frusta use `CreateFromPortal`. It mirrors the `CSector::traverse` near-dual-render test, target-sector selection, per-sector visited-portal set, exact SSA/source-expression ordering, with HOM absent. `CPortal::Setup` receives null sector pointers because only its plane and bounding sphere are consumed.
+
+Every portal must pass stricter finite, planar, strictly convex and nondegenerate checks before `CPortal::Setup`; uncertain polygons disable the whole result and return every visual visible. If a clipped polygon has more than six vertices, the target remains reachable with the incoming frustum, widening visibility instead of invoking source AABB simplification. Invalid matrices, thresholds, roots, adjacency, recursion depth, or generated frusta also fail open to all visuals.
+
+`rawVisualVisible` is deliberately only a per-ID OGF sphere/AABB test against all reached owner-sector frusta using `CFrustum::testSAABB`. It does not emulate static hierarchy ancestor masks, HOM, shadow exceptions, `MT_LOD`, temporal safety, wind-expanded mesh bounds, or actual rendering. A valid graph result is therefore an observer input for comparison, not an admission to suppress work.
+
+Source anchors: `src/Layers/xrRender/r__sector.cpp` (`CPortal::Setup`, `CreateFrustumFromPortal`, and `CSector::traverse`); `src/xrCDB/Frustum.cpp` (`CreateFromMatrix`, `testSphere_dirty`, `testSAABB`, `ClipPoly`, `CreateFromPortal`); and `src/Layers/xrRender/r__dsgraph_build.cpp` (`add_Static` / `add_Static_MultiFrustum` ancestor behavior).
+
+This draft has not been compiled or run. It depends on engine `stdafx.h`, render-sector, XRCore, and XRCDB targets, so a detached-parser compile would not validate the requested engine-source arithmetic. No production or build file was touched; root owns any temporary observer target.

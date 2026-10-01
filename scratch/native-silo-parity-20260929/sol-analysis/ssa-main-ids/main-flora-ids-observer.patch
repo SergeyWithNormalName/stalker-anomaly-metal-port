@@ -1,0 +1,277 @@
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.h
+@@ -6,6 +6,7 @@
+ #include "R4LevelGeometry.h"
+ 
+ #include <array>
++#include <cstdint>
+ #include <filesystem>
+ #include <memory>
+ #include <string>
+@@ -14,6 +15,21 @@
+ // This is deliberately a standalone admission adapter.  MetalR4EngineScene
+ // owns the G-buffer pass and may decide later whether to call it; the adapter
+ // never opens, closes, or submits a pass itself.
++struct R4FloraSsaObserverSettings
++{
++    std::uint32_t engineFrame = 0;
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    float fovDegrees = 0.0f;
++    float geometryLod = 0.0f;
++    float discardPixels = 0.0f;
++    float discardExponent = 0.0f;
++    float discardFadeK = 0.0f;
++    float screenFactor = 0.0f;
++    float effectiveDiscard = 0.0f;
++    bool valid = false;
++};
++
+ struct R4FloraViewState
+ {
+     std::array<float, 16> view{};
+@@ -21,6 +37,8 @@
+     std::array<float, 16> previousView{};
+     std::array<float, 16> previousProjection{};
+     std::array<float, 3> eye{};
++    std::uint32_t engineFrame = 0;
++    R4FloraSsaObserverSettings ssaObserver;
+     // Authoritative scene static_globals from combine/G-buffer setup. Tree
+     // shaders consume ambient/hemi/sun/fog here; synthesizing a zero-filled
+     // copy turns otherwise valid foliage into black silhouettes.
+diff --git a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+--- a/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
++++ b/src/Layers/xrRenderMetal/MetalR4FloraAdapter.cpp
+@@ -33,6 +33,101 @@
+ constexpr std::size_t kTransformsSize = 256u;
+ constexpr std::size_t kTreeShadowGlobalsSize = 320u;
+ constexpr std::size_t kTreeShadowStaticGlobalsSize = 528u;
++
++struct MainFloraIdCaptureConfig
++{
++    std::filesystem::path directory;
++    std::uint32_t frame = 0;
++    bool enabled = false;
++};
++
++const MainFloraIdCaptureConfig& mainFloraIdCaptureConfig()
++{
++    static const MainFloraIdCaptureConfig config = [] {
++        MainFloraIdCaptureConfig result;
++        const char* directory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        const char* frame = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_FRAME");
++        if (!directory || !*directory || !frame || !*frame)
++            return result;
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(frame, &end, 10);
++        if (*end != '\0' || parsed < 300ul ||
++            parsed > std::numeric_limits<std::uint32_t>::max())
++        {
++            std::fprintf(stderr, "METAL_MAIN_FLORA_IDS status=invalid_frame value=%s\n", frame);
++            return result;
++        }
++        result.directory = directory;
++        result.frame = static_cast<std::uint32_t>(parsed);
++        result.enabled = true;
++        return result;
++    }();
++    return config;
++}
++
++std::uint32_t floatBits(const float value)
++{
++    std::uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits;
++}
++
++template<std::size_t N>
++void writeFloatBits(std::ofstream& output, const char* key,
++    const std::array<float, N>& values)
++{
++    output << key;
++    for (const float value : values)
++    {
++        char bits[9];
++        std::snprintf(bits, sizeof(bits), "%08x", unsigned(floatBits(value)));
++        output << ',' << bits;
++    }
++    output << '\n';
++}
++
++struct CapturedMainFloraDraw
++{
++    std::uint32_t visualId = 0;
++    bool leaf = false;
++};
++
++bool writeMainFloraIds(const MainFloraIdCaptureConfig& config,
++    const R4FloraViewState& view, const std::vector<CapturedMainFloraDraw>& rows,
++    const std::size_t culled)
++{
++    const auto outputPath = config.directory /
++        ("main-flora-ids-frame-" + std::to_string(config.frame) + ".csv");
++    auto partialPath = outputPath;
++    partialPath += ".partial";
++    std::ofstream output(partialPath, std::ios::binary | std::ios::trunc);
++    if (!output)
++        return false;
++    const auto& settings = view.ssaObserver;
++    output << "schema,main-flora-id-observer/v1\n"
++           << "engine_frame," << view.engineFrame << '\n'
++           << "extent," << settings.width << ',' << settings.height << '\n'
++           << "admitted," << rows.size() + culled << '\n'
++           << "submitted," << rows.size() << '\n'
++           << "culled," << culled << '\n';
++    writeFloatBits(output, "view_bits", view.view);
++    writeFloatBits(output, "projection_bits", view.projection);
++    writeFloatBits(output, "eye_bits", view.eye);
++    writeFloatBits(output, "ssa_settings_bits", std::array<float, 7>{
++        settings.fovDegrees, settings.geometryLod, settings.discardPixels,
++        settings.discardExponent, settings.discardFadeK,
++        settings.screenFactor, settings.effectiveDiscard});
++    output << "visual_id,material\n";
++    for (const auto& row : rows)
++        output << row.visualId << ',' << (row.leaf ? "leaf" : "trunk") << '\n';
++    output << "encode_complete," << rows.size() << '\n';
++    output.close();
++    if (!output)
++        return false;
++    std::error_code renameError;
++    std::filesystem::rename(partialPath, outputPath, renameError);
++    return !renameError;
++}
+ 
+ struct Matrix4 { float elements[16]{}; };
+ 
+@@ -905,6 +1000,13 @@
+     m_telemetry.draws = 0;
+     m_telemetry.submittedVisuals = 0;
+     m_telemetry.culledVisuals = 0;
++    const auto& captureConfig = mainFloraIdCaptureConfig();
++    const bool selectedFrame = captureConfig.enabled && view.engineFrame == captureConfig.frame;
++    const bool captureIds = selectedFrame && view.ssaObserver.valid &&
++        view.ssaObserver.engineFrame == view.engineFrame;
++    std::vector<CapturedMainFloraDraw> captured;
++    if (captureIds)
++        captured.reserve(m_impl->draws.size());
+     for (Impl::Draw& draw : m_impl->draws)
+     {
+         const Matrix4 wvp = multiply(vp, draw.model);
+@@ -1045,7 +1147,16 @@
+             return false;
+         ++m_telemetry.draws;
+         ++m_telemetry.submittedVisuals;
+-    }
++        if (captureIds)
++            captured.push_back({draw.visualId, leaf});
++    }
++    if (selectedFrame)
++        std::fprintf(stderr, "METAL_MAIN_FLORA_IDS frame=%u status=%s submitted=%zu culled=%zu\n",
++            view.engineFrame,
++            !captureIds ? "invalid_settings" :
++                (writeMainFloraIds(captureConfig, view, captured, m_telemetry.culledVisuals) ?
++                    "encode_complete" : "write_failed"),
++            m_telemetry.submittedVisuals, m_telemetry.culledVisuals);
+     return true;
+ }
+ 
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.h b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.h
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.h
+@@ -137,6 +137,7 @@
+         std::array<float, 16> previousView{};
+         std::array<float, 16> previousProjection{};
+         std::array<float, 3> eye{};
++        R4FloraSsaObserverSettings floraSsaObserver;
+         std::uint32_t engineFrame = 0;
+         std::uint32_t previousFrame = 0;
+         bool cameraCut = false;
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -2540,7 +2540,9 @@
+     R4FloraViewState result;
+     result.view=view.view; result.projection=view.projection;
+     result.previousView=view.previousView; result.previousProjection=view.previousProjection;
+-    result.eye=view.eye; result.staticGlobals=staticGlobals;
++    result.eye=view.eye; result.engineFrame=view.engineFrame;
++    result.ssaObserver=view.floraSsaObserver;
++    result.staticGlobals=staticGlobals;
+     result.timeSeconds=environment.globalTime; result.treeScaleBiasCorrection=environment.treeScaleBiasCorrection;
+     result.previousBenders=motion.previousBenders; result.currentBenders=motion.currentBenders;
+     result.bendersSetup=motion.bendersSetup; result.windParams=motion.windParams;
+diff --git a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+--- a/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
++++ b/src/Layers/xrRenderMetal/MetalRenderDeviceRender.mm
+@@ -40,6 +40,8 @@
+ 
+ // Source LOD controls captured before the value-only OmniFace setup.
+ extern float r_ssaGLOD_start, r_ssaGLOD_end;
++extern float g_fSCREEN, r_ssaDISCARD;
++extern float ps_r__ssaDISCARD_exp, ps_r__ssaDISCARD_fade_k;
+ extern ENGINE_API BOOL g_appLoaded;
+ 
+ namespace
+@@ -1721,6 +1723,27 @@
+     else
+     {
+         scene.OnFrameSubmitted();
++        const char* captureDirectory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        if (captureDirectory && *captureDirectory && viewState.valid)
++        {
++            const char* captureFrame = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_FRAME");
++            char* end = nullptr;
++            const unsigned long parsed = captureFrame ? std::strtoul(captureFrame, &end, 10) : 0ul;
++            if (captureFrame && *captureFrame && *end == '\0' &&
++                parsed == viewState.engineFrame && parsed == Device.dwFrame)
++            {
++                const auto path = std::filesystem::path(captureDirectory) /
++                    ("main-flora-ids-frame-" + std::to_string(Device.dwFrame) + ".submitted");
++                std::FILE* marker = std::fopen(path.string().c_str(), "wb");
++                if (marker)
++                {
++                    std::fprintf(marker, "engine_frame,%u\nsubmitted_serial,%llu\n",
++                        Device.dwFrame,
++                        static_cast<unsigned long long>(backend->LastSubmittedSerial()));
++                    std::fclose(marker);
++                }
++            }
++        }
+         deviceState = dsOK;
+     }
+     frameActive = false;
+@@ -1745,6 +1768,32 @@
+     };
+     viewState.engineFrame = Device.dwFrame;
+     viewState.valid = true;
++    static const bool ssaObserverRequested = [] {
++        const char* directory = std::getenv("XRAY_METAL_MAIN_FLORA_IDS_DIR");
++        return directory && *directory;
++    }();
++    if (ssaObserverRequested)
++    {
++        auto& settings = viewState.floraSsaObserver;
++        settings.engineFrame = Device.dwFrame;
++        settings.width = Device.dwWidth;
++        settings.height = Device.dwHeight;
++        settings.fovDegrees = Device.fFOV;
++        settings.geometryLod = ps_r__LOD;
++        settings.discardPixels = ps_r__ssaDISCARD;
++        settings.discardExponent = ps_r__ssaDISCARD_exp;
++        settings.discardFadeK = ps_r__ssaDISCARD_fade_k;
++        settings.screenFactor = g_fSCREEN;
++        settings.effectiveDiscard = r_ssaDISCARD;
++        settings.valid = settings.width > 0u && settings.height > 0u &&
++            std::isfinite(settings.fovDegrees) && settings.fovDegrees > 0.0f &&
++            std::isfinite(settings.geometryLod) && settings.geometryLod > 0.0f &&
++            std::isfinite(settings.discardPixels) && settings.discardPixels > 0.0f &&
++            std::isfinite(settings.discardExponent) &&
++            std::isfinite(settings.discardFadeK) && settings.discardFadeK > 1.0f &&
++            std::isfinite(settings.screenFactor) && settings.screenFactor > 0.0f &&
++            std::isfinite(settings.effectiveDiscard) && settings.effectiveDiscard > 0.0f;
++    }
+ }
+ void MetalRenderDeviceRender::SetCacheXform_prev(Fmatrix& view, Fmatrix& projection)
+ {

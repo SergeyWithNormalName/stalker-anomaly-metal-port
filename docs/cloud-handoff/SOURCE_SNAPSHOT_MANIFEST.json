@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "created_utc": "2026-10-01T06:51:41.944290+00:00",
+  "repository": "SergeyWithNormalName/stalker-anomaly-metal-port",
+  "branch": "codex/direct-metal-cloud-handoff-20261001",
+  "public_parent_commit": "377562f5242c00a84b899d49353a78065bd00ce9",
+  "frozen_local_base_commit": "c8add841849cf7c4f1269d94e0addaac3b5d3427",
+  "frozen_local_branch": "feature/native-metal-r4",
+  "frozen_export_created_utc": "2026-10-01T05:10:27.617857+00:00",
+  "private_export_archive_sha256": "d77d960c071ca61a3410258ea8cca23de232ef79f5afff4314b987141125fd38",
+  "tracked_modified_at_export": 574,
+  "frozen_hashes_verified": 11278,
+  "live_comparison": {
+    "current_source_head": "c8add841849cf7c4f1269d94e0addaac3b5d3427",
+    "frozen_paths_different_now": []
+  },
+  "source_policy": "frozen export only; no later source changes merged; public-main ancestry only",
+  "copied_file_count": 10366,
+  "copied_bytes": 95842899,
+  "transformed_file_count": 34,
+  "source_transforms": "docs/cloud-handoff/PUBLICATION_TRANSFORMS.json",
+  "publication_hash_inventory": "docs/cloud-handoff/PUBLISHED_SHA256SUMS",
+  "omissions": [
+    "private Git history/bundle/archive/patches of complete dirty checkout",
+    "game data, assets, saves, installed runtime/apps, Wine prefixes",
+    "SDK libraries/binaries, shader binaries, build products, core dumps",
+    "raw traces, frame CSVs, large geometry census grids, local runtime configs",
+    "chat/thread exports, private identities/paths, credentials/cookies/keys",
+    "duplicate prestate source trees and private-path historical helpers"
+  ],
+  "excluded_candidate_counts": {
+    "binary/resource": 12,
+    "historical helper requires private local paths": 87,
+    "non-text content": 2
+  },
+  "public_base_files_removed_from_snapshot_count": 122,
+  "acceptance": "not verified on Mac; no builds, tests, games or benchmarks run for this publication",
+  "public_base_cleanup": "Selected source roots contain only files copied from the frozen export; obsolete/excluded base files are absent from this branch. Existing public history is unchanged."
+}

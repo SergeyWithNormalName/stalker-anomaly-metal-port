@@ -1,0 +1,13 @@
+# Fixed-ID portal ROI draft
+
+This folder contains a scratch-only, opt-in fixed-camera screen of the 4,086 Flora IDs from the frame-700 conservative portal/wind geometry candidate set. It is a potential upper-bound experiment, not source-equivalent culling, a shipping policy, or a claim that frame-700 wind bounds remain valid as benders move.
+
+`MetalR4FloraAdapter.base.cpp` is an exact copy of the current production adapter at draft start, SHA-256 `3cd57e6f84069698619358337d660bd6e159357ed455c3769ee5b584c47d58dc`. The production path is not edited. `MetalR4FloraAdapter.cpp` is the isolated candidate and `fixed-id-portal-roi.patch` is its unified diff from that base.
+
+The fixture is `portal-upper-bound-fixed-camera-4086.csv`, SHA-256 `35bce89dfa74883f8615d5cdf129327fbff515ede1af464bb6159b4630693c1d`; its receipt is `fixture-receipt.json`. It contains 4,086 unique IDs (1,765 leaf, 2,321 trunk) and exact frame-700 view/projection/eye float bits. I independently compared it with the 5,316-ID frame-700 main-Flora capture: every fixture ID is present with the same leaf/trunk material, and all three camera rows match bit-for-bit. At runtime, `Prepare` additionally validates that every fixture ID appears exactly once in the admitted Flora inventory with the same material.
+
+The candidate is inactive unless `XRAY_METAL_FLORA_PORTAL_ROI=1` and an absolute `XRAY_METAL_FLORA_PORTAL_ID_FILE` names a valid fixture. Invalid or absent fixture data leaves every visual on the current path. During a draw, the optional filter activates only when view, projection and eye float bits match exactly and `view.windValid` is true. Otherwise it fails open for the frame. It only checks fixed IDs after the existing Metal clip-volume rejection and before per-visual uploads. It does not change draw order for retained visuals, shadow draws, shader selection, resource bindings or graph state.
+
+The one-time activation line reports the number of fixed IDs skipped, remaining main-G-buffer visuals kept after clip rejection, fixed IDs already rejected by the existing clip test, and fixture size. The log labels this `fixed-frame-main-gbuffer-potential-upper-bound` and sets `wind_temporal_qualification=0`. The screen can run on any frame whose camera matches, so do not infer that the frame-700 envelope is safe for later bender states.
+
+This is source review only. It was not built, launched or integrated into `src/` or `build/`; the root task owns any scratch-runtime validation. Before an FPS interpretation, keep the fixture and runtime assets pinned, confirm the candidate frame actually matches, and report the result only as an upper-bound draw-reduction hypothesis. A positive count cannot qualify source hierarchy/HOM gates or visual correctness.

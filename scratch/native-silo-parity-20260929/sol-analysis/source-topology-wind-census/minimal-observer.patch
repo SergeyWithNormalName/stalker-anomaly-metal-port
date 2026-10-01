@@ -1,0 +1,318 @@
+--- src/Layers/xrRender/R_calculate.cpp
++++ src/Layers/xrRender/R_calculate.cpp
+@@ -1,6 +1,13 @@
+ #include "stdafx.h"
+ #include "../../xrEngine/customhud.h"
+ #include "../../Include/xrRender/R4BackendSelection.h"
++
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <locale>
+ 
+ float g_fSCREEN;
+ 
+@@ -68,6 +75,55 @@
+ 			}
+ 			ViewBase.CreateFromMatrix(Device.mFullTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+ 			GMBase.traverse(pLastSector, ViewBase, Device.vCameraPosition, Device.mFullTransform);
++			// One-frame observe-only readout. The Metal loader currently leaves
++			// the legacy sector/visual containers empty; this does not fill them.
++			static bool topologyCensusAttempted = false;
++			const char* topologyCensus = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++			if (!topologyCensusAttempted && Device.dwFrame == 700u && topologyCensus &&
++				std::strcmp(topologyCensus, "1") == 0)
++			{
++				topologyCensusAttempted = true;
++				const char* outputPath = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_FILE");
++				if (outputPath && outputPath[0] == '/')
++				{
++					std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
++					out.imbue(std::locale::classic());
++					out << std::setprecision(9) << std::boolalpha;
++					const auto scalar = [&out](float value) {
++						if (std::isfinite(value)) out << value; else out << "null";
++					};
++					const auto bits = [&out](const float* values, unsigned count) {
++						out << '[';
++						for (unsigned i = 0; i < count; ++i) {
++							u32 value; std::memcpy(&value, values + i, sizeof(value));
++							if (i) out << ','; out << value;
++						}
++						out << ']';
++					};
++					const bool populated = !Sectors.empty() && !Visuals.empty();
++					out << "{\n\"schema\":\"r4-source-topology-count-v1\",\n"
++						<< "\"engine_frame\":" << Device.dwFrame
++						<< ",\"source_sector_count\":" << Sectors.size()
++						<< ",\"source_visual_count\":" << Visuals.size()
++						<< ",\"legacy_graph_populated\":" << populated
++						<< ",\"has_start_sector\":" << (pLastSector != nullptr)
++						<< ",\"traversal_options\":" << GMBase.i_options
++						<< ",\"width\":" << Device.dwWidth << ",\"height\":" << Device.dwHeight
++						<< ",\"fov\":"; scalar(Device.fFOV);
++					out << ",\"g_fSCREEN\":"; scalar(g_fSCREEN);
++					out << ",\"r_ssaDISCARD\":"; scalar(r_ssaDISCARD);
++					out << ",\"r_dtex_range\":"; scalar(r_dtex_range);
++					out << ",\"ps_r2_df_parallax_range\":"; scalar(ps_r2_df_parallax_range);
++					out << ",\"eye_bits\":"; bits(&Device.vCameraPosition.x, 3u);
++					out << ",\"view_bits\":"; bits(&Device.mView.m[0][0], 16u);
++					out << ",\"projection_bits\":"; bits(&Device.mProject.m[0][0], 16u);
++					out << ",\"full_transform_bits\":"; bits(&Device.mFullTransform.m[0][0], 16u);
++					out << ",\"geometry_verified\":false,\"suppression\":0}\n";
++					out.close();
++					Msg("METAL_SOURCE_TOPOLOGY_CENSUS frame=%u sectors=%zu visuals=%zu graph_populated=%d output_written=%d suppressed=0",
++						Device.dwFrame, Sectors.size(), Visuals.size(), int(populated), int(bool(out)));
++				}
++			}
+ 		}
+ 		RImplementation.phase = PHASE_NORMAL;
+ 		GMBase.r_dsgraph_capture_metal_world();
+--- src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -4,6 +4,7 @@
+ #include "R4WholeLightVisibilitySelection.h"
+ #include "R4StaticConstantGroups.h"
+ #include "MetalR4EngineFs.h"
++#include "MetalFloraWindCensus.h"
+ #include "MetalR4LightHomDiagnostic.h"
+ #include "MetalR4FogScatteringAdapter.h"
+ #include "MetalR4LensFlareAdapter.h"
+@@ -7232,6 +7233,8 @@
+             {
+                 R4FloraViewState floraView=makeFloraView(callbackView,impl->floraEnvironment,
+                     impl->floraMotion,impl->scene.baseLightingStaticGlobals);
++                xray::metal::flora_wind_census::captureOnceIfRequested(callbackView, floraView,
++                    impl->floraEnvironment.engineFrame, impl->floraMotion.engineFrame);
+                 if (!impl->flora->DrawIntoActiveGBuffer(callbackBackend, floraView, callbackError))
+                     return false;
+                 const MetalR4FloraAdapter::Telemetry& flora = impl->flora->LastTelemetry();
+--- /dev/null
++++ src/Layers/xrRenderMetal/MetalFloraWindCensus.h
+@@ -0,0 +1,224 @@
++#pragma once
++
++#include "MetalR4FloraAdapter.h"
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <limits>
++#include <locale>
++#include <ostream>
++#include <string>
++#include <type_traits>
++
++namespace xray::metal::flora_wind_census
++{
++template <typename T, std::size_t N>
++bool allFinite(const std::array<T, N>& values)
++{
++    if constexpr (std::is_arithmetic_v<T>)
++    {
++        for (const T value : values)
++            if (!std::isfinite(static_cast<double>(value)))
++                return false;
++    }
++    else
++    {
++        for (const T& value : values)
++            if (!allFinite(value))
++                return false;
++    }
++    return true;
++}
++
++template <typename T, std::size_t N>
++void writeArray(std::ostream& output, const std::array<T, N>& values)
++{
++    output << '[';
++    for (std::size_t index = 0; index < N; ++index)
++    {
++        if (index != 0u)
++            output << ',';
++        if constexpr (std::is_arithmetic_v<T>)
++            output << values[index];
++        else
++            writeArray(output, values[index]);
++    }
++    output << ']';
++}
++
++inline std::string escapeJson(const std::string& value)
++{
++    std::string escaped;
++    escaped.reserve(value.size() + 8u);
++    for (const unsigned char character : value)
++    {
++        switch (character)
++        {
++        case '"': escaped += "\\\""; break;
++        case '\\': escaped += "\\\\"; break;
++        case '\n': escaped += "\\n"; break;
++        case '\r': escaped += "\\r"; break;
++        case '\t': escaped += "\\t"; break;
++        default:
++            if (character < 0x20u)
++                escaped += '?';
++            else
++                escaped += static_cast<char>(character);
++            break;
++        }
++    }
++    return escaped;
++}
++
++template <typename CallbackView>
++void captureOnceIfRequested(const CallbackView& callbackView, const R4FloraViewState& floraView,
++    const std::uint32_t environmentFrame, const std::uint32_t motionFrame)
++{
++    static bool attempted = false;
++    const char* enabled = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_CENSUS");
++    if (attempted || !enabled || std::string(enabled) != "1" || callbackView.engineFrame != 700u)
++        return;
++    attempted = true;
++
++    const char* configuredPath = std::getenv("XRAY_METAL_FLORA_WIND_FILE");
++    if (!configuredPath || !*configuredPath)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_WIND_CENSUS status=unavailable reason=missing_output_path frame=%u\n",
++            callbackView.engineFrame);
++        return;
++    }
++    const std::filesystem::path outputPath(configuredPath);
++    if (!outputPath.is_absolute())
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_WIND_CENSUS status=unavailable reason=output_path_not_absolute frame=%u\n",
++            callbackView.engineFrame);
++        return;
++    }
++
++    std::string unavailableReason;
++    if (callbackView.engineFrame != 700u || environmentFrame != 700u || motionFrame != 700u)
++        unavailableReason = "source_frame_provenance_mismatch";
++    else if (floraView.valid != callbackView.valid || floraView.previousValid != callbackView.previousValid)
++        unavailableReason = "flora_callback_view_provenance_mismatch";
++    else if (!callbackView.valid || !floraView.valid)
++        unavailableReason = "view_invalid";
++    else if (!floraView.windValid)
++        unavailableReason = "wind_snapshot_invalid";
++    const bool finiteInputs = allFinite(callbackView.view) && allFinite(callbackView.projection) &&
++        allFinite(callbackView.previousView) && allFinite(callbackView.previousProjection) &&
++        allFinite(callbackView.eye) && allFinite(floraView.view) && allFinite(floraView.projection) &&
++        allFinite(floraView.previousView) && allFinite(floraView.previousProjection) &&
++        allFinite(floraView.eye) && allFinite(floraView.currentBenders) &&
++        allFinite(floraView.previousBenders) && allFinite(floraView.bendersSetup) &&
++        allFinite(floraView.windParams) && allFinite(floraView.windSetupGrass) &&
++        allFinite(floraView.windSetupTrees) && allFinite(floraView.windAnimation) &&
++        allFinite(floraView.windAnimationPrevious) && std::isfinite(floraView.timeSeconds) &&
++        std::isfinite(floraView.treeScaleBiasCorrection);
++    if (unavailableReason.empty() && !finiteInputs)
++        unavailableReason = "non_finite_view_or_wind_input";
++
++    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
++    if (!output)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_WIND_CENSUS status=unavailable reason=output_open_failed frame=%u\n",
++            callbackView.engineFrame);
++        return;
++    }
++    output.imbue(std::locale::classic());
++    output << std::setprecision(std::numeric_limits<float>::max_digits10) << std::boolalpha;
++    if (!unavailableReason.empty())
++    {
++        output << "{\n  \"schema\":\"r4-flora-wind-census-v1\",\n"
++               << "  \"available\":false,\n  \"unavailable_reason\":\""
++               << escapeJson(unavailableReason) << "\",\n"
++               << "  \"output_path\":\"" << escapeJson(outputPath.string()) << "\",\n"
++               << "  \"callback_engine_frame\":" << callbackView.engineFrame << ",\n"
++               << "  \"environment_engine_frame\":" << environmentFrame << ",\n"
++               << "  \"motion_snapshot_engine_frame\":" << motionFrame << ",\n"
++               << "  \"finite_inputs\":" << finiteInputs << ",\n"
++               << "  \"wind_verified\":false,\n  \"suppression\":0,\n"
++               << "  \"texture_receipt\":{\"verified\":false,\"sha256\":null},\n"
++               << "  \"render_size\":{\"available\":false,\"width\":null,\"height\":null}\n}\n";
++        output.close();
++        std::fprintf(stderr, "METAL_FLORA_WIND_CENSUS status=unavailable reason=%s frame=%u path=%s\n",
++            unavailableReason.c_str(), callbackView.engineFrame, outputPath.string().c_str());
++        return;
++    }
++
++    output << "{\n  \"schema\":\"r4-flora-wind-census-v1\",\n"
++           << "  \"available\":true,\n  \"unavailable_reason\":null,\n"
++           << "  \"output_path\":\"" << escapeJson(outputPath.string()) << "\",\n"
++           << "  \"wind_verified\":false,\n  \"suppression\":0,\n"
++           << "  \"texture_receipt\":{\"verified\":false,\"sha256\":null},\n"
++           << "  \"render_size\":{\"available\":false,\"width\":null,\"height\":null},\n"
++           << "  \"callback_view\":{\n"
++           << "    \"engine_frame\":" << callbackView.engineFrame << ",\n"
++           << "    \"previous_frame\":" << callbackView.previousFrame << ",\n"
++           << "    \"camera_cut\":" << callbackView.cameraCut << ",\n"
++           << "    \"valid\":" << callbackView.valid << ",\n"
++           << "    \"previous_valid\":" << callbackView.previousValid << ",\n"
++           << "    \"eye\":";
++    writeArray(output, callbackView.eye);
++    output << ",\n    \"view\":";
++    writeArray(output, callbackView.view);
++    output << ",\n    \"projection\":";
++    writeArray(output, callbackView.projection);
++    output << ",\n    \"previous_view\":";
++    writeArray(output, callbackView.previousView);
++    output << ",\n    \"previous_projection\":";
++    writeArray(output, callbackView.previousProjection);
++    output << "\n  },\n  \"flora_view_state\":{\n"
++           << "    \"environment_engine_frame\":" << environmentFrame << ",\n"
++           << "    \"motion_snapshot_engine_frame\":" << motionFrame << ",\n"
++           << "    \"valid\":" << floraView.valid << ",\n"
++           << "    \"previous_valid\":" << floraView.previousValid << ",\n"
++           << "    \"wind_valid\":" << floraView.windValid << ",\n"
++           << "    \"eye\":";
++    writeArray(output, floraView.eye);
++    output << ",\n    \"view\":";
++    writeArray(output, floraView.view);
++    output << ",\n    \"projection\":";
++    writeArray(output, floraView.projection);
++    output << ",\n    \"previous_view\":";
++    writeArray(output, floraView.previousView);
++    output << ",\n    \"previous_projection\":";
++    writeArray(output, floraView.previousProjection);
++    output << ",\n    \"current_benders\":";
++    writeArray(output, floraView.currentBenders);
++    output << ",\n    \"previous_benders\":";
++    writeArray(output, floraView.previousBenders);
++    output << ",\n    \"benders_setup\":";
++    writeArray(output, floraView.bendersSetup);
++    output << ",\n    \"wind_params\":";
++    writeArray(output, floraView.windParams);
++    output << ",\n    \"wind_setup_grass\":";
++    writeArray(output, floraView.windSetupGrass);
++    output << ",\n    \"wind_setup_trees\":";
++    writeArray(output, floraView.windSetupTrees);
++    output << ",\n    \"wind_animation_current\":";
++    writeArray(output, floraView.windAnimation);
++    output << ",\n    \"wind_animation_previous\":";
++    writeArray(output, floraView.windAnimationPrevious);
++    output << ",\n    \"time_seconds\":" << floraView.timeSeconds << ",\n"
++           << "    \"tree_scale_bias_correction\":" << floraView.treeScaleBiasCorrection << "\n  }\n}\n";
++    output.close();
++    if (!output)
++    {
++        std::fprintf(stderr,
++            "METAL_FLORA_WIND_CENSUS status=unavailable reason=output_write_failed frame=%u path=%s\n",
++            callbackView.engineFrame, outputPath.string().c_str());
++        return;
++    }
++    std::fprintf(stderr, "METAL_FLORA_WIND_CENSUS status=written frame=%u path=%s\n",
++        callbackView.engineFrame, outputPath.string().c_str());
++}
++} // namespace xray::metal::flora_wind_census

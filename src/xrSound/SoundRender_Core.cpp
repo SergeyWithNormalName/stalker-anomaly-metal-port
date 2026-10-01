@@ -6,6 +6,7 @@
 #include "SoundRender_Core.h"
 #include "SoundRender_Source.h"
 #include "SoundRender_Emitter.h"
+#include "SoundRender_Target.h"
 
 #include "NotificationClient.h"
 
@@ -13,6 +14,7 @@
 
 float psSpeedOfSound = 1.f;
 int psSoundTargets = 1024;
+int psSoundAppleSpatialMode = 2; // 0: Off, 1: Fixed, 2: Head Tracked
 Flags32 psSoundFlags = {ss_Hardware | ss_EFX};
 float psSoundOcclusionScale = 0.5f;
 float psSoundCull = 0.01f;
@@ -553,3 +555,9 @@ void CSoundRender_Core::set_environment	(u32 id, CSound_environment** dst_env)
 	
 }
 #endif
+
+void CSoundRender_Core::start_deferred_target(CSoundRender_Target* target)
+{
+	target->render();
+}
+

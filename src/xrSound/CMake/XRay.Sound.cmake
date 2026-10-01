@@ -90,6 +90,58 @@ if(WIN32)
   )
 endif()
 
+if(APPLE)
+  enable_language(OBJCXX)
+
+  set_source_files_properties(
+    AppleSpatialBridge.mm
+    PROPERTIES
+    SKIP_UNITY_BUILD_INCLUSION true
+  )
+
+  target_sources(XRay.Sound PRIVATE
+    AppleSpatialBridge.h
+    AppleSpatialBridge.mm
+    SoundRender_CoreApple.h
+    SoundRender_CoreApple.cpp
+    SoundRender_TargetApple.h
+    SoundRender_TargetApple.cpp
+    AppleSpatialAudioTypes.h
+  )
+
+  target_compile_options(XRay.Sound PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-Wno-deprecated-declarations>
+  )
+  target_link_libraries(XRay.Sound
+    PRIVATE
+    "-framework Foundation"
+    "-framework AVFAudio"
+    "-framework AudioToolbox"
+    "-framework CoreAudio"
+  )
+
+  add_executable(XRay.Sound.AppleSpatialProbe
+    tests/AppleSpatialAudioProbe.cpp
+    AppleSpatialBridge.mm
+    AppleSpatialBridge.h
+  )
+  target_compile_features(XRay.Sound.AppleSpatialProbe PRIVATE cxx_std_17)
+  target_include_directories(XRay.Sound.AppleSpatialProbe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_options(XRay.Sound.AppleSpatialProbe PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-Wno-deprecated-declarations>
+  )
+  target_link_libraries(XRay.Sound.AppleSpatialProbe PRIVATE
+    "-framework Foundation"
+    "-framework AVFAudio"
+    "-framework AudioToolbox"
+    "-framework CoreAudio"
+  )
+endif()
+
 include(XRay.Sound.Cache)
 include(XRay.Sound.Core)
 include(XRay.Sound.Emitter)

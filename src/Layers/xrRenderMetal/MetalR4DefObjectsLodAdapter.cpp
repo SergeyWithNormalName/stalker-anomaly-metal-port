@@ -66,13 +66,6 @@ bool sourceDds(const std::string& identity, std::filesystem::path& path, std::st
     return true;
 }
 
-bool uniform(IR4Resources& resources, std::size_t bytes, const char* label,
-    std::shared_ptr<IR4Buffer>& result, std::string& error)
-{
-    R4BufferDesc d; d.size = bytes; d.storage = R4ResourceStorage::Shared; d.usage = R4BufferUsage::Uniform; d.label = label;
-    result = resources.CreateBuffer(d, nullptr, 0u, error);
-    return static_cast<bool>(result);
-}
 } // namespace
 
 struct MetalR4DefObjectsLodAdapter::Impl
@@ -85,7 +78,7 @@ struct MetalR4DefObjectsLodAdapter::Impl
         std::uint32_t vertexBase = 0, indexBase = 0, indexCount = 0;
         Matrix4 model{};
         xray::metal::R4PositionBounds bounds;
-        std::shared_ptr<IR4Buffer> vb, ib, vsGlobals, transforms, psGlobals;
+        std::shared_ptr<IR4Buffer> vb, ib;
         std::shared_ptr<IR4Texture> base, bump, bumpX;
     };
     std::shared_ptr<IR4GraphicsPipeline> flatPipeline, bumpPipeline, steepPipeline;
@@ -93,6 +86,8 @@ struct MetalR4DefObjectsLodAdapter::Impl
     std::vector<Texture> textures;
     std::vector<Draw> draws;
     bool uploaded = false;
+    bool pendingUpload = false;
+    std::uint64_t pendingUploadBytes = 0u;
 };
 
 MetalR4DefObjectsLodAdapter::MetalR4DefObjectsLodAdapter() = default;
@@ -152,7 +147,7 @@ bool MetalR4DefObjectsLodAdapter::Prepare(IR4Backend& backend,
         std::filesystem::path baseIdentity, basePath, bumpPath, bumpXPath; if(!sourceDds(geometry.shaders[visual.shaderId].baseTexture,baseIdentity,error) || !ResolveMetalR4EngineTextureDdsPath(baseIdentity,basePath,error)) {++m_telemetry.rejectedVisuals;break;}
         R4EngineTextureBumpKind kind; if(!ClassifyMetalR4EngineTextureBump(baseIdentity,kind,bumpPath,bumpXPath,error)) {++m_telemetry.rejectedVisuals;break;}
         Impl::Draw d; d.variant=kind==R4EngineTextureBumpKind::Steep?Impl::Variant::Steep:(kind==R4EngineTextureBumpKind::Bump?Impl::Variant::Bump:Impl::Variant::Flat); d.vertexBase=visual.vertexBase; d.indexBase=visual.indexBase; d.indexCount=visual.indexCount; d.bounds=visual.referencedPositionBounds; std::memcpy(d.model.values,visual.modelTransform.data(),sizeof(d.model.values)); d.vb=vbs[visual.vertexBufferId]; d.ib=ibs[visual.indexBufferId];
-        if(!load(basePath,d.base) || (d.variant!=Impl::Variant::Flat && !load(bumpPath,d.bump)) || (d.variant==Impl::Variant::Steep && !load(bumpXPath,d.bumpX)) || !uniform(backend.Resources(),kVsGlobals,"R4 B_VERT VS globals",d.vsGlobals,error) || !uniform(backend.Resources(),kTransforms,"R4 B_VERT transforms",d.transforms,error) || !uniform(backend.Resources(),kPsGlobals,"R4 B_VERT PS globals",d.psGlobals,error)){++m_telemetry.rejectedVisuals;break;}
+        if(!load(basePath,d.base) || (d.variant!=Impl::Variant::Flat && !load(bumpPath,d.bump)) || (d.variant==Impl::Variant::Steep && !load(bumpXPath,d.bumpX))){++m_telemetry.rejectedVisuals;break;}
         d.variant==Impl::Variant::Steep ? ++m_telemetry.steepVisuals : (d.variant==Impl::Variant::Bump ? ++m_telemetry.bumpVisuals : ++m_telemetry.flatVisuals); m_impl->draws.emplace_back(std::move(d));
     }
     m_telemetry.textureAssets=m_impl->textures.size();
@@ -162,7 +157,8 @@ bool MetalR4DefObjectsLodAdapter::Prepare(IR4Backend& backend,
 
 bool MetalR4DefObjectsLodAdapter::Upload(IR4Backend& backend,std::string& error)
 {
-    if(!m_ready||!m_impl||m_impl->uploaded)return true;
+    if(!m_ready||!m_impl||m_impl->uploaded||m_impl->pendingUpload)return true;
+    std::uint64_t uploadedBytes = 0u;
     for (auto& asset : m_impl->textures)
     {
         for (const auto& mip : asset.dds.mipLevels)
@@ -173,25 +169,113 @@ bool MetalR4DefObjectsLodAdapter::Upload(IR4Backend& backend,std::string& error)
                     asset.dds.bytes.data() + mip.dataOffset, mip.bytesPerImage,
                     mip.bytesPerRow, mip.bytesPerImage, error))
                 return false;
-            m_telemetry.uploadedBytes += mip.bytesPerImage;
+            uploadedBytes += mip.bytesPerImage;
         }
     }
-    for(auto& asset:m_impl->textures){asset.dds.bytes.clear();asset.dds.bytes.shrink_to_fit();}
-    m_impl->uploaded=true;std::fprintf(stderr,"METAL_B_VERT_UPLOAD visuals=%zu flat=%zu bump=%zu steep=%zu textures=%zu bytes=%llu\n",m_telemetry.requestedVisuals,m_telemetry.flatVisuals,m_telemetry.bumpVisuals,m_telemetry.steepVisuals,m_telemetry.textureAssets,static_cast<unsigned long long>(m_telemetry.uploadedBytes));return true;
+    m_impl->pendingUpload = true;
+    m_impl->pendingUploadBytes = uploadedBytes;
+    return true;
+}
+
+void MetalR4DefObjectsLodAdapter::CommitSubmittedFrame()
+{
+    if (!m_impl || !m_impl->pendingUpload)
+        return;
+    for (auto& asset : m_impl->textures)
+    {
+        asset.dds.bytes.clear();
+        asset.dds.bytes.shrink_to_fit();
+    }
+    m_impl->uploaded = true;
+    m_impl->pendingUpload = false;
+    m_telemetry.uploadedBytes += m_impl->pendingUploadBytes;
+    m_impl->pendingUploadBytes = 0u;
+    std::fprintf(stderr,"METAL_B_VERT_UPLOAD visuals=%zu flat=%zu bump=%zu steep=%zu textures=%zu bytes=%llu\n",
+        m_telemetry.requestedVisuals,m_telemetry.flatVisuals,m_telemetry.bumpVisuals,
+        m_telemetry.steepVisuals,m_telemetry.textureAssets,
+        static_cast<unsigned long long>(m_telemetry.uploadedBytes));
+}
+
+void MetalR4DefObjectsLodAdapter::DiscardUnsubmittedFrame()
+{
+    if (!m_impl || !m_impl->pendingUpload)
+        return;
+    m_impl->pendingUpload = false;
+    m_impl->pendingUploadBytes = 0u;
 }
 
 bool MetalR4DefObjectsLodAdapter::DrawIntoActiveGBuffer(IR4Backend& backend,const R4DefObjectsLodViewState& view,std::string& error)
 {
-    if(!m_ready||!m_impl||!m_impl->uploaded)return true;
+    if(!m_ready||!m_impl||(!m_impl->uploaded&&!m_impl->pendingUpload))return true;
     if (m_telemetry.steepVisuals && !view.staticGlobals) { error="B_VERT steep parallax requires live static_globals b2"; return false; }
-    Matrix4 v,p;std::memcpy(v.values,view.view.data(),sizeof(v.values));std::memcpy(p.values,view.projection.data(),sizeof(p.values));const Matrix4 vp=mul(p,v);m_telemetry.submittedVisuals=m_telemetry.culledVisuals=0;std::shared_ptr<IR4Buffer> last; Impl::Variant lastVariant=Impl::Variant::Flat; bool hasVariant=false;
-    for(auto& d:m_impl->draws){const Matrix4 wvp=mul(vp,d.model);if(view.valid&&outside(d.bounds,wvp)){++m_telemetry.culledVisuals;continue;}const Matrix4 wv=mul(v,d.model);std::array<std::uint8_t,kVsGlobals> vg{};std::array<std::uint8_t,kTransforms> tr{};std::array<std::uint8_t,kPsGlobals> pg{};std::memcpy(vg.data(),&wvp,sizeof(wvp));std::memcpy(vg.data()+64u,&vp,sizeof(vp));std::memcpy(tr.data(),&wvp,sizeof(wvp));std::memcpy(tr.data()+64u,&wv,sizeof(wv));std::memcpy(tr.data()+128u,&d.model,sizeof(d.model));const float material[4]={0,0,0,.25f};std::memcpy(tr.data()+192u,material,sizeof(material));std::memcpy(pg.data(),&wvp,sizeof(wvp));std::memcpy(pg.data()+64u,&vp,sizeof(vp));if(!backend.Resources().UpdateBuffer(d.vsGlobals,0,vg.data(),vg.size(),error)||!backend.Resources().UpdateBuffer(d.transforms,0,tr.data(),tr.size(),error)||!backend.Resources().UpdateBuffer(d.psGlobals,0,pg.data(),pg.size(),error))return false;
+    Matrix4 v,p;std::memcpy(v.values,view.view.data(),sizeof(v.values));std::memcpy(p.values,view.projection.data(),sizeof(p.values));const Matrix4 vp=mul(p,v);Matrix4 previousView=v,previousProjection=p;if(view.previousValid&&!view.cameraCut){std::memcpy(previousView.values,view.previousView.data(),sizeof(previousView.values));std::memcpy(previousProjection.values,view.previousProjection.data(),sizeof(previousProjection.values));}const Matrix4 previousVp=mul(previousProjection,previousView);m_telemetry.submittedVisuals=m_telemetry.culledVisuals=0;std::shared_ptr<IR4Buffer> last; Impl::Variant lastVariant=Impl::Variant::Flat; bool hasVariant=false;
+    for(auto& d:m_impl->draws){const Matrix4 wvp=mul(vp,d.model);if(view.valid&&outside(d.bounds,wvp)){++m_telemetry.culledVisuals;continue;}const Matrix4 wv=mul(v,d.model);const Matrix4 previousWvp=mul(previousVp,d.model);std::array<std::uint8_t,kVsGlobals> vg{};std::array<std::uint8_t,kTransforms> tr{};std::array<std::uint8_t,kPsGlobals> pg{};std::memcpy(vg.data(),&previousWvp,sizeof(previousWvp));std::memcpy(vg.data()+64u,&previousVp,sizeof(previousVp));std::memcpy(tr.data(),&wvp,sizeof(wvp));std::memcpy(tr.data()+64u,&wv,sizeof(wv));std::memcpy(tr.data()+128u,&d.model,sizeof(d.model));const float material[4]={0,0,0,.25f};std::memcpy(tr.data()+192u,material,sizeof(material));std::memcpy(pg.data(),&previousWvp,sizeof(previousWvp));std::memcpy(pg.data()+64u,&previousVp,sizeof(previousVp));R4FrameBufferSlice vsGlobalsSlice, transformsSlice, psGlobalsSlice;if(!backend.UploadFrameData(vg.data(),vg.size(),256u,vsGlobalsSlice,error)||!backend.UploadFrameData(tr.data(),tr.size(),256u,transformsSlice,error)||!backend.UploadFrameData(pg.data(),pg.size(),256u,psGlobalsSlice,error))return false;
         if(!hasVariant||lastVariant!=d.variant){const auto& pipeline=d.variant==Impl::Variant::Flat?m_impl->flatPipeline:(d.variant==Impl::Variant::Bump?m_impl->bumpPipeline:m_impl->steepPipeline);if(!backend.BindGraphicsPipeline(pipeline,error))return false;lastVariant=d.variant;hasVariant=true;}
-        R4MscStageBindings vs{R4ShaderStage::Vertex,48u,{{R4MscResourceType::ConstantBuffer,0u,d.vsGlobals,0u,kVsGlobals},{R4MscResourceType::ConstantBuffer,24u,d.transforms,0u,kTransforms}}};R4MscStageBindings ps;ps.stage=R4ShaderStage::Fragment;
-        if(d.variant==Impl::Variant::Flat)ps={R4ShaderStage::Fragment,96u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::ConstantBuffer,24u,d.psGlobals,0u,kPsGlobals},{R4MscResourceType::ConstantBuffer,48u,d.transforms,0u,kTransforms},{R4MscResourceType::Sampler,72u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
-        else if(d.variant==Impl::Variant::Bump)ps={R4ShaderStage::Fragment,120u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::Texture,24u,nullptr,0u,0u,d.bump},{R4MscResourceType::ConstantBuffer,48u,d.psGlobals,0u,kPsGlobals},{R4MscResourceType::ConstantBuffer,72u,d.transforms,0u,kTransforms},{R4MscResourceType::Sampler,96u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
-        else ps={R4ShaderStage::Fragment,168u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::Texture,24u,nullptr,0u,0u,d.bump},{R4MscResourceType::Texture,48u,nullptr,0u,0u,d.bumpX},{R4MscResourceType::ConstantBuffer,72u,d.psGlobals,0u,kPsGlobals},{R4MscResourceType::ConstantBuffer,96u,d.transforms,0u,kTransforms},{R4MscResourceType::ConstantBuffer,120u,view.staticGlobals,0u,kStaticGlobals},{R4MscResourceType::Sampler,144u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
+        R4MscStageBindings vs{R4ShaderStage::Vertex,48u,{{R4MscResourceType::ConstantBuffer,0u,vsGlobalsSlice.buffer,vsGlobalsSlice.offset,kVsGlobals},{R4MscResourceType::ConstantBuffer,24u,transformsSlice.buffer,transformsSlice.offset,kTransforms}}};R4MscStageBindings ps;ps.stage=R4ShaderStage::Fragment;
+        if(d.variant==Impl::Variant::Flat)ps={R4ShaderStage::Fragment,96u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::ConstantBuffer,24u,psGlobalsSlice.buffer,psGlobalsSlice.offset,kPsGlobals},{R4MscResourceType::ConstantBuffer,48u,transformsSlice.buffer,transformsSlice.offset,kTransforms},{R4MscResourceType::Sampler,72u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
+        else if(d.variant==Impl::Variant::Bump)ps={R4ShaderStage::Fragment,120u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::Texture,24u,nullptr,0u,0u,d.bump},{R4MscResourceType::ConstantBuffer,48u,psGlobalsSlice.buffer,psGlobalsSlice.offset,kPsGlobals},{R4MscResourceType::ConstantBuffer,72u,transformsSlice.buffer,transformsSlice.offset,kTransforms},{R4MscResourceType::Sampler,96u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
+        else ps={R4ShaderStage::Fragment,168u,{{R4MscResourceType::Texture,0u,nullptr,0u,0u,d.base},{R4MscResourceType::Texture,24u,nullptr,0u,0u,d.bump},{R4MscResourceType::Texture,48u,nullptr,0u,0u,d.bumpX},{R4MscResourceType::ConstantBuffer,72u,psGlobalsSlice.buffer,psGlobalsSlice.offset,kPsGlobals},{R4MscResourceType::ConstantBuffer,96u,transformsSlice.buffer,transformsSlice.offset,kTransforms},{R4MscResourceType::ConstantBuffer,120u,view.staticGlobals,0u,kStaticGlobals},{R4MscResourceType::Sampler,144u,nullptr,0u,0u,nullptr,m_impl->sampler}}};
         if(!backend.BindMscResources(vs,error)||!backend.BindMscResources(ps,error))return false;if(d.vb!=last){if(!backend.BindVertexBuffer(6u,d.vb,0u,error))return false;last=d.vb;}R4IndexedDrawDesc draw;draw.indexBuffer=d.ib;draw.indexBufferOffset=static_cast<std::size_t>(d.indexBase)*sizeof(std::uint16_t);draw.indexCount=d.indexCount;draw.indexType=R4IndexType::UInt16;draw.baseVertex=static_cast<std::int32_t>(d.vertexBase);if(!backend.DrawIndexed(draw,error))return false;++m_telemetry.submittedVisuals;}
+    return true;
+}
+
+bool MetalR4DefObjectsLodAdapter::DrawShadowCasters(IR4Backend& backend,
+    const std::array<float, 16>& lightViewProjection,
+    const std::shared_ptr<IR4GraphicsPipeline>& opaquePipeline,
+    std::string& error)
+{
+    if (!m_ready || !m_impl || (!m_impl->uploaded && !m_impl->pendingUpload) ||
+        m_impl->draws.empty() || !opaquePipeline)
+        return true;
+    Matrix4 lvp;
+    std::memcpy(lvp.values, lightViewProjection.data(), sizeof(lvp.values));
+    for (const float val : lvp.values)
+    {
+        if (!std::isfinite(val))
+            return true;
+    }
+    std::shared_ptr<IR4Buffer> lastVb;
+    bool pipelineBound = false;
+    for (const auto& d : m_impl->draws)
+    {
+        const Matrix4 wvp = mul(lvp, d.model);
+        if (outside(d.bounds, wvp))
+        {
+            ++m_telemetry.shadowCulledVisuals;
+            continue;
+        }
+        std::array<std::uint8_t, 256u> transform{};
+        std::memcpy(transform.data(), &wvp, sizeof(wvp));
+        R4FrameBufferSlice slice;
+        if (!backend.UploadFrameData(transform.data(), transform.size(), 256u, slice, error))
+            return false;
+        if (!pipelineBound)
+        {
+            if (!backend.BindGraphicsPipeline(opaquePipeline, error))
+                return false;
+            pipelineBound = true;
+        }
+        R4MscStageBindings vs{R4ShaderStage::Vertex, 24u, {
+            {R4MscResourceType::ConstantBuffer, 0u, slice.buffer, slice.offset, 256u}
+        }};
+        if (!backend.BindMscResources(vs, error))
+            return false;
+        if (d.vb != lastVb)
+        {
+            if (!backend.BindVertexBuffer(6u, d.vb, 0u, error))
+                return false;
+            lastVb = d.vb;
+        }
+        R4IndexedDrawDesc draw;
+        draw.indexBuffer = d.ib;
+        draw.indexBufferOffset = static_cast<std::size_t>(d.indexBase) * sizeof(std::uint16_t);
+        draw.indexCount = d.indexCount;
+        draw.indexType = R4IndexType::UInt16;
+        draw.baseVertex = static_cast<std::int32_t>(d.vertexBase);
+        if (!backend.DrawIndexed(draw, error))
+            return false;
+        ++m_telemetry.shadowSubmittedVisuals;
+    }
     return true;
 }
 

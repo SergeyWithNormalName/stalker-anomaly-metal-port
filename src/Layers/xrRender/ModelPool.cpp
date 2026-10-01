@@ -517,6 +517,16 @@ void CModelPool::Prefetch_One(LPCSTR N, bool assert)
 bool CModelPool::Exists(LPCSTR N)
 {
 	xrCriticalSectionGuard poolGuard(PoolLock);
+	// Visual-less server objects (including lamps) legitimately query an empty
+	// visual before the caller selects its configured fallback. An empty name
+	// cannot identify a model and must never reach filesystem prefetch.
+	if (!N || !N[0])
+	{
+		static bool logged = false;
+		if (!logged) Msg("MODEL_POOL_EMPTY_VISUAL_QUERY result=absent");
+		logged = true;
+		return false;
+	}
 	string_path low_name;
 	VERIFY(xr_strlen(N) < sizeof(low_name));
 	xr_strcpy(low_name, N);

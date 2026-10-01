@@ -1,0 +1,167 @@
+diff --git a/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake b/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
+--- a/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
++++ b/src/Layers/xrRenderPC_R4/CMake/XRay.Render.R4.cmake
+@@ -101,10 +101,10 @@
+   ../xrRender/r__pixel_calculator.h
+   ../xrRender/r__screenshot.cpp
+   ../xrRender/R_calculate.cpp
+-  ../../xrRenderMetal/R4PortalGenerationContext.cpp
+-  ../../xrRenderMetal/R4PortalGraphPreparedObserver.cpp
+-  ../../xrRenderMetal/R4PortalGenerationContext.h
+-  ../../xrRenderMetal/R4PortalGraphObserver.h
++  ../xrRenderMetal/R4PortalGenerationContext.cpp
++  ../xrRenderMetal/R4PortalGraphPreparedObserver.cpp
++  ../xrRenderMetal/R4PortalGenerationContext.h
++  ../xrRenderMetal/R4PortalGraphObserver.h
+   ../xrRender/CHudInitializer.cpp
+   ../xrRender/gifPlayer.cpp
+   ../xrRender/r_sun_cascades.h
+diff --git a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+--- a/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
++++ b/src/Layers/xrRenderMetal/MetalR4EngineScene.mm
+@@ -6314,6 +6314,7 @@
+ {
+     LevelScene scene;
+     xray::metal::R4PortalGenerationCache portalCache;
++    std::vector<R4FloraBlenderMaterial> portalFloraShaderMaterials;
+     xray::metal::R4PortalContextFrameInput portalInput;
+     xray::metal::R4PortalContextFrameOutput portalOutput;
+     bool portalObserverEnabled = false;
+@@ -6668,6 +6669,7 @@
+ bool MetalR4EngineScene::Prepare(IR4Backend& backend, const Options& options, std::string& error)
+ {
+     Reset();
++    if (impl) impl->portalFloraShaderMaterials = options.flora.shaderMaterials;
+     if (options.levelDirectory.empty() || options.mscVertexMetallibPath.empty() ||
+         options.mscFragmentMetallibPath.empty() || options.lightingVertexMetallibPath.empty() ||
+         options.lightingFragmentMetallibPath.empty() || options.sunShaderDirectory.empty() ||
+@@ -8114,7 +8116,97 @@
+                 row.first < impl->portalOutput.graph.ownerFrustumTests.size();
+         idsValid = idsValid && csvViewMatch && csvProjectionMatch && csvEyeMatch &&
+             csvSsaMatch && idsIndicesValid;
+-        const bool complete = impl->portalOutput.valid && impl->portalSelectedViewMatches && idsValid;
++        const auto joinStart = std::chrono::steady_clock::now();
++        std::unordered_map<std::uint32_t, const xray::metal::R4StaticVisual*> sourceVisualById;
++        std::unordered_set<std::uint32_t> duplicateSourceVisualIds;
++        for (const auto& visual : impl->scene.geometry.visuals)
++        {
++            if (!sourceVisualById.emplace(visual.visualId, &visual).second)
++                duplicateSourceVisualIds.insert(visual.visualId);
++        }
++        std::unordered_map<std::string, const R4FloraBlenderMaterial*> floraShaderByName;
++        std::unordered_set<std::string> duplicateFloraShaderNames;
++        for (const auto& shader : impl->portalFloraShaderMaterials)
++        {
++            if (!floraShaderByName.emplace(shader.shaderName, &shader).second)
++                duplicateFloraShaderNames.insert(shader.shaderName);
++        }
++        std::vector<bool> geometryJoinValid(ids.size(), false);
++        std::size_t geometryJoinUnknown = 0;
++        const auto finite3 = [](const float* p) {
++            return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
++        };
++        const auto finite4 = [](const float* p) {
++            return std::isfinite(p[0]) && std::isfinite(p[1]) &&
++                std::isfinite(p[2]) && std::isfinite(p[3]);
++        };
++        for (std::size_t rowIndex = 0; rowIndex < ids.size(); ++rowIndex)
++        {
++            const std::uint32_t id = ids[rowIndex].first;
++            const std::string& capturedMaterial = ids[rowIndex].second;
++            bool joined = id < impl->portalCache.graph.visualNodes.size() &&
++                id < impl->portalCache.graph.portalMetadata.visualOwnerSectors.size();
++            const xray::metal::R4VisualNode* node = joined ?
++                &impl->portalCache.graph.visualNodes[id] : nullptr;
++            const auto foundVisual = sourceVisualById.find(id);
++            const xray::metal::R4StaticVisual* visual =
++                foundVisual == sourceVisualById.end() ? nullptr : foundVisual->second;
++            joined = joined && node && node->visualId == id && node->visualType == 7u &&
++                node->boundsValid && finite4(node->sphere.data()) && node->sphere[3] >= 0.f &&
++                finite3(node->box.data()) && finite3(node->box.data() + 3u) &&
++                node->box[0] <= node->box[3] && node->box[1] <= node->box[4] &&
++                node->box[2] <= node->box[5];
++            joined = joined && visual && !duplicateSourceVisualIds.count(id) &&
++                visual->valid && visual->visualType == 7u && visual->hasTreeLighting &&
++                visual->referencedPositionBounds.available &&
++                finite3(visual->referencedPositionBounds.minimum.data()) &&
++                finite3(visual->referencedPositionBounds.maximum.data()) &&
++                visual->referencedPositionBounds.minimum[0] <= visual->referencedPositionBounds.maximum[0] &&
++                visual->referencedPositionBounds.minimum[1] <= visual->referencedPositionBounds.maximum[1] &&
++                visual->referencedPositionBounds.minimum[2] <= visual->referencedPositionBounds.maximum[2] &&
++                visual->shaderId < impl->scene.geometry.shaders.size() &&
++                !impl->scene.geometry.shaders[visual->shaderId].baseTexture.empty() &&
++                visual->vertexBufferId < impl->scene.geometry.vertexBuffers.size() &&
++                visual->indexBufferId < impl->scene.geometry.indexBuffers.size() &&
++                visual->vertexCount > 0u && visual->indexCount > 0u;
++            if (joined)
++            {
++                const auto& vb = impl->scene.geometry.vertexBuffers[visual->vertexBufferId];
++                const auto& ib = impl->scene.geometry.indexBuffers[visual->indexBufferId];
++                joined = visual->vertexBase <= vb.vertexCount &&
++                    visual->vertexCount <= vb.vertexCount - visual->vertexBase &&
++                    visual->indexBase <= ib.indexCount &&
++                    visual->indexCount <= ib.indexCount - visual->indexBase;
++            }
++            const R4FloraBlenderMaterial* blender = nullptr;
++            if (joined)
++            {
++                const std::string& shaderName = impl->scene.geometry.shaders[visual->shaderId].shaderName;
++                const bool expectedLeaf = capturedMaterial == "leaf" && shaderName == "flora\\leaf_wave";
++                const bool expectedTrunk = capturedMaterial == "trunk" && shaderName == "flora\\trunk_wave";
++                const auto foundShader = floraShaderByName.find(shaderName);
++                blender = foundShader == floraShaderByName.end() ? nullptr : foundShader->second;
++                joined = (expectedLeaf || expectedTrunk) && blender &&
++                    !duplicateFloraShaderNames.count(shaderName) && !blender->objectLod &&
++                    (expectedLeaf ? blender->alphaBlend : !blender->alphaBlend);
++            }
++            if (joined)
++            {
++                const auto& owners = impl->portalCache.graph.portalMetadata.visualOwnerSectors[id];
++                joined = !owners.empty() && std::all_of(owners.begin(), owners.end(),
++                    [&](const std::uint32_t owner) {
++                        return owner < impl->portalCache.graph.portalMetadata.sectors.size();
++                    });
++            }
++            geometryJoinValid[rowIndex] = joined;
++            if (!joined) ++geometryJoinUnknown;
++        }
++        const double geometryJoinCpuMs = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - joinStart).count();
++        const bool geometryJoinComplete = idsValid && geometryJoinUnknown == 0u &&
++            geometryJoinValid.size() == 5316u;
++        const bool complete = impl->portalOutput.valid && impl->portalSelectedViewMatches &&
++            idsValid && geometryJoinComplete;
+         const char* receiptPath = std::getenv("XRAY_METAL_SOURCE_TOPOLOGY_FILE");
+         if (receiptPath && receiptPath[0] == '/')
+         {
+@@ -8148,6 +8240,11 @@
+                 << ",\"observer_valid\":" << impl->portalOutput.valid
+                 << ",\"view_match\":" << impl->portalSelectedViewMatches
+                 << ",\"flora_ids_valid\":" << idsValid
++                << ",\"geometry_join_complete\":" << geometryJoinComplete
++                << ",\"geometry_joined_ids\":" << (ids.size() - geometryJoinUnknown)
++                << ",\"geometry_join_unknown_ids\":" << geometryJoinUnknown
++                << ",\"geometry_join_cpu_ms\":" << geometryJoinCpuMs
++                << ",\"geometry_join_scope\":\"source-MT_TREE_ST-type7-structure-only; no GPU/wind enclosure proof\""
+                 << ",\"csv_view_match\":" << csvViewMatch
+                 << ",\"csv_projection_match\":" << csvProjectionMatch
+                 << ",\"csv_eye_match\":" << csvEyeMatch
+@@ -8187,14 +8284,16 @@
+             {
+                 if (i) receipt << ',';
+                 const std::uint32_t id = ids[i].first;
+-                const bool indexValid = id < impl->portalOutput.graph.rawVisualVisible.size() &&
++                const bool indexValid = geometryJoinValid[i] &&
++                    id < impl->portalOutput.graph.rawVisualVisible.size() &&
+                     id < impl->portalOutput.graph.ownerFrustumTests.size();
+                 if (i && !indexValid) { idsValid = false; }
+                 receipt << "{\"id\":" << id << ",\"material\":\"" << ids[i].second
+                     << "\",\"raw_visible\":" << (indexValid ?
+                         unsigned(impl->portalOutput.graph.rawVisualVisible[id]) : 1u)
+                     << ",\"owner_tests\":" << (indexValid ?
+-                        impl->portalOutput.graph.ownerFrustumTests[id] : 0u) << '}';
++                        impl->portalOutput.graph.ownerFrustumTests[id] : 0u)
++                    << ",\"geometry_join_valid\":" << geometryJoinValid[i] << '}';
+             }
+             receipt << "]}\n";
+             receipt.close();

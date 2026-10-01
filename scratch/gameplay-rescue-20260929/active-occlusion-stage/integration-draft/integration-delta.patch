@@ -1,0 +1,629 @@
+--- prestate/MetalBootstrap.mm
++++ draft/MetalBootstrap.mm
+@@ -525,6 +525,9 @@
+     {
+         std::uint32_t visualId = 0;
+         std::uint32_t triangleId = 0;
++        // Precomputed once from the immutable indexed geometry. No edge-map
++        // construction or pair search is performed in a render frame.
++        std::uint32_t mateTriangleId = std::numeric_limits<std::uint32_t>::max();
+         // Visual-local UInt16 source indices, in the original draw's index order.
+         std::array<std::uint32_t, 3> sourceVertexIds{};
+         std::array<std::array<float, 3>, 3> positions{};
+@@ -651,6 +654,8 @@
+     std::unordered_map<std::uint32_t, std::size_t> textureMaterialByVisual;
+     bool activeOcclusionRequested = false;
+     bool activeOcclusionEnabled = false;
++    bool activeOcclusionLocalVolumeShaderQualified = false;
++    const char* activeOcclusionLocalVolumeShaderReason = "not-checked";
+     const char* activeOcclusionDisableReason = nullptr;
+     std::vector<ActiveOcclusionSourceTriangle> activeOcclusionSourceTriangles;
+     ActiveOcclusionObservation activeOcclusionObservation;
+@@ -1112,6 +1117,63 @@
+                 scene.activeOcclusionOmittedTriangles += triangleCount;
+                 continue;
+             }
++
++            struct EdgeUse
++            {
++                std::uint32_t firstTriangle = 0;
++                std::uint32_t secondTriangle = 0;
++                std::uint32_t firstStart = 0;
++                std::uint32_t firstEnd = 0;
++                std::uint8_t count = 0;
++                bool reciprocal = false;
++            };
++            std::unordered_map<std::uint32_t, EdgeUse> edgeUses;
++            edgeUses.reserve(triangleCount * 3u);
++            for (std::uint32_t tri = 0; tri < visualTriangles.size(); ++tri)
++                for (std::uint32_t edge = 0; edge != 3u; ++edge)
++                {
++                    const std::uint32_t start = visualTriangles[tri].sourceVertexIds[edge];
++                    const std::uint32_t end = visualTriangles[tri].sourceVertexIds[(edge + 1u) % 3u];
++                    if (start == end)
++                        continue;
++                    const std::uint32_t lo = std::min(start, end);
++                    const std::uint32_t hi = std::max(start, end);
++                    const std::uint32_t key = (lo << 16u) | hi;
++                    auto inserted = edgeUses.emplace(key, EdgeUse{});
++                    EdgeUse& use = inserted.first->second;
++                    if (inserted.second)
++                    {
++                        use.firstTriangle = tri;
++                        use.firstStart = start;
++                        use.firstEnd = end;
++                        use.count = 1u;
++                        continue;
++                    }
++                    if (use.count == 1u)
++                    {
++                        use.count = 2u;
++                        use.secondTriangle = tri;
++                        use.reciprocal = use.firstTriangle != tri &&
++                            use.firstStart == end && use.firstEnd == start;
++                        if (use.reciprocal)
++                        {
++                            visualTriangles[use.firstTriangle].mateTriangleId = tri;
++                            visualTriangles[tri].mateTriangleId = use.firstTriangle;
++                        }
++                    }
++                    else
++                    {
++                        if (use.reciprocal)
++                        {
++                            visualTriangles[use.firstTriangle].mateTriangleId =
++                                std::numeric_limits<std::uint32_t>::max();
++                            visualTriangles[use.secondTriangle].mateTriangleId =
++                                std::numeric_limits<std::uint32_t>::max();
++                        }
++                        use.reciprocal = false;
++                        use.count = 3u;
++                    }
++                }
+             material.activeOcclusionFirstTriangle = firstTriangle;
+             material.activeOcclusionTriangleCount = static_cast<std::uint32_t>(triangleCount);
+             scene.activeOcclusionSourceTriangles.insert(scene.activeOcclusionSourceTriangles.end(),
+--- prestate/MetalR4EngineScene.mm
++++ draft/MetalR4EngineScene.mm
+@@ -14,6 +14,7 @@
+ #include "MetalR4VolumetricCapture.h"
+ #include "R4NightVisionFoundation.h"
+ #include "R4SubmittedViewHistory.h"
++#include "R4ActiveOcclusionSceneBridge.h"
+ #import <CoreGraphics/CoreGraphics.h>
+ #import <ImageIO/ImageIO.h>
+ 
+@@ -44,6 +45,55 @@
+ namespace
+ {
+ constexpr R4ClearColor EngineSceneClearColor{0.025, 0.055, 0.105, 1.0};
++
++bool qualifyActiveOcclusionLocalVolumeShader(const std::filesystem::path& directory,
++    const char*& reason)
++{
++    try
++    {
++        constexpr const char* expectedMetallib =
++            "8c570a04d307eea059a5000eb693ed2d1e6a31f7ba1a0cf212ad961c607afc93";
++        constexpr const char* expectedReflection =
++            "2717f0d1347d142df19048da76fd04852f9a67cbb415581cfa21e80ba6b07a1c";
++        const auto metallibPath = directory / "accum_volume.vs.metallib";
++        const auto reflectionPath = directory / "accum_volume.vs.json";
++        const auto receiptPath = directory / "local-lights-msc-receipt.txt";
++        std::error_code ec;
++        const std::uintmax_t metallibSize = std::filesystem::file_size(metallibPath, ec);
++        if (ec || metallibSize == 0u || metallibSize > 1024u * 1024u)
++        { reason = "local-volume-metallib-unreadable-or-oversized"; return false; }
++        ec.clear();
++        const std::uintmax_t reflectionSize = std::filesystem::file_size(reflectionPath, ec);
++        if (ec || reflectionSize == 0u || reflectionSize > 64u * 1024u)
++        { reason = "local-volume-reflection-unreadable-or-oversized"; return false; }
++        ec.clear();
++        const std::uintmax_t receiptSize = std::filesystem::file_size(receiptPath, ec);
++        if (ec || receiptSize == 0u || receiptSize > 64u * 1024u)
++        { reason = "local-volume-receipt-unreadable-or-oversized"; return false; }
++
++        std::string metallibHash, reflectionHash;
++        if (!fileSha256(metallibPath, metallibHash) || metallibHash != expectedMetallib ||
++            !fileSha256(reflectionPath, reflectionHash) || reflectionHash != expectedReflection)
++        { reason = "local-volume-artifact-identity-mismatch"; return false; }
++
++        std::string receipt;
++        if (!readActiveOcclusionTextFileBounded(receiptPath, 64u * 1024u, receipt))
++        { reason = "local-volume-receipt-unreadable-or-oversized"; return false; }
++        if (receipt.find("source_tree_sha256=bc502abe6276487148978a7423c102079d7120a12ed8359c87eff7f1047b8494") == std::string::npos ||
++            receipt.find("msc_version=metal-irconverter version: 4.0.1") == std::string::npos ||
++            receipt.find("entry_point=main") == std::string::npos ||
++            receipt.find("common_define_args=-D SMAP_size=2048 -D FP16_FILTER=1 -D FP16_BLEND=1 -D USE_HWSMAP=1 -D USE_HWSMAP_PCF=1 -D USE_BRANCHING=1 -D USE_VTF=1 -D SM_5=1 -D SSFX_INT_GRASS=8 -D SSFX_SSR_QUALITY=0 -D SSFX_WATER_QUALITY=1 -D SSFX_WATER_PARALLAX=2 -D SSFX_IL_QUALITY=16 -D SSFX_AO_QUALITY=2 -D SSFX_POM_REFINE=0 -D SSFX_TERRA_POM_REFINE=0 -D SSFX_SSS_DIR_QUALITY=6 -D SSFX_SSS_OMNI_QUALITY=2 -D SSFX_MODEXE=1") == std::string::npos ||
++            receipt.find("output=accum_volume.vs\tdxil_sha256=1a6b903e514652d9229d84c343bd08a2841f90e1400304244f3fb70bf6bd28b8\tmetallib_sha256=8c570a04d307eea059a5000eb693ed2d1e6a31f7ba1a0cf212ad961c607afc93\treflection_sha256=2717f0d1347d142df19048da76fd04852f9a67cbb415581cfa21e80ba6b07a1c") == std::string::npos)
++        { reason = "local-volume-source-or-receipt-identity-mismatch"; return false; }
++    }
++    catch (...)
++    {
++        reason = "local-volume-qualification-failed";
++        return false;
++    }
++    reason = nullptr;
++    return true;
++}
+ 
+ // E07 CPU encoding attribution. These intervals include nested caster work;
+ // they are not GPU durations and must not be added to scene_ms.
+@@ -2589,8 +2639,238 @@
+         std::fprintf(stderr,"METAL_LOCAL_LIGHT_FACE_CULL frame=%u before=%zu eligible=%zu exempt=%zu unknown=%zu removed=%zu remaining=%zu batches=%zu\n",
+             view.engineFrame,before,eligible,exempt,unknown,removed,before-removed,batches.size());
+     return true;
++}
++
++struct ActiveOcclusionGridStats
++{
++    R4ActiveOcclusion::BuildStats build{};
++    std::uint64_t scopeId = 0u;
++    std::size_t drawsUsed = 0u;
++    std::size_t drawsSkipped = 0u;
++    std::size_t sourcePairs = 0u;
++    bool ready = false;
++    bool sourceTriangleCap = false;
++    const char* reason = "not-attempted";
++    double buildMs = 0.0;
++    double queryMs = 0.0;
++    std::uint64_t queryCellTests = 0u;
++    std::size_t inputTriangles = 0u;
++    bool queryCellCap = false;
++    bool queryInvalid = false;
++};
++
++bool buildActiveOcclusionGrid(LevelScene& scene,
++    const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
++    const std::vector<R4WholeLightVisibilitySample>& samples,
++    R4ActiveOcclusion::CoverageGrid& grid, ActiveOcclusionGridStats& result)
++{
++    const auto buildStart = std::chrono::steady_clock::now();
++    const auto& observation = scene.activeOcclusionObservation;
++    if (!snapshot || samples.empty() || !observation.scopeId || !observation.complete ||
++        observation.failed || observation.engineFrame != snapshot->engineFrame ||
++        observation.viewportWidth == 0u || observation.viewportHeight == 0u)
++    {
++        result.reason = "scope-or-selection-unavailable";
++        result.buildMs = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - buildStart).count();
++        return false;
++    }
++
++    result.scopeId = observation.scopeId;
++    try
++    {
++        std::vector<R4ActiveOcclusionBridge::SourceTriangle> source;
++        source.reserve(scene.activeOcclusionSourceTriangles.size());
++        for (const auto& input : scene.activeOcclusionSourceTriangles)
++        {
++            R4ActiveOcclusionBridge::SourceTriangle output;
++            output.sourceTriangleId = input.triangleId;
++            output.mateTriangleId = input.mateTriangleId;
++            for (unsigned i = 0; i != 3u; ++i)
++            {
++                output.sourceVertexIds[i] = input.sourceVertexIds[i];
++                for (unsigned axis = 0; axis != 3u; ++axis)
++                    output.positions[i][axis] = input.positions[i][axis];
++            }
++            source.emplace_back(output);
++            if (input.mateTriangleId != std::numeric_limits<std::uint32_t>::max())
++                ++result.sourcePairs;
++        }
++        result.sourcePairs /= 2u;
++
++        std::vector<R4ActiveOcclusion::Triangle> triangles;
++        triangles.reserve(std::min<std::size_t>(R4ActiveOcclusion::kMaxTriangles,
++            observation.admittedDraws.size() * 256u));
++        for (const auto& receipt : observation.admittedDraws)
++        {
++            if (receipt.scopeId != observation.scopeId ||
++                receipt.engineFrame != observation.engineFrame ||
++                receipt.triangleCount == 0u ||
++                receipt.firstTriangle > source.size() ||
++                receipt.triangleCount > source.size() - receipt.firstTriangle)
++            { ++result.drawsSkipped; continue; }
++            if (receipt.triangleCount > R4ActiveOcclusion::kMaxTriangles - triangles.size())
++            {
++                result.sourceTriangleCap = true;
++                ++result.drawsSkipped;
++                continue;
++            }
++            R4ActiveOcclusionBridge::DrawTransform draw;
++            draw.drawId = receipt.drawId;
++            draw.scopeId = receipt.scopeId;
++            draw.engineFrame = receipt.engineFrame;
++            draw.viewportWidth = receipt.viewportWidth;
++            draw.viewportHeight = receipt.viewportHeight;
++            draw.clockwiseFrontFace = receipt.clockwiseFrontFace;
++            draw.backFaceCull = receipt.backFaceCull;
++            draw.depthLess = receipt.depthLess;
++            draw.opaque = receipt.opaque;
++            draw.writesDepth = receipt.writesDepth;
++            draw.stencilPassGuaranteed = receipt.stencilPassGuaranteed;
++            std::memcpy(draw.uploadedWvp, receipt.uploadedWvp.data(), sizeof(draw.uploadedWvp));
++            std::memcpy(draw.uploadedJitter, receipt.uploadedJitter.data(), sizeof(draw.uploadedJitter));
++            const char* drawReason = nullptr;
++            if (!R4ActiveOcclusionBridge::AppendDrawTriangles(
++                    source.data() + receipt.firstTriangle, receipt.triangleCount, draw,
++                    observation.scopeId, observation.engineFrame, triangles, drawReason))
++            { ++result.drawsSkipped; continue; }
++            ++result.drawsUsed;
++        }
++
++        R4ActiveOcclusion::BuildInput input;
++        input.observationScopeId = observation.scopeId;
++        input.triangles = triangles.data();
++        input.triangleCount = triangles.size();
++        input.viewportWidth = observation.viewportWidth;
++        input.viewportHeight = observation.viewportHeight;
++        input.viewportY = R4ActiveOcclusion::ViewportYDirection::ClipPositiveYMapsToLowerPixelY;
++        input.pixelAreaWinding = R4ActiveOcclusion::PixelAreaWinding::PositiveIsClockwise;
++        input.rasterEdgeGuardPixels = 1.0f;
++        result.inputTriangles = triangles.size();
++        if (!grid.Build(input, &result.build))
++        {
++            result.reason = "coverage-grid-build-invalid";
++            result.buildMs = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - buildStart).count();
++            return false;
++        }
++        result.ready = true;
++        result.reason = nullptr;
++    }
++    catch (...)
++    {
++        grid.Reset();
++        result.ready = false;
++        result.reason = "observer-grid-allocation-or-construction-failure";
++    }
++    result.buildMs = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - buildStart).count();
++    return result.ready;
+ }
+ 
++void queryActiveOcclusionSamples(const LevelScene& scene,
++    const std::shared_ptr<const R4EngineLocalLightSnapshot>& snapshot,
++    const MetalR4LocalLightAdapter::ViewState& view,
++    const std::vector<std::vector<std::size_t>>& batches,
++    std::vector<R4WholeLightVisibilitySample>& samples,
++    R4ActiveOcclusion::CoverageGrid& grid, ActiveOcclusionGridStats& stats)
++{
++    if (!snapshot || samples.empty())
++        return;
++    const auto queryStart = std::chrono::steady_clock::now();
++    std::array<float, 16> cameraVp{};
++    BuildMetalR4LocalLightCameraViewProjection(view.view, view.projection, cameraVp);
++    const auto& observation = scene.activeOcclusionObservation;
++    for (auto& sample : samples)
++    {
++        sample.cpuObservationScopeId = stats.ready ? stats.scopeId : 0u;
++        const char* reason = nullptr;
++        const char* prediction = "unknown";
++        std::uint32_t queryCells = 0u;
++        if (!stats.ready)
++            reason = stats.reason ? stats.reason : "coverage-grid-unavailable";
++        else
++        {
++            auto found = snapshot->lights.end();
++            std::size_t foundIndex = 0u;
++            for (std::size_t index = 0; index != snapshot->lights.size(); ++index)
++                if (snapshot->lights[index].lightId == sample.lightId)
++                { found = snapshot->lights.begin() + static_cast<std::ptrdiff_t>(index); foundIndex = index; break; }
++            const bool batchMatches = sample.batchId >= 0 &&
++                static_cast<std::size_t>(sample.batchId) < batches.size() &&
++                std::find(batches[static_cast<std::size_t>(sample.batchId)].begin(),
++                    batches[static_cast<std::size_t>(sample.batchId)].end(), foundIndex) !=
++                    batches[static_cast<std::size_t>(sample.batchId)].end();
++            const bool identityMatches = found != snapshot->lights.end() && batchMatches &&
++                sample.engineFrame == snapshot->engineFrame &&
++                sample.cpuObservationScopeId == stats.scopeId &&
++                found->active && found->shadowed &&
++                ((found->type == R4EngineLocalLightType::OmniFace &&
++                    sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent &&
++                    sample.expectedFaceCount == 6u && sample.face < 6u &&
++                    found->parentLightId == sample.parentLightId && found->omniFace == sample.face) ||
++                 (found->type == R4EngineLocalLightType::Spot &&
++                    sample.groupKind == R4WholeLightVisibilityGroupKind::SingleRecord &&
++                    sample.expectedFaceCount == 1u && sample.face == 0u));
++            if (!identityMatches)
++                reason = "selected-face-snapshot-identity-mismatch";
++            else
++            {
++                std::array<float, 3> minimum{}, maximum{};
++                R4ActiveOcclusion::ClipVertex corners[8]{};
++                const char* boundsReason = nullptr;
++                std::array<float, 16> model{}, wvp{};
++                std::array<float, 4> localPositionAbsMax{};
++                std::array<float, 4> associationError{};
++                BuildMetalR4LocalLightModel(*found, model, &localPositionAbsMax);
++                BuildMetalR4LocalLightWorldViewProjection(cameraVp, model, wvp);
++                if (!BuildMetalR4LocalLightVolumeBounds(*found, minimum, maximum))
++                    reason = "local-light-volume-bounds-invalid";
++                else if (!R4ActiveOcclusionBridge::BuildLocalVolumeAssociationError(
++                    cameraVp.data(), model.data(), wvp.data(), localPositionAbsMax.data(),
++                    associationError.data(), boundsReason))
++                    reason = boundsReason ? boundsReason : "local-volume-association-error-unknown";
++                else if (!R4ActiveOcclusionBridge::BuildPaddedWorldAabbClipCorners(
++                    minimum.data(), maximum.data(), cameraVp.data(), associationError.data(),
++                    corners, boundsReason))
++                    reason = boundsReason ? boundsReason : "local-light-query-corners-invalid";
++                else
++                {
++                    R4ActiveOcclusion::QueryStats query{};
++                    const auto result = grid.QueryPaddedAabb(corners,
++                        observation.viewportWidth, observation.viewportHeight,
++                        R4ActiveOcclusion::ViewportYDirection::ClipPositiveYMapsToLowerPixelY,
++                        1.0f, stats.scopeId, &query);
++                    queryCells = query.cellsVisited;
++                    stats.queryCellTests += query.cellsVisited;
++                    if (query.invalidInput || query.cellTestCapReached)
++                    {
++                        stats.queryInvalid = stats.queryInvalid || query.invalidInput;
++                        stats.queryCellCap = stats.queryCellCap || query.cellTestCapReached;
++                        reason = query.cellTestCapReached ? "query-cell-cap" : "query-invalid-input";
++                    }
++                    else if (result == R4ActiveOcclusion::QueryResult::ConservativelyBehindCoverage)
++                    { prediction = "behind"; reason = "all-query-cells-behind-proven-coverage"; }
++                    else
++                    { prediction = "visible_or_unknown"; reason = "not-proven-behind-coverage"; }
++                }
++            }
++        }
++        std::fprintf(stderr,
++            "METAL_ACTIVE_OCCLUSION_FACE cpu_observation_scope=%llu engine_frame=%u "
++            "batch_id=%d light_id=%llu parent_light_id=%llu face=%u group_kind=%s "
++            "expected_faces=%u prediction=%s query_cells=%u reason=%s\n",
++            static_cast<unsigned long long>(sample.cpuObservationScopeId), sample.engineFrame,
++            sample.batchId, static_cast<unsigned long long>(sample.lightId),
++            static_cast<unsigned long long>(sample.parentLightId), sample.face,
++            sample.groupKind == R4WholeLightVisibilityGroupKind::OmniParent ? "omni-parent" : "single",
++            sample.expectedFaceCount,
++            prediction, queryCells, reason ? reason : "none");
++    }
++    stats.queryMs = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - queryStart).count();
++}
++
+ // Exact ordered source IDs are the key. Geometry/model/materials are immutable
+ // for this scene owner; Prepare resets the cache. Light matrices are fresh CBs,
+ // never cached. Only the index stream is reused, under a 64-MiB cache budget.
+@@ -4613,6 +4893,69 @@
+             if (!visibilitySelectionError.empty())
+                 visibilityFailureReason = "selection-invalid-input";
+         }
++        const bool activeOcclusionObserveRequested = scene.activeOcclusionRequested &&
++            visibilityOptIn && activeOcclusionFrameInWindow(view.engineFrame);
++        if (activeOcclusionObserveRequested)
++        {
++            ActiveOcclusionGridStats activeStats;
++            activeStats.scopeId = scene.activeOcclusionObservation.scopeId;
++            R4ActiveOcclusion::CoverageGrid activeGrid;
++            try
++            {
++                if (!scene.activeOcclusionEnabled)
++                    activeStats.reason = "static-source-not-enabled";
++                else if (!scene.activeOcclusionLocalVolumeShaderQualified)
++                    activeStats.reason = scene.activeOcclusionLocalVolumeShaderReason ?
++                        scene.activeOcclusionLocalVolumeShaderReason : "local-volume-shader-unqualified";
++                else if (visibilitySamples.empty())
++                    activeStats.reason = "no-selected-complete-groups";
++                else
++                    buildActiveOcclusionGrid(scene, snapshot, visibilitySamples, activeGrid, activeStats);
++                if (!visibilitySamples.empty())
++                    queryActiveOcclusionSamples(scene, snapshot, localView, batches,
++                        visibilitySamples, activeGrid, activeStats);
++            }
++            catch (...)
++            {
++                activeGrid.Reset();
++                activeStats.ready = false;
++                activeStats.reason = "observer-exception-fail-open";
++                for (auto& sample : visibilitySamples)
++                    sample.cpuObservationScopeId = 0u;
++            }
++            {
++                const char* gridStatus = activeStats.ready ? "ready" :
++                    (activeStats.reason && std::strcmp(activeStats.reason,
++                        "no-selected-complete-groups") != 0 &&
++                        std::strcmp(activeStats.reason, "static-source-not-enabled") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-artifact-identity-mismatch") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-source-or-receipt-identity-mismatch") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-metallib-unreadable-or-oversized") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-reflection-unreadable-or-oversized") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-receipt-unreadable-or-oversized") != 0 &&
++                        std::strcmp(activeStats.reason, "local-volume-qualification-failed") != 0 ?
++                        "unknown" : "skipped");
++                std::fprintf(stderr,
++                    "METAL_ACTIVE_OCCLUSION_GRID status=%s cpu_observation_scope=%llu engine_frame=%u "
++                    "selected_groups=%zu selected_faces=%zu draws_used=%zu draws_skipped=%zu "
++                    "triangles=%zu source_pairs=%zu "
++                    "paired_unions_accepted=%u cells_marked=%u primitive_cell_tests=%llu "
++                    "query_cell_tests=%llu query_invalid=%u triangle_cap=%u cell_test_cap=%u build_ms=%.6f query_ms=%.6f "
++                    "raster_convention=synthetic_only suppression=disabled reason=%s\n",
++                    gridStatus, static_cast<unsigned long long>(activeStats.scopeId),
++                    view.engineFrame, visibilityStats.selectedGroups, visibilitySamples.size(),
++                    activeStats.drawsUsed, activeStats.drawsSkipped,
++                    activeStats.inputTriangles, activeStats.sourcePairs,
++                    activeStats.build.pairedUnionsAccepted, activeStats.build.cellsMarked,
++                    static_cast<unsigned long long>(activeStats.build.primitiveCellTests),
++                    static_cast<unsigned long long>(activeStats.queryCellTests),
++                    unsigned(activeStats.queryInvalid),
++                    unsigned(activeStats.sourceTriangleCap || activeStats.build.triangleCapReached),
++                    unsigned(activeStats.build.cellTestCapReached || activeStats.queryCellCap),
++                    activeStats.buildMs, activeStats.queryMs,
++                    activeStats.reason ? activeStats.reason : "none");
++            }
++        }
+         if (e08PlanTiming)
+             std::fprintf(stderr, "METAL_E08_LOCAL_PLAN frame=%u cpu_ms=%.6f batches=%zu\n", view.engineFrame,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - e08PlanStart).count(), batches.size());
+@@ -6681,6 +7024,15 @@
+         }
+         std::fprintf(stderr, "METAL_LOCAL_LIGHT_PREPARE status=\"%s\" enabled=%s\n",
+             localLightStatus.c_str(), impl->localLights->IsReady() ? "true" : "false");
++        if (impl->scene.activeOcclusionRequested && impl->localLights->IsReady())
++        {
++            const char* qualificationReason = nullptr;
++            impl->scene.activeOcclusionLocalVolumeShaderQualified =
++                qualifyActiveOcclusionLocalVolumeShader(options.localLights.shaderDirectory,
++                    qualificationReason);
++            impl->scene.activeOcclusionLocalVolumeShaderReason = qualificationReason ?
++                qualificationReason : "qualified-pinned-local-volume-vs";
++        }
+         if (impl->localLights->IsReady())
+         {
+             if (!prepareLocalShadowScene(backend, impl->scene, impl->localShadows, error))
+--- prestate/MetalR4LocalLightAdapter.cpp
++++ draft/MetalR4LocalLightAdapter.cpp
+@@ -205,6 +205,57 @@
+ }
+ } // namespace
+ 
++void BuildMetalR4LocalLightCameraViewProjection(
++    const std::array<float, 16>& view,
++    const std::array<float, 16>& projection,
++    std::array<float, 16>& viewProjection)
++{
++    Matrix4 viewMatrix{};
++    Matrix4 projectionMatrix{};
++    std::memcpy(viewMatrix.e, view.data(), sizeof(viewMatrix.e));
++    std::memcpy(projectionMatrix.e, projection.data(), sizeof(projectionMatrix.e));
++    const Matrix4 result = multiply(projectionMatrix, viewMatrix);
++    std::memcpy(viewProjection.data(), result.e, sizeof(result.e));
++}
++
++void BuildMetalR4LocalLightModel(const R4EngineLocalLight& light,
++    std::array<float, 16>& model, std::array<float, 4>* localPositionAbsMax)
++{
++    const Matrix4 result = localLightModel(light);
++    std::memcpy(model.data(), result.e, sizeof(result.e));
++    if (!localPositionAbsMax)
++        return;
++    *localPositionAbsMax = {1.0f, 1.0f, 1.0f, 1.0f};
++    if (light.type == R4EngineLocalLightType::Spot)
++        *localPositionAbsMax = {0.5f, 0.5f, 1.0f, 1.0f};
++    else if (light.type == R4EngineLocalLightType::OmniFace)
++    {
++        *localPositionAbsMax = {0.0f, 0.0f, 0.0f, 1.0f};
++        for (std::size_t i = 0; i < DU_SPHERE_PART_NUMVERTEX; ++i)
++        {
++            (*localPositionAbsMax)[0] = std::max((*localPositionAbsMax)[0],
++                std::abs(du_sphere_part_vertices[i].x));
++            (*localPositionAbsMax)[1] = std::max((*localPositionAbsMax)[1],
++                std::abs(du_sphere_part_vertices[i].y));
++            (*localPositionAbsMax)[2] = std::max((*localPositionAbsMax)[2],
++                std::abs(du_sphere_part_vertices[i].z));
++        }
++    }
++}
++
++void BuildMetalR4LocalLightWorldViewProjection(
++    const std::array<float, 16>& cameraViewProjection,
++    const std::array<float, 16>& model,
++    std::array<float, 16>& worldViewProjection)
++{
++    Matrix4 camera{};
++    Matrix4 object{};
++    std::memcpy(camera.e, cameraViewProjection.data(), sizeof(camera.e));
++    std::memcpy(object.e, model.data(), sizeof(object.e));
++    const Matrix4 result = multiply(camera, object);
++    std::memcpy(worldViewProjection.data(), result.e, sizeof(result.e));
++}
++
+ struct MetalR4LocalLightAdapter::Impl
+ {
+     std::array<std::shared_ptr<IR4GraphicsPipeline>, 2> maskFront;
+@@ -271,6 +322,8 @@
+ bool MetalR4LocalLightAdapter::Prepare(IR4Backend& backend, const Options& options, std::string& status)
+ {
+     m_ready = false; m_status.clear(); m_telemetry = {}; m_impl = std::make_unique<Impl>();
++    const char* activeOcclusion = std::getenv("XRAY_METAL_ACTIVE_OCCLUSION");
++    m_activeOcclusionTransformsRequested = activeOcclusion && std::strcmp(activeOcclusion, "1") == 0;
+     if (options.shaderDirectory.empty()) { m_status = "local lights not configured"; status = m_status; return true; }
+     std::string error;
+     if (!xray::metal::ValidateR4LocalLightMscBundle(options.shaderDirectory, error))
+@@ -426,7 +479,13 @@
+     if (unavailableForDraw(view, snapshot)) { ++m_telemetry.skippedUnavailable; return true; }
+     if (!inputs.position || !inputs.diffuse || !inputs.staticGlobals || !inputs.noFilterSampler || !inputs.linearSampler)
+     { error = "local-light adapter is ready but owned G-buffer bindings are unavailable"; return false; }
+-    Matrix4 viewMatrix; Matrix4 projection; std::memcpy(viewMatrix.e, view.view.data(), sizeof(viewMatrix.e)); std::memcpy(projection.e, view.projection.data(), sizeof(projection.e));
++    Matrix4 viewMatrix; std::memcpy(viewMatrix.e, view.view.data(), sizeof(viewMatrix.e));
++    std::array<float, 16> cameraViewProjectionBytes{};
++    BuildMetalR4LocalLightCameraViewProjection(view.view, view.projection,
++        cameraViewProjectionBytes);
++    Matrix4 cameraViewProjection{};
++    std::memcpy(cameraViewProjection.e, cameraViewProjectionBytes.data(),
++        sizeof(cameraViewProjection.e));
+     auto& lightMarker = state.marker;
+     for (const std::size_t lightIndex : lightIndices)
+     {
+@@ -440,8 +499,22 @@
+         const std::size_t shaderKind = light.type == R4EngineLocalLightType::Spot ? 1u : 0u;
+         const std::size_t volumeKind = light.type == R4EngineLocalLightType::Point ? 0u :
+             (light.type == R4EngineLocalLightType::Spot ? 1u : 2u);
+-        const Matrix4 model = localLightModel(light);
+-        const Matrix4 wvp = multiply(multiply(projection, viewMatrix), model);
++        Matrix4 model{};
++        Matrix4 wvp{};
++        if (m_activeOcclusionTransformsRequested)
++        {
++            std::array<float, 16> modelBytes{};
++            BuildMetalR4LocalLightModel(light, modelBytes);
++            std::memcpy(model.e, modelBytes.data(), sizeof(model.e));
++            std::array<float, 16> wvpBytes{};
++            BuildMetalR4LocalLightWorldViewProjection(cameraViewProjectionBytes, modelBytes, wvpBytes);
++            std::memcpy(wvp.e, wvpBytes.data(), sizeof(wvp.e));
++        }
++        else
++        {
++            model = localLightModel(light);
++            wvp = multiply(cameraViewProjection, model);
++        }
+         if (outsideMetalClip(light.type, wvp)) { ++m_telemetry.culled; continue; }
+         const xray::metal::R4LocalShadowAtlasRecord* shadowRecord = nullptr;
+         if (light.shadowed)
+@@ -485,10 +558,10 @@
+         // (for the spot family) shadow/lightmap transforms plus sss_id. The
+         // unshadowed permutations do not consume a shadow map, but preserving
+         // these live transforms avoids a zero-global ABI shortcut.
+-        const Matrix4 viewProjection = multiply(projection, viewMatrix);
+         const Matrix4 identity{{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}};
+         std::memcpy(psGlobals.data(), wvp.e, sizeof(wvp.e));
+-        std::memcpy(psGlobals.data() + 64u, viewProjection.e, sizeof(viewProjection.e));
++        std::memcpy(psGlobals.data() + 64u, cameraViewProjectionBytes.data(),
++            sizeof(cameraViewProjectionBytes));
+         std::memcpy(psGlobals.data() + 288u,
+             shadowRecord ? shadowRecord->shadowMatrix.data() : identity.e, sizeof(identity.e));
+         std::memcpy(psGlobals.data() + 192u, snapshot->ssfxLightSetup1.data(),
+--- prestate/MetalR4LocalLightAdapter.h
++++ draft/MetalR4LocalLightAdapter.h
+@@ -100,10 +100,28 @@
+ private:
+     std::unique_ptr<Impl> m_impl;
+     bool m_ready = false;
++    bool m_activeOcclusionTransformsRequested = false;
+     std::string m_status;
+     Telemetry m_telemetry;
+ };
+ 
++// Pure helper for the camera VP used by the local-light adapter. It shares the
++// adapter's historical `multiply(projection, view)` implementation so the
++// diagnostic query cannot silently substitute a separately ordered multiply.
++void BuildMetalR4LocalLightCameraViewProjection(
++    const std::array<float, 16>& view,
++    const std::array<float, 16>& projection,
++    std::array<float, 16>& viewProjection);
++
++// These two helpers share the exact model construction and multiply used by
++// the ordinary adapter upload path. They expose numeric provenance only.
++void BuildMetalR4LocalLightModel(const R4EngineLocalLight& light,
++    std::array<float, 16>& model, std::array<float, 4>* localPositionAbsMax = nullptr);
++void BuildMetalR4LocalLightWorldViewProjection(
++    const std::array<float, 16>& cameraViewProjection,
++    const std::array<float, 16>& model,
++    std::array<float, 16>& worldViewProjection);
++
+ bool RunMetalR4LocalLightAdapterSelfTest(std::string& error);
+ 
+ // Conservative world AABB of the exact accumulator mesh/model, not the lamp

@@ -1,0 +1,54 @@
+--- prestate/R4ActiveOcclusionCatalogSelectionProbe.cpp	2026-09-29 19:36:48
++++ draft/tests/R4ActiveOcclusionCatalogSelectionProbe.cpp	2026-09-29 19:38:46
+@@ -89,6 +89,51 @@
+         paired.Triangles()[0].mateTriangleId != 1u || paired.Triangles()[1].mateTriangleId != 0u)
+         return fail("reciprocal exact source pair survives catalog build");
+ 
++    // The production edge collector has one mate hint per triangle. On a fan,
++    // later reciprocal edges can overwrite an earlier neighbor. Normalize only
++    // the final hints: retain surviving reciprocal pairs and leave source data
++    // byte-for-byte equivalent at the field level.
++    std::array<SourceTriangle, 3> fan = {
++        triangle(42u, 0u, 2u), triangle(42u, 1u, 0u), triangle(42u, 2u, 0u)};
++    const auto fanBefore = fan;
++    if (NormalizeReciprocalMateHints(fan.data(), fan.size()) != 1u ||
++        fan[0].mateTriangleId != 2u || fan[1].mateTriangleId != kNoMateTriangle ||
++        fan[2].mateTriangleId != 0u)
++        return fail("fan overwrite clears only stale directed hint");
++    for (std::size_t i = 0u; i < fan.size(); ++i)
++        if (fan[i].visualId != fanBefore[i].visualId || fan[i].triangleId != fanBefore[i].triangleId ||
++            fan[i].sourceVertexIds != fanBefore[i].sourceVertexIds ||
++            fan[i].positions != fanBefore[i].positions)
++            return fail("normalization never edits visual, triangle, index, or position data");
++
++    // A three-triangle edge chain leaves the first link stale after the middle
++    // triangle takes its later neighbor; the final reciprocal pair survives.
++    std::array<SourceTriangle, 3> chain = {
++        triangle(43u, 0u, 1u), triangle(43u, 1u, 2u), triangle(43u, 2u, 1u)};
++    if (NormalizeReciprocalMateHints(chain.data(), chain.size()) != 1u ||
++        chain[0].mateTriangleId != kNoMateTriangle || chain[1].mateTriangleId != 2u ||
++        chain[2].mateTriangleId != 1u)
++        return fail("chain retains only final reciprocal source pair");
++
++    // A producer edge with three incident triangles is intentionally left
++    // unpaired by the exact edge collector. Normalization must not synthesize
++    // a mate or alter the unambiguous empty result.
++    std::array<SourceTriangle, 3> nonManifold = {
++        triangle(44u, 0u), triangle(44u, 1u), triangle(44u, 2u)};
++    if (NormalizeReciprocalMateHints(nonManifold.data(), nonManifold.size()) != 0u ||
++        nonManifold[0].mateTriangleId != kNoMateTriangle ||
++        nonManifold[1].mateTriangleId != kNoMateTriangle ||
++        nonManifold[2].mateTriangleId != kNoMateTriangle)
++        return fail("non-manifold edge contributes no synthesized pair");
++
++    std::array<SourceTriangle, 3> malformed = {
++        triangle(45u, 0u, 0u), triangle(45u, 1u, 99u), triangle(45u, 2u, 1u)};
++    if (NormalizeReciprocalMateHints(malformed.data(), malformed.size()) != 3u ||
++        malformed[0].mateTriangleId != kNoMateTriangle ||
++        malformed[1].mateTriangleId != kNoMateTriangle ||
++        malformed[2].mateTriangleId != kNoMateTriangle)
++        return fail("self, out-of-range, and newly nonreciprocal links fail open");
++
+     std::vector<VisualRange> brokenRanges = {{41u, 0u, 2u}};
+     std::vector<SourceTriangle> brokenTriangles = {triangle(41u, 0u, 1u), triangle(41u, 1u)};
+     if (paired.Build(std::move(brokenRanges), std::move(brokenTriangles)) !=

@@ -1,0 +1,939 @@
+--- prestate/IR4Backend.h
++++ src/Layers/xrRenderMetal/IR4Backend.h
+@@ -53,6 +53,31 @@
+     std::shared_ptr<IR4Buffer> buffer;
+     std::size_t offset = 0;
+     std::size_t size = 0;
++    // Unique backend acquisition that created this immutable upload range.
++    // Zero denotes a slice with no native acquisition proof.
++    std::uint64_t acquireEpoch = 0;
++};
++
++// Narrow native skin dispatch description. The canonical input is immutable
++// 88-byte scalar-array records decoded and validated by the caller. Its bone
++// indices must be below boneCount; maxReferencedBoneIndex is trusted metadata
++// only after validating every canonical record. Output is exactly the
++// existing 36-byte SKIN_0 stream. The canonical buffer must outlive the
++// acquired frame and must not be an arena upload slice. The backend validates every resource span
++// and the full job batch before it encodes any writes.
++struct R4ComputeSkinJob
++{
++    std::shared_ptr<IR4Buffer> canonicalInput;
++    std::size_t inputOffset = 0;
++    std::size_t inputSize = 0;
++    R4FrameBufferSlice bones;
++    std::shared_ptr<IR4Buffer> output;
++    std::size_t outputOffset = 0;
++    std::size_t outputSize = 0;
++    std::uint32_t vertexCount = 0;
++    std::uint32_t influenceCount = 0;
++    std::uint32_t boneCount = 0;
++    std::uint32_t maxReferencedBoneIndex = 0;
+ };
+ 
+ // Value-only gameplay state captured after the actor update and before the
+@@ -556,6 +581,14 @@
+     // constants and at least 16 bytes for vertex/instance streams.
+     virtual bool UploadFrameData(const void* data, std::size_t size,
+         std::size_t alignment, R4FrameBufferSlice& slice, std::string& error) = 0;
++    // Unsupported by default so other backends retain their CPU fallback.
++    // Contract for every implementation: a false return means that no compute
++    // skin output write was encoded. Validate/preallocate before the first
++    // dispatch; after dispatch starts, return true and let asynchronous GPU
++    // command-buffer failures follow the backend's existing fatal path.
++    virtual bool EncodeComputeSkinJobs(const std::vector<R4ComputeSkinJob>&,
++        std::string& error)
++    { error = "compute skinning is unsupported by this backend"; return false; }
+     virtual bool SubmitFrame(std::string& error) = 0;
+     // A transient drawable loss at late submit discards the unsubmitted frame.
+     // Retry preserves device readiness; no history or serial was committed.
+@@ -651,6 +684,7 @@
+ // E02 GPU ownership probe. The old-path mode intentionally returns false when
+ // the pre-submit Shared-buffer overwrite is reproduced.
+ bool RunMetalR4FrameUploadGpuProbe(bool oldPath, std::string& error);
++bool RunMetalR4ComputeSkinBackendGpuProbe(std::string& error);
+ // Small offscreen regression for abort/replay ownership and bounded recovery.
+ bool RunMetalR4PrivateUploadRecoveryProbe(std::string& error);
+ 
+--- prestate/MetalR4Backend.mm
++++ src/Layers/xrRenderMetal/MetalR4Backend.mm
+@@ -42,6 +42,9 @@
+ #include "MetalUIOverlayCommon.h"
+ #include "R4LightMarker.h"
+ #include "R4DdsTexture.h"
++#include "R4ComputeSkinFoundation.h"
++#include "R4ComputeSkinMetal.h"
++#include "R4ComputeSkinSource.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -763,12 +766,23 @@
+     {
+         m_activeBlock = 0;
+         m_offset = 0;
++        m_acquireEpoch = 0;
++        m_trackUploads = false;
++        for (Block& block : m_blocks)
++            block.uploadedRanges.clear();
++    }
++    void BeginAcquisition(std::uint64_t acquireEpoch, bool trackUploads)
++    {
++        Reset();
++        m_acquireEpoch = acquireEpoch;
++        m_trackUploads = trackUploads && acquireEpoch != 0;
+     }
+     void Clear()
+     {
+         m_blocks.clear();
+         m_totalCapacity = 0;
+         Reset();
++        m_trackUploads = false;
+     }
+ 
+     bool Upload(id<MTLDevice> device, const void* data, std::size_t size,
+@@ -803,7 +817,17 @@
+                         std::memcpy(static_cast<std::uint8_t*>(block.buffer->Native().contents) +
+                                 aligned, data, size);
+                         m_offset = aligned + size;
+-                        slice = {block.buffer, aligned, size};
++                        slice = {block.buffer, aligned, size, m_acquireEpoch};
++                        if (m_trackUploads)
++                        {
++                            try { block.uploadedRanges.push_back({aligned, size}); }
++                            catch (...)
++                            {
++                                slice = {};
++                                error = "frame upload ownership metadata allocation failed";
++                                return false;
++                            }
++                        }
+                         return true;
+                     }
+                 }
+@@ -838,17 +862,43 @@
+     }
+ 
+     std::size_t Capacity() const { return m_totalCapacity; }
++    std::uint64_t AcquireEpoch() const { return m_acquireEpoch; }
++
++    // A current frame upload is authorized only for the exact bytes copied by
++    // Upload. Alignment gaps and enclosing superspans never qualify.
++    bool OwnsUploadedRange(id<MTLBuffer> native, std::size_t offset,
++        std::size_t size, std::uint64_t acquireEpoch) const
++    {
++        if (!m_trackUploads || !native || size == 0 || acquireEpoch == 0 ||
++            acquireEpoch != m_acquireEpoch)
++            return false;
++        for (const Block& block : m_blocks)
++        {
++            if (block.buffer->Native() != native)
++                continue;
++            const auto found = std::lower_bound(block.uploadedRanges.begin(),
++                block.uploadedRanges.end(), offset,
++                [](const UploadedRange& range, std::size_t value) { return range.offset < value; });
++            return found != block.uploadedRanges.end() && found->offset == offset &&
++                found->size == size;
++        }
++        return false;
++    }
+ 
+ private:
++    struct UploadedRange { std::size_t offset = 0, size = 0; };
+     struct Block
+     {
+         std::shared_ptr<MetalBuffer> buffer;
+         std::size_t capacity = 0;
++        std::vector<UploadedRange> uploadedRanges;
+     };
+     std::vector<Block> m_blocks;
+     std::size_t m_activeBlock = 0;
+     std::size_t m_offset = 0;
+     std::size_t m_totalCapacity = 0;
++    std::uint64_t m_acquireEpoch = 0;
++    bool m_trackUploads = false;
+ };
+ 
+ class MetalTexture final : public IR4Texture
+@@ -914,10 +964,13 @@
+ public:
+     ~MetalR4Backend() override { Shutdown(); }
+     static bool ProbePrivateUploadRecovery(std::string& error);
++    static bool ProbeComputeSkinBackendGpu(std::string& error);
+ 
+     bool Initialize(SDL_Window* window, const std::uint32_t preferredWidth,
+         const std::uint32_t preferredHeight, std::string& error) override
+     {
++        const char* computeSkinEnv = std::getenv("XRAY_METAL_COMPUTE_SKIN");
++        m_computeSkinEnabled = computeSkinEnv && std::strcmp(computeSkinEnv, "1") == 0;
+         if (m_window || !window)
+         {
+             error = m_window ? "Metal R4 backend is already initialized" : "SDL window is null";
+@@ -1198,6 +1251,14 @@
+         if (!ensurePresentationResources(context, error))
+         {
+             stopE03Capture();
++            context.commandBuffer = nil;
++            context.drawable = nil;
++            dispatch_semaphore_signal(context.available);
++            return R4FrameAcquireResult::Error;
++        }
++
++        if (!beginAcquiredContext(context, error))
++        {
+             context.commandBuffer = nil;
+             context.drawable = nil;
+             dispatch_semaphore_signal(context.available);
+@@ -1647,6 +1708,226 @@
+             return false;
+         if (m_e01Frames)
+             context.e01UpdatedBytes += size;
++        return true;
++    }
++
++    bool EncodeComputeSkinJobs(const std::vector<R4ComputeSkinJob>& jobs,
++        std::string& error) override
++    {
++        if (!m_computeSkinEnabled)
++        {
++            error = "native compute skinning requires XRAY_METAL_COMPUTE_SKIN=1";
++            return false;
++        }
++        if (!m_frameActive || jobs.empty())
++        {
++            error = jobs.empty() ? "compute skinning job batch is empty" :
++                "compute skinning requires an active acquired frame";
++            return false;
++        }
++        FrameContext& context = m_frames[m_activeFrameIndex];
++        if (!context.commandBuffer || context.encoder)
++        {
++            error = "compute skinning requires an idle frame command buffer outside render/queued upload encoders";
++            return false;
++        }
++
++        struct ValidatedJob
++        {
++            const R4ComputeSkinJob* job = nullptr;
++            std::shared_ptr<MetalBuffer> input;
++            std::shared_ptr<MetalBuffer> bones;
++            std::shared_ptr<MetalBuffer> output;
++            id<MTLBuffer> inputNative = nil;
++            id<MTLBuffer> bonesNative = nil;
++            id<MTLBuffer> outputNative = nil;
++            std::size_t inputBytes = 0;
++            std::size_t boneBytes = 0;
++            std::size_t outputBytes = 0;
++        };
++        struct BufferRange { id<MTLBuffer> native; std::size_t begin, end; };
++        std::vector<ValidatedJob> validated;
++        std::vector<BufferRange> outputs;
++        std::vector<BufferRange> reads;
++        if (jobs.size() > std::numeric_limits<std::size_t>::max() / 6u)
++        {
++            error = "compute skinning batch is too large to validate safely";
++            return false;
++        }
++        try
++        {
++            validated.reserve(jobs.size());
++            outputs.reserve(jobs.size());
++            reads.reserve(jobs.size() * 2u);
++        }
++        catch (...)
++        {
++            error = "compute skinning validation metadata allocation failed";
++            return false;
++        }
++
++        const std::uint64_t acquireEpoch = context.uploadArena.AcquireEpoch();
++        const auto checkedSpan = [](std::size_t offset, std::size_t length,
++            std::size_t logicalSize, NSUInteger nativeSize, std::size_t& end) {
++            if (length == 0 || offset > std::numeric_limits<std::size_t>::max() - length)
++                return false;
++            end = offset + length;
++            return end <= logicalSize && end <= static_cast<std::size_t>(nativeSize);
++        };
++        const auto checkedProduct = [](std::size_t left, std::size_t right,
++            std::size_t& result) {
++            if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right)
++                return false;
++            result = left * right;
++            return true;
++        };
++        const auto overlaps = [](const BufferRange& left, const BufferRange& right) {
++            return left.native == right.native && left.begin < right.end && right.begin < left.end;
++        };
++
++        // Validate all resources and every write/write and write/read alias
++        // before a command encoder is created or any output can be dispatched.
++        for (std::size_t index = 0; index < jobs.size(); ++index)
++        {
++            const R4ComputeSkinJob& job = jobs[index];
++            ValidatedJob item;
++            item.job = &job;
++            item.input = std::dynamic_pointer_cast<MetalBuffer>(job.canonicalInput);
++            item.bones = std::dynamic_pointer_cast<MetalBuffer>(job.bones.buffer);
++            item.output = std::dynamic_pointer_cast<MetalBuffer>(job.output);
++            std::size_t end = 0;
++            if (!item.input || !item.bones || !item.output || !job.canonicalInput ||
++                !job.bones.buffer || !job.output || job.vertexCount == 0 ||
++                job.influenceCount < 1 || job.influenceCount > 4 || job.boneCount == 0 ||
++                job.maxReferencedBoneIndex >= job.boneCount)
++            {
++                error = "compute skinning job " + std::to_string(index) +
++                    " has missing resources or invalid counts/bone metadata";
++                return false;
++            }
++            if (!checkedProduct(job.vertexCount, 88u, item.inputBytes) ||
++                !checkedProduct(job.boneCount, 64u, item.boneBytes) ||
++                !checkedProduct(job.vertexCount, 36u, item.outputBytes) ||
++                job.inputSize != item.inputBytes || job.outputSize != item.outputBytes)
++            {
++                error = "compute skinning job " + std::to_string(index) +
++                    " has inconsistent or overflowing canonical/input/output byte counts";
++                return false;
++            }
++            item.inputNative = item.input->Native();
++            item.bonesNative = item.bones->Native();
++            item.outputNative = item.output->Native();
++            if (!item.inputNative || !item.bonesNative || !item.outputNative ||
++                item.inputNative.device != m_device || item.bonesNative.device != m_device ||
++                item.outputNative.device != m_device ||
++                item.input->IsFrameUpload() ||
++                item.output->Storage() != R4ResourceStorage::Private ||
++                !item.bones->IsFrameUpload() || job.bones.acquireEpoch == 0 ||
++                job.bones.acquireEpoch != acquireEpoch || job.bones.size < item.boneBytes ||
++                !context.uploadArena.OwnsUploadedRange(item.bonesNative, job.bones.offset,
++                    job.bones.size, job.bones.acquireEpoch))
++            {
++                error = "compute skinning job " + std::to_string(index) +
++                    " uses an ephemeral canonical input, stale/foreign resource, or non-current bone upload";
++                return false;
++            }
++            std::size_t inputEnd = 0, bonesEnd = 0, outputEnd = 0;
++            if (!checkedSpan(job.inputOffset, item.inputBytes, item.input->Size(),
++                    item.inputNative.length, inputEnd) ||
++                !checkedSpan(job.bones.offset, job.bones.size, item.bones->Size(),
++                    item.bonesNative.length, bonesEnd) ||
++                !checkedSpan(job.outputOffset, item.outputBytes, item.output->Size(),
++                    item.outputNative.length, outputEnd))
++            {
++                error = "compute skinning job " + std::to_string(index) +
++                    " resource span is out of bounds or overflows";
++                return false;
++            }
++            if ((job.inputOffset & 3u) != 0 || (job.bones.offset & 3u) != 0 ||
++                (job.outputOffset & 3u) != 0)
++            {
++                error = "compute skinning job " + std::to_string(index) +
++                    " resource offsets are not float aligned";
++                return false;
++            }
++            item.bonesNative = item.bones->Native();
++            reads.push_back({item.inputNative, job.inputOffset, inputEnd});
++            reads.push_back({item.bonesNative, job.bones.offset, bonesEnd});
++            outputs.push_back({item.outputNative, job.outputOffset, outputEnd});
++            validated.push_back(std::move(item));
++        }
++        for (std::size_t outputIndex = 0; outputIndex < outputs.size(); ++outputIndex)
++        {
++            for (std::size_t otherOutput = 0; otherOutput < outputIndex; ++otherOutput)
++                if (overlaps(outputs[outputIndex], outputs[otherOutput]))
++                {
++                    error = "compute skinning output spans overlap";
++                    return false;
++                }
++            for (const BufferRange& read : reads)
++                if (overlaps(outputs[outputIndex], read))
++                {
++                    error = "compute skinning output aliases an input or bone upload";
++                    return false;
++                }
++        }
++
++        if (!ensureComputeSkinPipeline(error))
++            return false;
++        try
++        {
++            const std::size_t extraOwners = jobs.size() * 6u;
++            const std::size_t extraResources = jobs.size() * 6u;
++            if (extraOwners > std::numeric_limits<std::size_t>::max() - context.retainedOwners.size() ||
++                extraResources > std::numeric_limits<std::size_t>::max() - context.retainedResources.size())
++            {
++                error = "compute skinning retained-resource count overflow";
++                return false;
++            }
++            context.retainedOwners.reserve(context.retainedOwners.size() + extraOwners);
++            context.retainedResources.reserve(context.retainedResources.size() + extraResources);
++            for (const ValidatedJob& item : validated)
++            {
++                retainFrameResource(context, item.input);
++                retainFrameResource(context, item.input->VersionHandle());
++                retainFrameResource(context, item.bones);
++                retainFrameResource(context, item.bones->VersionHandle());
++                retainFrameResource(context, item.output);
++                retainFrameResource(context, item.output->VersionHandle());
++            }
++        }
++        catch (...)
++        {
++            error = "compute skinning resource retention allocation failed before dispatch";
++            return false;
++        }
++
++        finishPrivateUploads(context);
++        id<MTLComputeCommandEncoder> compute = [context.commandBuffer computeCommandEncoder];
++        if (!compute)
++        {
++            error = "compute skinning encoder creation failed before dispatch";
++            return false;
++        }
++        compute.label = @"R4 canonical compute skin jobs";
++        [compute setComputePipelineState:m_computeSkinPipeline];
++        struct SkinParams { std::uint32_t vertices, influences; };
++        const NSUInteger threadWidth = std::max<NSUInteger>(1u,
++            std::min<NSUInteger>(m_computeSkinPipeline.threadExecutionWidth,
++                m_computeSkinPipeline.maxTotalThreadsPerThreadgroup));
++        for (const ValidatedJob& item : validated)
++        {
++            const R4ComputeSkinJob& job = *item.job;
++            const SkinParams params{job.vertexCount, job.influenceCount};
++            [compute setBuffer:item.inputNative offset:job.inputOffset atIndex:0];
++            [compute setBuffer:item.bonesNative offset:job.bones.offset atIndex:1];
++            [compute setBuffer:item.outputNative offset:job.outputOffset atIndex:2];
++            [compute setBytes:&params length:sizeof(params) atIndex:3];
++            [compute dispatchThreads:MTLSizeMake(job.vertexCount, 1u, 1u)
++                threadsPerThreadgroup:MTLSizeMake(threadWidth, 1u, 1u)];
++        }
++        [compute endEncoding];
++        error.clear();
+         return true;
+     }
+ 
+@@ -3196,7 +3477,12 @@
+             return;
+         }
+         if (!m_window)
++        {
++            m_computeSkinPipeline = nil;
++            m_computeSkinPipelineAttempted = false;
++            m_computeSkinPipelineError.clear();
+             return;
++        }
+ 
+         if (m_frameActive)
+         {
+@@ -3271,6 +3557,9 @@
+         m_uiOverlayPipeline = nil;
+         m_presentPipeline = nil;
+         m_thumbnailPipeline = nil;
++        m_computeSkinPipeline = nil;
++        m_computeSkinPipelineAttempted = false;
++        m_computeSkinPipelineError.clear();
+         {
+             std::lock_guard<std::mutex> lock(m_thumbnailMutex);
+             m_latestThumbnail = {};
+@@ -3791,6 +4080,60 @@
+         std::uint32_t e01PsoBinds = 0;
+     };
+ 
++    bool beginAcquiredContext(FrameContext& context, std::string& error)
++    {
++        if (m_nextFrameAcquireEpoch == std::numeric_limits<std::uint64_t>::max())
++        {
++            error = "native frame acquisition epoch exhausted";
++            return false;
++        }
++        const std::uint64_t epoch = ++m_nextFrameAcquireEpoch;
++        context.uploadArena.BeginAcquisition(epoch, m_computeSkinEnabled);
++        return true;
++    }
++
++    bool ensureComputeSkinPipeline(std::string& error)
++    {
++        if (m_computeSkinPipeline)
++            return true;
++        if (m_computeSkinPipelineAttempted)
++        {
++            error = m_computeSkinPipelineError;
++            return false;
++        }
++        m_computeSkinPipelineAttempted = true;
++        const auto fail = [&](std::string reason) {
++            m_computeSkinPipelineError = std::move(reason);
++            error = m_computeSkinPipelineError;
++            return false;
++        };
++        NSError* libraryError = nil;
++        NSString* source = [NSString stringWithUTF8String:xray::metal::R4ComputeSkinMslSource];
++        MTLCompileOptions* options = xray::metal::R4ComputeSkinCompileOptions();
++        id<MTLLibrary> library = source ? [m_device newLibraryWithSource:source
++            options:options error:&libraryError] : nil;
++        if (!library)
++        {
++            return fail("Metal compute skin source compile failed (" +
++                std::string(xray::metal::R4ComputeSkinSourceSha256) + "): " +
++                describeError(libraryError));
++        }
++        id<MTLFunction> function = [library newFunctionWithName:@"r4_compute_skin"];
++        if (!function)
++        {
++            return fail("canonical compute skin kernel entry point is unavailable");
++        }
++        NSError* pipelineError = nil;
++        id<MTLComputePipelineState> pipeline = [m_device
++            newComputePipelineStateWithFunction:function error:&pipelineError];
++        if (!pipeline)
++        {
++            return fail("Metal compute skin pipeline creation failed: " + describeError(pipelineError));
++        }
++        m_computeSkinPipeline = pipeline;
++        return true;
++    }
++
+     bool ensurePresentationPipelines(std::string& error)
+     {
+         if (m_presentPipeline && m_thumbnailPipeline)
+@@ -4102,6 +4445,14 @@
+     bool m_e03CaptureActive = false;
+     id<MTLRenderPipelineState> m_presentPipeline = nil;
+     id<MTLComputePipelineState> m_thumbnailPipeline = nil;
++    id<MTLComputePipelineState> m_computeSkinPipeline = nil;
++    bool m_computeSkinPipelineAttempted = false;
++    std::string m_computeSkinPipelineError;
++    std::uint64_t m_nextFrameAcquireEpoch = 0;
++    bool m_computeSkinEnabled = [] {
++        const char* value = std::getenv("XRAY_METAL_COMPUTE_SKIN");
++        return value && std::strcmp(value, "1") == 0;
++    }();
+     std::array<FrameContext, MaxFramesInFlight> m_frames;
+     std::vector<PrivateUploadOperation> m_recoverablePrivateUploads;
+     std::size_t m_privateUploadRecoveryFailures = 0;
+@@ -4193,6 +4544,12 @@
+                 return false;
+             }
+             backend.m_activeFrameIndex = 0;
++            if (!backend.beginAcquiredContext(context, error))
++            {
++                context.commandBuffer = nil;
++                dispatch_semaphore_signal(context.available);
++                return false;
++            }
+             backend.m_frameActive = true;
+             context.privateUploads = std::move(backend.m_recoverablePrivateUploads);
+             prunePrivateUploads(context.privateUploads);
+@@ -4478,9 +4835,306 @@
+ }
+ }
+ 
++bool MetalR4Backend::ProbeComputeSkinBackendGpu(std::string& error)
++{
++    @autoreleasepool
++    {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        id<MTLCommandQueue> queue = [device newCommandQueue];
++        if (!device || !queue)
++        {
++            error = "Metal device/queue unavailable for compute skin backend probe";
++            return false;
++        }
++
++        MetalR4Backend backend;
++        backend.m_device = device;
++        backend.m_commandQueue = queue;
++        for (FrameContext& context : backend.m_frames)
++            context.available = dispatch_semaphore_create(1);
++        FrameContext& context = backend.m_frames[0];
++        auto beginManualAcquiredFrame = [&]() {
++            if (backend.m_frameActive || !context.available)
++                return false;
++            dispatch_semaphore_wait(context.available, DISPATCH_TIME_FOREVER);
++            context.commandBuffer = [queue commandBuffer];
++            if (!context.commandBuffer)
++            {
++                dispatch_semaphore_signal(context.available);
++                return false;
++            }
++            backend.m_activeFrameIndex = 0;
++            if (!backend.beginAcquiredContext(context, error))
++            {
++                context.commandBuffer = nil;
++                dispatch_semaphore_signal(context.available);
++                return false;
++            }
++            backend.m_frameActive = true;
++            return true;
++        };
++        auto fail = [&](const std::string& message) {
++            if (error.empty()) error = message;
++            if (backend.m_frameActive) backend.DiscardFrame();
++            return false;
++        };
++        if (!beginManualAcquiredFrame())
++            return fail("compute skin probe could not begin an acquired frame");
++
++        constexpr std::size_t VertexCount = 4;
++        constexpr std::size_t InputBytes = VertexCount * sizeof(xray::metal::R4ComputeSkinVertex);
++        constexpr std::size_t OutputStride = 36;
++        constexpr std::size_t OutputBytes = VertexCount * OutputStride;
++        using InputVertex = xray::metal::R4ComputeSkinVertex;
++        std::array<InputVertex, VertexCount> source{};
++        constexpr std::array<std::array<float, 4>, VertexCount> weights{{
++            {{1.0f, 0.0f, 0.0f, 0.0f}},
++            {{0.25f, 0.75f, 0.0f, 0.0f}},
++            {{0.25f, 0.25f, 0.5f, 0.0f}},
++            {{0.125f, 0.25f, 0.25f, 0.375f}},
++        }};
++        std::array<float, 4 * 16> boneMatrices{};
++        for (std::size_t bone = 0; bone < 4; ++bone)
++        {
++            float* matrix = boneMatrices.data() + bone * 16;
++            matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
++            matrix[12] = static_cast<float>(bone);
++        }
++        for (std::size_t vertex = 0; vertex < source.size(); ++vertex)
++        {
++            InputVertex& value = source[vertex];
++            value.position[0] = 0.25f; value.position[1] = 0.5f; value.position[2] = 0.75f;
++            value.normal[1] = 1.0f;
++            value.tangent[0] = 1.0f;
++            value.binormal[2] = 1.0f;
++            value.texcoord[0] = 0.125f; value.texcoord[1] = 0.875f;
++            for (std::size_t influence = 0; influence < 4; ++influence)
++            {
++                value.bones[influence] = static_cast<std::uint32_t>(influence);
++                value.weights[influence] = weights[vertex][influence];
++            }
++        }
++        R4BufferDesc inputDesc{InputBytes, R4ResourceStorage::Shared,
++            R4BufferUsage::Generic, "R4 compute skin backend canonical probe input"};
++        auto input = backend.CreateBuffer(inputDesc, source.data(), InputBytes, error);
++        if (!input) return fail("compute skin probe canonical input allocation failed: " + error);
++        R4FrameBufferSlice bones;
++        if (!backend.UploadFrameData(boneMatrices.data(), sizeof(boneMatrices), 256u, bones, error))
++            return fail("compute skin probe bone upload failed: " + error);
++        const std::uint64_t firstAcquireEpoch = bones.acquireEpoch;
++        if (firstAcquireEpoch == 0 || firstAcquireEpoch != context.uploadArena.AcquireEpoch())
++            return fail("compute skin probe upload did not stamp the production acquired epoch");
++        std::array<std::uint8_t, 16> gapUpload{};
++        R4FrameBufferSlice afterGap;
++        if (!backend.UploadFrameData(gapUpload.data(), gapUpload.size(), 512u, afterGap, error))
++            return fail("compute skin probe could not create an alignment gap: " + error);
++        R4FrameBufferSlice ephemeralCanonical;
++        if (!backend.UploadFrameData(source.data(), sizeof(InputVertex), 16u,
++                ephemeralCanonical, error))
++            return fail("compute skin probe could not stage an ephemeral canonical input: " + error);
++
++        R4BufferDesc outputDesc{OutputBytes, R4ResourceStorage::Private,
++            R4BufferUsage::Vertex, "R4 compute skin backend private probe output"};
++        auto output = backend.CreateBuffer(outputDesc, nullptr, 0, error);
++        if (!output) return fail("compute skin probe output allocation failed: " + error);
++        std::array<std::uint8_t, OutputBytes> sentinel{};
++        sentinel.fill(0xcd);
++        if (!backend.UpdateBuffer(output, 0, sentinel.data(), sentinel.size(), error))
++            return fail("compute skin probe sentinel upload failed: " + error);
++
++        std::vector<R4ComputeSkinJob> jobs;
++        jobs.reserve(VertexCount);
++        for (std::size_t vertex = 0; vertex < VertexCount; ++vertex)
++        {
++            R4ComputeSkinJob job;
++            job.canonicalInput = input;
++            job.inputOffset = vertex * sizeof(InputVertex);
++            job.inputSize = sizeof(InputVertex);
++            job.bones = bones;
++            job.output = output;
++            job.outputOffset = vertex * OutputStride;
++            job.outputSize = OutputStride;
++            job.vertexCount = 1;
++            job.influenceCount = static_cast<std::uint32_t>(vertex + 1u);
++            job.boneCount = 4;
++            job.maxReferencedBoneIndex = static_cast<std::uint32_t>(vertex);
++            jobs.push_back(std::move(job));
++        }
++
++        // Each rejection uses the production validator and leaves the same
++        // private sentinel untouched. The range case points at an alignment gap.
++        std::vector<R4ComputeSkinJob> rejected{jobs[0]};
++        rejected[0].bones.acquireEpoch = firstAcquireEpoch - 1u;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted a stale acquisition epoch");
++        rejected[0] = jobs[0];
++        rejected[0].bones.offset = bones.offset + 256u;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted an unowned alignment-gap span");
++        rejected = {jobs[0], jobs[1]};
++        rejected[1].outputOffset = rejected[0].outputOffset;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted overlapping output spans");
++        rejected = {jobs[0]};
++        rejected[0].canonicalInput = ephemeralCanonical.buffer;
++        rejected[0].inputOffset = ephemeralCanonical.offset;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted an arena slice as canonical geometry input");
++
++        R4BufferDesc aliasInputDesc{InputBytes, R4ResourceStorage::Private,
++            R4BufferUsage::Generic, "R4 compute skin native alias probe"};
++        auto aliasInput = backend.CreateBuffer(aliasInputDesc, source.data(), InputBytes, error);
++        if (!aliasInput) return fail("compute skin alias input allocation failed: " + error);
++        const auto aliasMetalInput = std::dynamic_pointer_cast<MetalBuffer>(aliasInput);
++        auto aliasOutput = std::make_shared<MetalBuffer>(aliasMetalInput->Native(),
++            aliasInputDesc, aliasMetalInput->AllocationSize());
++        rejected[0] = jobs[0];
++        rejected[0].canonicalInput = aliasInput;
++        rejected[0].inputOffset = 0;
++        rejected[0].output = aliasOutput;
++        rejected[0].outputOffset = 0;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted aliased native input/output wrappers");
++
++        rejected = jobs;
++        rejected[1].influenceCount = 5;
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted a batch with an invalid second job");
++
++        [backend.m_frames[0].uploadBlit endEncoding];
++        backend.m_frames[0].uploadBlit = nil;
++        id<MTLBuffer> invalidReadback = [device newBufferWithLength:OutputBytes
++            options:MTLResourceStorageModeShared];
++        id<MTLBuffer> resultReadback = [device newBufferWithLength:OutputBytes
++            options:MTLResourceStorageModeShared];
++        if (!invalidReadback || !resultReadback)
++            return fail("compute skin probe readback allocation failed");
++        id<MTLBlitCommandEncoder> before = [context.commandBuffer blitCommandEncoder];
++        if (!before) return fail("compute skin probe pre-dispatch readback encoder failed");
++        [before copyFromBuffer:std::dynamic_pointer_cast<MetalBuffer>(output)->Native()
++            sourceOffset:0 toBuffer:invalidReadback destinationOffset:0 size:OutputBytes];
++        [before endEncoding];
++
++        error.clear();
++        if (!backend.EncodeComputeSkinJobs(jobs, error))
++            return fail("production compute skin batch encode failed: " + error);
++        id<MTLBlitCommandEncoder> after = [context.commandBuffer blitCommandEncoder];
++        if (!after) return fail("compute skin probe post-dispatch readback encoder failed");
++        [after copyFromBuffer:std::dynamic_pointer_cast<MetalBuffer>(output)->Native()
++            sourceOffset:0 toBuffer:resultReadback destinationOffset:0 size:OutputBytes];
++        [after endEncoding];
++        id<MTLCommandBuffer> command = context.commandBuffer;
++        [command commit];
++        [command waitUntilCompleted];
++        if (command.status != MTLCommandBufferStatusCompleted)
++            return fail("compute skin backend GPU probe command failed: " + describeError(command.error));
++        context.privateUploads.clear(); // These staged writes completed with this probe command.
++
++        const auto* sentinelResult = static_cast<const std::uint8_t*>(invalidReadback.contents);
++        if (!std::equal(sentinel.begin(), sentinel.end(), sentinelResult))
++            return fail("rejected compute skin batch modified output before dispatch");
++
++        struct ExpectedOutput
++        {
++            float position[4];
++            std::uint8_t normal[4], tangent[4], binormal[4];
++            float texcoord[2];
++        };
++        static_assert(sizeof(ExpectedOutput) == OutputStride, "compute skin output ABI");
++        const auto* result = static_cast<const std::uint8_t*>(resultReadback.contents);
++        constexpr std::array<float, VertexCount> expectedX{{0.25f, 1.0f, 1.5f, 2.125f}};
++        for (std::size_t vertex = 0; vertex < VertexCount; ++vertex)
++        {
++            ExpectedOutput actual{};
++            std::memcpy(&actual, result + vertex * OutputStride, sizeof(actual));
++            if (actual.position[0] != expectedX[vertex] || actual.position[1] != 0.5f ||
++                actual.position[2] != 0.75f || actual.position[3] != 1.0f ||
++                actual.normal[0] != 127 || actual.normal[1] != 255 ||
++                actual.normal[2] != 127 || actual.normal[3] != 0 ||
++                actual.tangent[0] != 127 || actual.tangent[1] != 127 ||
++                actual.tangent[2] != 255 || actual.tangent[3] != 0 ||
++                actual.binormal[0] != 255 || actual.binormal[1] != 127 ||
++                actual.binormal[2] != 127 || actual.binormal[3] != 0 ||
++                actual.texcoord[0] != 0.125f || actual.texcoord[1] != 0.875f)
++                return fail("compute skin backend output differed from the canonical CPU expectation");
++        }
++
++        const R4ComputeSkinJob staleJob = jobs[0];
++        R4ComputeSkinJob staleCanonicalJob = jobs[0];
++        staleCanonicalJob.canonicalInput = ephemeralCanonical.buffer;
++        staleCanonicalJob.inputOffset = ephemeralCanonical.offset;
++        backend.DiscardFrame();
++        if (context.uploadArena.AcquireEpoch() != 0)
++            return fail("discard did not clear the acquired frame epoch");
++        if (!beginManualAcquiredFrame())
++            return fail("compute skin probe could not reacquire after discard");
++        rejected = {staleJob};
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted a prior-acquisition bone slice");
++        rejected = {staleCanonicalJob};
++        error.clear();
++        if (backend.EncodeComputeSkinJobs(rejected, error))
++            return fail("compute skin backend accepted a stale arena slice as canonical input");
++        backend.DiscardFrame();
++
++        // Model the real no-drawable retry point: BeginFrame resets the arena,
++        // returns Retry, and does not call beginAcquiredContext. The following
++        // successful acquisition must receive a fresh epoch, including slot wrap.
++        std::uint64_t previousEpoch = firstAcquireEpoch;
++        FrameContext& retryContext = backend.m_frames[0];
++        retryContext.uploadArena.Reset(); // Drawable retry returns here without stamping a new epoch.
++        if (retryContext.uploadArena.AcquireEpoch() != 0)
++            return fail("drawable retry retained an old native acquisition epoch");
++        const std::array<std::size_t, 4> slotOrder{{0u, 1u, 2u, 0u}};
++        for (std::size_t slot : slotOrder)
++        {
++            FrameContext& slotContext = backend.m_frames[slot];
++            slotContext.uploadArena.Reset();
++            if (slotContext.uploadArena.AcquireEpoch() != 0 ||
++                !backend.beginAcquiredContext(slotContext, error))
++                return fail("retry/slot-wrap acquisition helper failed");
++            const std::uint64_t nextEpoch = slotContext.uploadArena.AcquireEpoch();
++            if (nextEpoch <= previousEpoch)
++                return fail("retry or slot wrap reused a prior native acquisition epoch");
++            previousEpoch = nextEpoch;
++            slotContext.uploadArena.Reset();
++        }
++        error.clear();
++        return true;
++    }
++}
++
+ bool RunMetalR4PrivateUploadRecoveryProbe(std::string& error)
+ {
+     return MetalR4Backend::ProbePrivateUploadRecovery(error);
++}
++
++bool RunMetalR4ComputeSkinBackendGpuProbe(std::string& error)
++{
++    const char* current = std::getenv("XRAY_METAL_COMPUTE_SKIN");
++    const bool hadValue = current != nullptr;
++    const std::string oldValue = current ? current : "";
++    if (::setenv("XRAY_METAL_COMPUTE_SKIN", "1", 1) != 0)
++    {
++        error = "compute skin probe could not enable the opt-in backend path";
++        return false;
++    }
++    const bool passed = MetalR4Backend::ProbeComputeSkinBackendGpu(error);
++    const int restored = hadValue ? ::setenv("XRAY_METAL_COMPUTE_SKIN", oldValue.c_str(), 1) :
++        ::unsetenv("XRAY_METAL_COMPUTE_SKIN");
++    if (restored != 0 && passed)
++    {
++        error = "compute skin probe could not restore XRAY_METAL_COMPUTE_SKIN";
++        return false;
++    }
++    return passed;
+ }
+ 
+ std::unique_ptr<IR4Backend> CreateMetalR4Backend()
+--- prestate/CMakeLists.txt
++++ src/Layers/xrRenderMetal/CMakeLists.txt
+@@ -8,6 +8,17 @@
+ endif()
+ 
+ include(CTest)
++
++# Embed the canonical production skin kernel at configure time. A changed MSL
++# source must trigger reconfiguration before the backend can rebuild.
++set(R4_COMPUTE_SKIN_MSL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/R4ComputeSkin.metal")
++set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${R4_COMPUTE_SKIN_MSL_PATH}")
++file(SHA256 "${R4_COMPUTE_SKIN_MSL_PATH}" R4_COMPUTE_SKIN_SHA256)
++file(READ "${R4_COMPUTE_SKIN_MSL_PATH}" R4_COMPUTE_SKIN_MSL)
++set(R4_COMPUTE_SKIN_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
++file(MAKE_DIRECTORY "${R4_COMPUTE_SKIN_GENERATED_DIR}")
++configure_file(R4ComputeSkinSource.h.in
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}/R4ComputeSkinSource.h" @ONLY)
+ 
+ add_executable(XRay.Metal.LightHomBoundsProbe tests/R4LightHomBoundsProbe.cpp)
+ target_compile_features(XRay.Metal.LightHomBoundsProbe PRIVATE cxx_std_17)
+@@ -83,6 +94,8 @@
+   R4DefVertexFoundation.h
+   R4DefObjectsLodFoundation.cpp
+   R4DefObjectsLodFoundation.h
++  R4ComputeSkinFoundation.cpp
++  R4ComputeSkinFoundation.h
+   MetalR4EngineFs.cpp
+   MetalR4EngineFs.h
+   MetalR4UiVideo.cpp
+@@ -109,11 +122,14 @@
+   IR4Backend.h
+   IR4Pipeline.h
+   IR4Resources.h
++  R4ComputeSkinMetal.h
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}/R4ComputeSkinSource.h"
+ )
+ target_compile_options(XRay.Metal.R4Backend PRIVATE -fobjc-arc)
+ target_compile_features(XRay.Metal.R4Backend PUBLIC cxx_std_17)
+ target_include_directories(XRay.Metal.R4Backend PUBLIC
+   ${CMAKE_CURRENT_SOURCE_DIR}
++  "${R4_COMPUTE_SKIN_GENERATED_DIR}"
+   /opt/homebrew/include/SDL2
+ )
+ target_link_libraries(XRay.Metal.R4Backend PUBLIC
+@@ -268,7 +284,6 @@
+ # oracle compares its output against the existing CPU repack implementation.
+ add_executable(XRay.Metal.ComputeSkinGpuProbe
+   tests/R4ComputeSkinGpuProbe.mm
+-  R4ComputeSkinFoundation.cpp
+ )
+ target_compile_features(XRay.Metal.ComputeSkinGpuProbe PRIVATE cxx_std_17)
+ target_compile_options(XRay.Metal.ComputeSkinGpuProbe PRIVATE -fobjc-arc)
+@@ -280,6 +295,30 @@
+ )
+ add_test(NAME XRay.Metal.ComputeSkin.GpuOracle
+   COMMAND XRay.Metal.ComputeSkinGpuProbe --self-test
++)
++
++add_executable(XRay.Metal.ComputeSkinBoundsProbe
++  tests/R4ComputeSkinBoundsProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.ComputeSkinBoundsProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.ComputeSkinBoundsProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.ComputeSkin.Bounds
++  COMMAND XRay.Metal.ComputeSkinBoundsProbe
++)
++
++add_executable(XRay.Metal.ComputeSkinBackendGpuProbe
++  tests/R4ComputeSkinBackendGpuProbe.cpp
++  tests/R4LocalLightRolloverGpuSupport.cpp
++)
++target_compile_features(XRay.Metal.ComputeSkinBackendGpuProbe PRIVATE cxx_std_17)
++target_link_libraries(XRay.Metal.ComputeSkinBackendGpuProbe PRIVATE
++  XRay.Metal.R4Backend XRay.Core
++)
++add_test(NAME XRay.Metal.ComputeSkin.BackendGpu
++  COMMAND XRay.Metal.ComputeSkinBackendGpuProbe --self-test
+ )
+ 
+ add_executable(XRay.Metal.FloraAdapterProbe
+--- prestate/R4ComputeSkinBackendGpuProbe.cpp
++++ src/Layers/xrRenderMetal/tests/R4ComputeSkinBackendGpuProbe.cpp
+@@ -0,0 +1,22 @@
++#include "../IR4Backend.h"
++
++#include <cstdio>
++#include <string>
++
++int main(int argc, char** argv)
++{
++    if (argc != 2 || std::string(argv[1]) != "--self-test")
++    {
++        std::fprintf(stderr, "usage: R4ComputeSkinBackendGpuProbe --self-test\n");
++        return 2;
++    }
++    std::string error;
++    if (!RunMetalR4ComputeSkinBackendGpuProbe(error))
++    {
++        std::fprintf(stderr, "COMPUTE_SKIN_BACKEND_GPU_PROBE status=FAIL error=%s\n",
++            error.c_str());
++        return 1;
++    }
++    std::fprintf(stderr, "COMPUTE_SKIN_BACKEND_GPU_PROBE status=PASS\n");
++    return 0;
++}

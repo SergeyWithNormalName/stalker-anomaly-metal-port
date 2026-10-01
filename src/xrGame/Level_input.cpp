@@ -22,6 +22,8 @@
 #include "../xrEngine/xr_input.h"
 #include "saved_game_wrapper.h"
 #include "ui\UIPdaWnd.h"
+#include "UICursor.h"
+#include "MainMenu.h"
 
 #include "../Include/xrRender/DebugRender.h"
 
@@ -126,8 +128,7 @@ void CLevel::IR_OnMouseMove(int dx, int dy)
 	// Use SDL relative mode for the free camera and leave it before UI receives
 	// motion, since the UI needs a normal absolute cursor.
 #if defined(XR_PLATFORM_APPLE)
-	auto* top_input_receiver = CurrentGameUI()->TopInputReceiver();
-	if (top_input_receiver && top_input_receiver->IR_process())
+	if (GetUICursor().IsVisible() || (CurrentGameUI()->TopInputReceiver() && CurrentGameUI()->TopInputReceiver()->IR_process()))
 		pInput->SetRelativeMouseMode(false);
 #endif
 	if (CurrentGameUI()->IR_UIOnMouseMove(dx, dy)) return;
@@ -144,7 +145,8 @@ void CLevel::IR_OnMouseMove(int dx, int dy)
 	}
 
 #if defined(XR_PLATFORM_APPLE)
-	pInput->SetRelativeMouseMode(true);
+	if (!GetUICursor().IsVisible() && (!MainMenu() || !MainMenu()->IsActive()))
+		pInput->SetRelativeMouseMode(true);
 #else
 	POINT p;
 	p.x = Device.clientWidth / 2;

@@ -140,7 +140,8 @@ void CControlAnimationBase::clear_override_animation()
 void CControlAnimationBase::set_override_animation(EMotionAnim anim, u32 index)
 {
 	if (m_override_animation == anim) return;
-	if (!m_anim_storage[anim]) return;
+	// eAnimUndefined is the documented way to turn the override off.
+	if (anim != eAnimUndefined && !has_animation(anim)) return;
 
 	m_override_animation = anim;
 	m_override_animation_index = index;
@@ -150,7 +151,7 @@ void CControlAnimationBase::set_override_animation_script(EMotionAnim anim, u32 
 {
 	if (m_override_animation == anim) return;
 
-	if (!m_anim_storage[anim])
+	if (!has_animation(anim))
 	{
 		Msg("![CControlAnimationBase] wrong animation id.");
 		return;
